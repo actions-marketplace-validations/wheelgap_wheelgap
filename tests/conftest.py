@@ -16,6 +16,10 @@ FAKE_INDEX = {
         "1.9": ["ranged-1.9.tar.gz"],
         "2.0": ["ranged-2.0-py3-none-any.whl"],
     },
+    "pythonranged": {
+        "1.0": [{"filename": "pythonranged-1.0-py3-none-any.whl", "requires_python": ">=3.8"}],
+        "2.0": [{"filename": "pythonranged-2.0-py3-none-any.whl", "requires_python": ">=3.10"}],
+    },
     "yanked": {"1.0": [{"filename": "yanked-1.0-py3-none-any.whl", "yanked": True}]},
     "halfyanked": {"2.0": [{"filename": "halfyanked-2.0-py3-none-any.whl", "yanked": True}, "halfyanked-2.0.tar.gz"]},
 }
@@ -63,3 +67,54 @@ def fake_pypi(monkeypatch):
 
     monkeypatch.setattr(pypi, "fetch_json", fetch_json)
     return calls
+
+
+def _simple_files(name):
+    """Every file of every version in one flat list, like a PEP 691 project page."""
+    files = []
+    for fs in FAKE_INDEX[name].values():
+        for f in fs:
+            entry = f if isinstance(f, dict) else {"filename": f}
+            item = {
+                "filename": entry["filename"],
+                "url": f"https://files.example/{entry['filename']}",
+                "hashes": {},
+            }
+            if entry.get("yanked"):
+                item["yanked"] = True  # PEP 592: a bool or a reason string
+            if "requires_python" in entry:
+                item["requires-python"] = entry["requires_python"]  # PEP 691 spelling
+            files.append(item)
+    return files
+
+
+class FakeSimple:
+    """A fake PEP 691 index: .calls records requests, .html_only makes it serve only PEP 503 HTML."""
+
+    def __init__(self):
+        self.calls = []  # (url, auth) pairs
+        self.html_only = False
+
+
+@pytest.fixture
+def fake_simple(monkeypatch):
+    import urllib.error
+    from urllib.parse import urlsplit
+
+    from wheelgap import pypi
+
+    index = FakeSimple()
+
+    def fetch_simple(url, auth=None, timeout=20.0):
+        # Credentials must be split off before the fetch layer (they go in `auth`).
+        assert "@" not in urlsplit(url).netloc, "credentials leaked into the request URL"
+        index.calls.append((url, auth))
+        if index.html_only:
+            raise pypi.IndexFormatError(urlsplit(url).hostname or "index")
+        name = url.rstrip("/").rsplit("/", 1)[-1]
+        if name not in FAKE_INDEX:
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        return {"meta": {"api-version": "1.0"}, "name": name, "files": _simple_files(name)}
+
+    monkeypatch.setattr(pypi, "fetch_simple", fetch_simple)
+    return index

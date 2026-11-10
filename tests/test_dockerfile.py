@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from wheelgap import pypi
 from wheelgap.cli import main
 from wheelgap.dockerfile import DockerfileError, ImageTarget, _heredocs, last_from, parse_from, read_dockerfile
 
@@ -10,21 +11,30 @@ from wheelgap.dockerfile import DockerfileError, ImageTarget, _heredocs, last_fr
     ("line", "expected"),
     [
         ("python:3.13-alpine", ImageTarget("3.13", "musl-x86_64", musl="1.2")),
-        ("--platform=linux/arm64 python:3.12-slim", ImageTarget("3.12", "linux-aarch64")),
-        ('--platform="linux/arm64" python:3.12-slim', ImageTarget("3.12", "linux-aarch64")),
-        ("--platform='linux/arm64' python:3.12-slim", ImageTarget("3.12", "linux-aarch64")),
+        ("--platform=linux/arm64 python:3.12-slim", ImageTarget("3.12", "linux-aarch64", glibc="2.41")),
+        ('--platform="linux/arm64" python:3.12-slim', ImageTarget("3.12", "linux-aarch64", glibc="2.41")),
+        ("--platform='linux/arm64' python:3.12-slim", ImageTarget("3.12", "linux-aarch64", glibc="2.41")),
         ('--platform="linux/arm/v7" python:3.13-alpine', ImageTarget("3.13", "musl-armv7l", musl="1.2")),
-        ('--platform="" python:3.13', ImageTarget("3.13", "linux-x86_64")),
+        ('--platform="" python:3.13', ImageTarget("3.13", "linux-x86_64", glibc="2.41")),
         ("python:3.14-slim-trixie", ImageTarget("3.14", "linux-x86_64", glibc="2.41")),
         ("python:3.13-bookworm", ImageTarget("3.13", "linux-x86_64", glibc="2.36")),
         ("python:3.11-slim-bullseye", ImageTarget("3.11", "linux-x86_64", glibc="2.31")),
         ("python:3.13.1-alpine3.22 AS runtime", ImageTarget("3.13", "musl-x86_64", musl="1.2")),
-        ("docker.io/library/python:3.12", ImageTarget("3.12", "linux-x86_64")),
-        ("--platform= python:3.13", ImageTarget("3.13", "linux-x86_64")),  # empty value: the default
-        ("-- python:3.13", ImageTarget("3.13", "linux-x86_64")),  # BuildKit drops a bare --
+        ("docker.io/library/python:3.12", ImageTarget("3.12", "linux-x86_64", glibc="2.41")),
+        ("--platform= python:3.13", ImageTarget("3.13", "linux-x86_64", glibc="2.41")),  # empty value: the default
+        ("-- python:3.13", ImageTarget("3.13", "linux-x86_64", glibc="2.41")),  # BuildKit drops a bare --
         ("--platform=linux/arm64 -- python:3.13-alpine", ImageTarget("3.13", "musl-aarch64", musl="1.2")),
-        ("python:3.13-slim@sha256:" + "0" * 64, ImageTarget("3.13", "linux-x86_64")),
+        ("python:3.13-slim@sha256:" + "0" * 64, ImageTarget("3.13", "linux-x86_64", glibc="2.41")),
         ("python:3.15.0a1-slim", ImageTarget("3.15", "linux-x86_64")),
+        # No Debian release in the tag: the one Docker Hub publishes that Python on (see UNTAGGED_DEBIAN)
+        ("python:3.13", ImageTarget("3.13", "linux-x86_64", glibc="2.41")),
+        ("python:3.13-slim", ImageTarget("3.13", "linux-x86_64", glibc="2.41")),
+        ("python:3.8-slim", ImageTarget("3.8", "linux-x86_64", glibc="2.36")),
+        ("python:3.6", ImageTarget("3.6", "linux-x86_64", glibc="2.31")),
+        ("python:3.16-slim", ImageTarget("3.16", "linux-x86_64")),  # not published yet: falls back to --glibc
+        # A patch tag may be older than its X.Y tag (3.12.7-slim is still bookworm), so it falls back to --glibc too
+        ("python:3.12.7-slim", ImageTarget("3.12", "linux-x86_64")),
+        ("python:3.13.9", ImageTarget("3.13", "linux-x86_64")),
         ("python:3.13-windowsservercore-ltsc2022", ImageTarget("3.13", "win-amd64")),
         ("ghcr.io/astral-sh/uv:python3.13-bookworm-slim", ImageTarget("3.13", "linux-x86_64", glibc="2.36")),
         ("ghcr.io/astral-sh/uv:python3.14-trixie-slim", ImageTarget("3.14", "linux-x86_64", glibc="2.41")),
@@ -33,6 +43,13 @@ from wheelgap.dockerfile import DockerfileError, ImageTarget, _heredocs, last_fr
         ("--platform=linux/arm/v7 python:3.13-alpine", ImageTarget("3.13", "musl-armv7l", musl="1.2")),
         ("--platform=linux/ppc64le python:3.13-bookworm", ImageTarget("3.13", "linux-ppc64le", glibc="2.36")),
         ("--platform=linux/riscv64 python:3.14-trixie", ImageTarget("3.14", "linux-riscv64", glibc="2.41")),
+        ("--platform=linux/s390x python:3.13-alpine", ImageTarget("3.13", "musl-s390x", musl="1.2")),
+        ("--platform=linux/riscv64 python:3.13", ImageTarget("3.13", "linux-riscv64", glibc="2.41")),
+        # Tags Docker Hub stopped rebuilding before it dropped s390x and ppc64le for bookworm and bullseye
+        ("--platform=linux/s390x python:3.9-bookworm", ImageTarget("3.9", "linux-s390x", glibc="2.36")),
+        ("--platform=linux/s390x python:3.12.7-bookworm", ImageTarget("3.12", "linux-s390x", glibc="2.36")),
+        ("--platform=linux/ppc64le python:3.11.0-slim-bullseye", ImageTarget("3.11", "linux-ppc64le", glibc="2.31")),
+        ("--platform=linux/s390x python:3.6", ImageTarget("3.6", "linux-s390x", glibc="2.31")),
         (
             "--platform=linux/arm64 ghcr.io/astral-sh/uv:python3.12-alpine3.23",
             ImageTarget("3.12", "musl-aarch64", musl="1.2"),
@@ -57,6 +74,21 @@ def test_parse_from(line, expected):
         ("--platform=linux/386 python:3.13", "only linux/amd64"),
         ("--platform=linux/s390x ghcr.io/astral-sh/uv:python3.13-bookworm-slim", "only published for linux/amd64"),
         ("python:3.13-slim-buster", "unknown image variant 'buster'"),
+        ("--platform=linux/riscv64 python:3.13-bookworm", r"python:3\.13-bookworm isn't published for linux/riscv64"),
+        (
+            "--platform=linux/riscv64 python:3.13-slim-bookworm",
+            r"isn't published for linux/riscv64 \(3\.13-trixie is\)",
+        ),
+        ("--platform=linux/s390x python:3.13-bookworm", "isn't published for linux/s390x"),
+        ("--platform=linux/s390x python:3.13-slim-bookworm", "isn't published for linux/s390x"),
+        ("--platform=linux/ppc64le python:3.13-bullseye", "isn't published for linux/ppc64le"),
+        ("--platform=linux/s390x python:3.8-bullseye", r"isn't published for linux/s390x \(3\.8-bookworm is\)$"),
+        ("--platform=linux/riscv64 python:3.9-bookworm", r"isn't published for linux/riscv64 \(3\.9-trixie is\)$"),
+        ("--platform=linux/riscv64 python:3.8-bookworm", "isn't published for linux/riscv64$"),
+        (
+            "--platform=linux/riscv64 python:3.12.7-slim-bookworm",
+            r"isn't published for linux/riscv64 \(3\.12-trixie is\)$",
+        ),
     ],
 )
 def test_parse_from_errors(line, message):
@@ -102,6 +134,17 @@ def test_cli_flags_beat_dockerfile(capsys, fixtures, tmp_path):
     main([str(fixtures / "uvproj"), "--dockerfile", str(dockerfile), "-t", "win-amd64", "--json"])
     data = json.loads(capsys.readouterr().out)
     assert [(t["python"], t["platform"]) for t in data["targets"]] == [("3.13", "win-amd64")]
+
+
+@pytest.mark.parametrize(("image", "status"), [("python:3.13-slim", "wheel"), ("python:3.13-slim-bookworm", "source")])
+def test_cli_untagged_image_uses_its_debian_glibc(capsys, monkeypatch, tmp_path, image, status):
+    files = [{"filename": "trixielib-1.0-cp313-cp313-manylinux_2_39_x86_64.whl"}, {"filename": "trixielib-1.0.tar.gz"}]
+    monkeypatch.setattr(pypi, "fetch_json", lambda url, timeout=20.0: {"info": {"version": "1.0"}, "urls": files})
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(f"FROM {image}\n")
+    main(["trixielib==1.0", "--dockerfile", str(dockerfile), "--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert data["packages"][0]["results"] == {"linux-x86_64": status}
 
 
 def test_cli_bad_dockerfile_exit_2(capsys, fixtures, tmp_path):
@@ -163,15 +206,15 @@ def test_chain_of_stages_and_platforms(tmp_path):
     text += "FROM --platform=linux/amd64 deps\n"
     assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.12", "linux-aarch64", glibc="2.36")
     text = "FROM python:3.13-slim AS base\nFROM --platform=linux/arm64 base\n"
-    assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.13", "linux-x86_64")
+    assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.13", "linux-x86_64", glibc="2.41")
 
 
 def test_stage_names_are_lowercased_like_docker(tmp_path):
     # Docker lowercases the AS name but looks a reference up as written (and image names are lowercase).
     text = "FROM python:3.13 as Base\nFROM base\n"
-    assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.13", "linux-x86_64")
+    assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.13", "linux-x86_64", glibc="2.41")
     text = "FROM python:3.13 AS build-env_1.2\nFROM build-env_1.2\n"
-    assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.13", "linux-x86_64")
+    assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.13", "linux-x86_64", glibc="2.41")
     with pytest.raises(DockerfileError, match="FROM BASE: not an earlier stage"):
         read_dockerfile(_dockerfile(tmp_path, "FROM python:3.13 as Base\nFROM BASE\n"))
 
@@ -203,7 +246,7 @@ _HEREDOC_LIKE_LINES = [
 def test_lines_with_heredoc_like_text_never_hide_the_final_from(tmp_path, line):
     # wheelgap doesn't parse heredocs, so whatever these mean to Docker, the final FROM is still found.
     text = f"FROM python:3.13-alpine AS base\n{line}\nFROM python:3.12-slim\n"
-    assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.12", "linux-x86_64")
+    assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.12", "linux-x86_64", glibc="2.41")
 
 
 def _docs(*names):
@@ -344,7 +387,7 @@ def test_unknown_stage_lists_only_earlier_stages(tmp_path):
 
 def test_python_lines_starting_with_from_are_not_errors(tmp_path):
     text = "FROM python:3.13 AS a\nRUN python - <<EOF\nfromtimestamp = 1\nEOF\nFROM python:3.12\n"
-    assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.12", "linux-x86_64")
+    assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.12", "linux-x86_64", glibc="2.41")
 
 
 def test_python_imports_in_heredocs_are_not_from_lines(tmp_path):
@@ -387,7 +430,7 @@ def test_continuations_like_docker(tmp_path, text):
     ],
 )
 def test_lines_that_do_not_continue(tmp_path, text):
-    assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.12", "linux-x86_64")
+    assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.12", "linux-x86_64", glibc="2.41")
 
 
 @pytest.mark.parametrize(
@@ -402,7 +445,7 @@ def test_lines_that_do_not_continue(tmp_path, text):
 def test_final_line_edge_cases(tmp_path, text):
     path = tmp_path / "Dockerfile"
     path.write_text(text, encoding="utf-8")
-    assert read_dockerfile(path) == ImageTarget("3.11", "linux-aarch64")
+    assert read_dockerfile(path) == ImageTarget("3.11", "linux-aarch64", glibc="2.41")
 
 
 def test_escape_directive_rules(tmp_path):
@@ -461,7 +504,7 @@ def test_ascii_whitespace_inside_a_line_separates_words(tmp_path, space):
     # \v, \f and \r don't end a line for Docker (only \n does), but they do separate words, as spaces do.
     path = tmp_path / "Dockerfile"
     path.write_bytes(f"FROM python:3.13{space}AS build\nFROM build\n".encode())
-    assert read_dockerfile(path) == ImageTarget("3.13", "linux-x86_64")
+    assert read_dockerfile(path) == ImageTarget("3.13", "linux-x86_64", glibc="2.41")
 
 
 @pytest.mark.parametrize(
@@ -474,7 +517,7 @@ def test_ascii_whitespace_inside_a_line_separates_words(tmp_path, space):
         ),
         (
             b"FROM python:3.12 AS a\r\nFROM --platform=linux/arm64 \\\r\n python:3.11-slim\r\n",
-            ImageTarget("3.11", "linux-aarch64"),
+            ImageTarget("3.11", "linux-aarch64", glibc="2.41"),
         ),
     ],
 )

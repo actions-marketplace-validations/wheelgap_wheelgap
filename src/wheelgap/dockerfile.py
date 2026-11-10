@@ -9,9 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
-# Debian release in the image tag -> its glibc version.
-DEBIAN_GLIBC = {"bullseye": "2.31", "bookworm": "2.36", "trixie": "2.41"}
-ALPINE_MUSL = "1.2"  # Alpine 3.13 and later; 3.12 and earlier ship musl 1.1
+from .targets import ALPINE_MUSL, DEBIAN_GLIBC
+
+# Debian release an official python X.Y tag that names none (python:3.13, python:3.13-slim) is built on, per Python.
+# Checked on Docker Hub 2026-11-10: 3.9 to 3.15 point at trixie; 3.7 and 3.8 stopped on bookworm, 3.6 on bullseye.
+UNTAGGED_DEBIAN = {"3.6": "bullseye", "3.7": "bookworm", "3.8": "bookworm"} | {f"3.{n}": "trixie" for n in range(9, 16)}
+# A patch or pre-release tag (python:3.12.7-slim) stops being rebuilt once the next one ships, so it can still be on
+# an older release than its X.Y tag (3.12.7-slim is bookworm): those keep the --glibc default.
+_MINOR_TAG_RE = re.compile(r"^\d+\.\d+(?:-|$)", re.ASCII)
 _ALPINE_RE = re.compile(r"^alpine(\d+)\.(\d+)", re.ASCII)
 # docker --platform -> wheelgap arch
 ARCHES = {
@@ -30,6 +35,20 @@ WINDOWS_VARIANTS = ("windowsservercore", "nanoserver")
 IMAGE_NAMES = ("python", "library/python", "docker.io/library/python", "docker.io/python")
 UV_IMAGE = "ghcr.io/astral-sh/uv"
 UV_ARCHES = {"x86_64", "aarch64"}
+# Arches the official python images are published for, by Debian release (trixie and alpine have them all).
+# Checked on Docker Hub 2026-11-10 for the X.Y tags (python:3.13-bookworm, python:3.13-slim-bullseye).
+DEBIAN_ARCHES = {"bookworm": {"x86_64", "aarch64", "armv7l", "ppc64le"}, "bullseye": {"x86_64", "aarch64", "armv7l"}}
+# Images that stopped being rebuilt before Docker Hub dropped ppc64le/s390x still have them: patch and pre-release
+# tags (python:3.12.7-bookworm, python:3.11.0-bullseye) and these end-of-life X.Y tags. riscv64 was never built for
+# either release.
+OLD_DEBIAN_ARCHES = {"x86_64", "aarch64", "armv7l", "ppc64le", "s390x"}
+OLD_DEBIAN_TAGS = {
+    ("3.6", "bullseye"),
+    ("3.7", "bullseye"),
+    ("3.7", "bookworm"),
+    ("3.8", "bookworm"),
+    ("3.9", "bookworm"),
+}
 
 _TAG_RE = re.compile(r"^(\d+)\.(\d+)(?:\.\d+)?(?:(?:a|b|rc)\d+)?(?:-(.+))?$", re.ASCII)
 _UV_TAG_PREFIX_RE = re.compile(r"^(?:\d+\.\d+(?:\.\d+)?-)?python", re.ASCII)
@@ -546,6 +565,7 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
     python = f"{m.group(1)}.{m.group(2)}"
     variant = m.group(3).split("-") if m.group(3) else []  # Docker Hub tags are case-sensitive: -SLIM doesn't exist
 
+    release = None
     if alpine := next((part for part in variant if part.startswith("alpine")), None):
         family, glibc, musl = "musl", None, ALPINE_MUSL
         if (m := _ALPINE_RE.match(alpine)) and (int(m.group(1)), int(m.group(2))) <= (3, 12):
@@ -559,7 +579,10 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
         unknown = [part for part in variant if part not in DEBIAN_GLIBC and part != "slim"]
         if unknown:
             raise DockerfileError(f"{image}: unknown image variant '{'-'.join(unknown)}'")
-        glibc = next((DEBIAN_GLIBC[part] for part in variant if part in DEBIAN_GLIBC), None)
+        release = next((part for part in variant if part in DEBIAN_GLIBC), None)
+        if release is None and name in IMAGE_NAMES and _MINOR_TAG_RE.match(tag):
+            release = UNTAGGED_DEBIAN.get(python)
+        glibc = DEBIAN_GLIBC.get(release) if release else None
 
     arch = "x86_64"
     if platform:
@@ -568,6 +591,16 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
         arch = ARCHES[platform.lower()]
         if name == UV_IMAGE and arch not in UV_ARCHES:
             raise DockerfileError(f"{image}: Astral's uv images are only published for linux/amd64 and linux/arm64")
+        if name in IMAGE_NAMES and release in DEBIAN_ARCHES:
+            frozen = not _MINOR_TAG_RE.match(tag) or (python, release) in OLD_DEBIAN_TAGS
+            if arch not in (OLD_DEBIAN_ARCHES if frozen else DEBIAN_ARCHES[release]):
+                if UNTAGGED_DEBIAN.get(python) == "trixie":
+                    hint = f" ({python}-trixie is)"  # the X.Y tag: a patch tag has no trixie twin
+                elif (python, "bookworm") in OLD_DEBIAN_TAGS and arch in OLD_DEBIAN_ARCHES:
+                    hint = f" ({python}-bookworm is)"
+                else:
+                    hint = ""
+                raise DockerfileError(f"{image} isn't published for {platform}{hint}")
     return ImageTarget(python, f"{family}-{arch}", glibc, musl)
 
 

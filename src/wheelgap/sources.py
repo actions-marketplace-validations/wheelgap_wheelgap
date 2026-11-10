@@ -50,7 +50,7 @@ class Package:
     spec: str | None = None
     # Files of a pinned release that the index marks as yanked (see check.status_for).
     yanked: frozenset[str] = frozenset()
-    # uv.lock / pylock.toml: the index the lock says the package came from, e.g. https://pypi.org/simple.
+    # uv.lock / pylock.toml / poetry.lock: the index the lock says the package came from, e.g. https://pypi.org/simple.
     registry: str | None = None
 
     @property
@@ -60,6 +60,17 @@ class Package:
 
 # A dependency edge in a lockfile graph: (name, version or None, marker or None)
 Edge = tuple[str, str | None, str | None]
+
+
+@dataclass(frozen=True)
+class UvSelection:
+    """Explicit installation selection. None on a Source keeps the conservative all-dependencies walk."""
+
+    extras: frozenset[str] = frozenset()
+    all_extras: bool = False
+    groups: frozenset[str] = frozenset()
+    no_dev: bool = False
+    only_groups: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -75,6 +86,13 @@ class Source:
     root_groups: dict[int, str] = field(default_factory=dict)
     # uv.lock only: the project's requires-python. uv keeps only the wheels that can serve it.
     requires_python: str | None = None
+    # Retain uv edge provenance for an explicit installation selection. The existing flattened
+    # graph remains untouched, preserving conservative behavior when no selectors are supplied.
+    uv_packages: list[dict] | None = None
+    uv_manifest: dict = field(default_factory=dict)
+    uv_pyproject: Path | None = None
+    uv_default_groups: list[str] = field(default_factory=lambda: ["dev"])
+    uv_selection: UvSelection | None = None
 
 
 def pythons_outside_lock(source: Source, targets: Iterable[Target]) -> list[str]:
@@ -130,7 +148,8 @@ def parse_uv_lock(path: Path) -> Source:
     manifest = data.get("manifest", {})
     members = {canonicalize_name(m) for m in manifest.get("members", [])}
     edges: dict[int, list[Edge]] = {}
-    source = Source(path.name, edges=edges)
+    source = Source(path.name, edges=edges, uv_packages=data.get("package", []), uv_manifest=manifest)
+    source.uv_pyproject = path.with_name("pyproject.toml")
     for p in data.get("package", []):
         src = p.get("source", {})
         pkg = Package(p["name"], p.get("version"), origin=path.name)
@@ -160,6 +179,72 @@ def parse_uv_lock(path: Path) -> Source:
     if isinstance(data.get("requires-python"), str):
         source.requires_python = data["requires-python"]
     return source
+
+
+def uv_selected_roots(source: Source) -> list[int]:
+    # A rooted workspace syncs its project, not every sibling member. With no project
+    # (a virtual workspace), all member roots remain eligible, as with uv sync.
+    packages = source.uv_packages or []
+    project = [
+        i
+        for i in source.roots
+        if any(packages[i].get("source", {}).get(kind) == "." for kind in ("editable", "virtual"))
+    ]
+    return project or source.roots
+
+
+def uv_extra_names(package: dict) -> frozenset[str]:
+    # uv omits empty optional-dependency groups from the graph, but records their names here.
+    return frozenset(canonicalize_name(name) for name in package.get("optional-dependencies", {})) | frozenset(
+        canonicalize_name(name) for name in package.get("metadata", {}).get("provides-extras", [])
+    )
+
+
+def uv_group_names(package: dict) -> frozenset[str]:
+    return frozenset(canonicalize_name(name) for name in package.get("dev-dependencies", {})) | frozenset(
+        canonicalize_name(name) for name in package.get("metadata", {}).get("requires-dev", {})
+    )
+
+
+def select_uv_dependencies(sources: list[Source], selection: UvSelection, strict: bool = True) -> None:
+    """Apply `selection` to the uv.lock sources. With strict (selectors from the command line), other inputs are an
+    error; otherwise (from [tool.wheelgap]) they're left as they are."""
+    if selection.only_groups and (selection.extras or selection.all_extras):
+        raise SourceError("--only-group cannot be combined with --extra or --all-extras")
+    if selection.no_dev and "dev" in selection.groups | selection.only_groups:
+        raise SourceError("--no-dev cannot be combined with an explicit dev group")
+    if strict and (not sources or any(source.uv_packages is None for source in sources)):
+        raise SourceError("extra/group selection requires uv.lock inputs")
+    for source in sources:
+        if source.uv_packages is None:
+            continue
+        pyproject = source.uv_pyproject
+        if pyproject is not None and pyproject.is_file():
+            uv = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("tool", {}).get("uv", {})
+            defaults = uv.get("default-groups", ["dev"])
+            if defaults == "all":
+                source.uv_default_groups = ["*"]
+            elif isinstance(defaults, list) and all(isinstance(g, str) for g in defaults):
+                source.uv_default_groups = [canonicalize_name(g) for g in defaults]
+            else:
+                raise SourceError(f"{pyproject}: [tool.uv] default-groups must be a list of strings or 'all'")
+        if source.edges is None:
+            raise SourceError(f"{source.label}: cannot select extras/groups without project or manifest roots")
+        packages = source.uv_packages or []
+        roots = uv_selected_roots(source)
+        extras = frozenset(name for i in roots for name in uv_extra_names(packages[i]))
+        groups: set[str] = {canonicalize_name(name) for name in source.uv_manifest.get("dependency-groups", {})}
+        groups.update(frozenset().union(*(uv_group_names(packages[i]) for i in roots)))
+        unknown_defaults = set(source.uv_default_groups) - groups - {"dev", "*"}
+        if unknown_defaults:
+            raise SourceError(f"{source.label}: unknown default groups: {', '.join(sorted(unknown_defaults))}")
+        for label, unknown in (
+            ("extras", selection.extras - extras),
+            ("groups", (selection.groups | selection.only_groups) - groups),
+        ):
+            if unknown:
+                raise SourceError(f"{source.label}: unknown {label}: {', '.join(sorted(unknown))}")
+        source.uv_selection = selection
 
 
 def parse_pylock(path: Path) -> Source:
@@ -212,10 +297,14 @@ def parse_poetry_lock(path: Path) -> Source:
         if src_type in ("git", "hg", "svn", "bzr", "directory", "file", "url"):
             pkg.skip = src_type
         else:
+            # A "legacy" source is a simple index: remember it so the package isn't looked up on PyPI.
+            url = p.get("source", {}).get("url")
+            pkg.registry = url if isinstance(url, str) else None
             entries = p.get("files")
             if entries is None:
                 entries = legacy_files.get(p["name"])
-            # No files recorded at all (old [metadata.hashes] locks): leave them for the index lookup.
+            # No files recorded at all (old [metadata.hashes] locks): PyPI packages are looked up on the index,
+            # packages from another index are skipped (fill_all).
             pkg.files = None if entries is None else [f for f in (_filename(e) for e in entries) if f]
         edges[len(pkgs)] = _poetry_edges(p)
         pkgs.append(pkg)
@@ -341,7 +430,10 @@ def _add_once(pkgs: list[Package], seen: dict[tuple[str, str | None], Package], 
     if first is None:
         seen[key] = pkg
         pkgs.append(pkg)
-    elif first.markers is not None:
+        return
+    if pkg.skip == "private index":
+        first.skip = pkg.skip  # Pipenv may pin the index in one category only: keep the name off pypi.org anyway
+    if first.markers is not None:
         first.markers = None if pkg.markers is None else first.markers + pkg.markers
 
 
@@ -390,6 +482,14 @@ def parse_pipfile_lock(path: Path) -> Source:
             raise SourceError(f"{path.name}: {key} isn't a package section")
     sections = [s for s in ("default", "develop") if s in data]
     sections += [key for key in data if key not in ("_meta", "default", "develop")]
+    meta = data.get("_meta")
+    sources = meta.get("sources") if isinstance(meta, dict) else None
+    # Pipenv writes "index": "<source name>" for a package pinned to one of the Pipfile's [[source]] entries.
+    source_urls = {
+        s["name"]: s["url"]
+        for s in (sources if isinstance(sources, list) else [])
+        if isinstance(s, dict) and isinstance(s.get("name"), str) and isinstance(s.get("url"), str)
+    }
     for section in sections:
         for name, p in data[section].items():
             if not isinstance(p, dict):
@@ -403,8 +503,18 @@ def parse_pipfile_lock(path: Path) -> Source:
             pkg.skip = next((kind for kind in ("git", "hg", "svn", "bzr", "path", "file") if kind in p), None)
             if pkg.skip is None and p.get("editable"):
                 pkg.skip = "editable"
+            index = p.get("index")
+            if pkg.skip is None and index is not None and not _is_public_pypi(source_urls.get(str(index))):
+                pkg.skip = "private index"  # don't send internal names to pypi.org, or check a namesake there
             _add_once(pkgs, seen, pkg)
     return Source(path.name, pkgs)
+
+
+def _is_public_pypi(url: str | None) -> bool:
+    try:
+        return url is not None and urlparse(url).hostname in ("pypi.org", "pypi.python.org")
+    except ValueError:  # e.g. "https://[bad/simple": not something we can call PyPI
+        return False
 
 
 def _pinned_version(req: Requirement) -> str | None:

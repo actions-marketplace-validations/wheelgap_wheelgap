@@ -21,13 +21,15 @@ uvx wheelgap@latest -p 3.13 -t linux-aarch64,musl-aarch64 --json
   - A `[tool.wheelgap]` table in `pyproject.toml`: its defaults apply with no `-p`/`-t`.
   - Otherwise ask, or use `-t all` (the eight common platforms).
   - `uvx wheelgap@latest --list-targets` lists every target and alias.
+- **Libc:** if the user names a deployment distro, pass `--distro NAME` (e.g. `ubuntu-22.04`, `debian-12`, `rhel-9`, `amazonlinux-2023`, `alpine`; `--list-targets` lists them). For a distro that isn't listed, verify its libc version and pass `--glibc X.Y` or `--musl X.Y`. None of these select platforms; Alpine still needs a `musl-*` target. With `--dockerfile`, leave `--distro` out: the image already sets the libc, and `--distro` would override it.
 
 ## Read the result
 
-- **Don't rely on the exit code alone:** `0` no failing gaps, `1` gaps, `2` bad input (read stderr). `--exit-zero` or `fail-on = "missing"` can make source builds exit 0, so read `summary.with_gaps` and each package's `results`.
+- **Don't rely on the exit code alone:** `0` no failing gaps, `1` gaps, `2` bad input (with `--json`, stdout is then `{"error": {"message": ..., "type": ...}}`; the message is on stderr too). `--exit-zero` or `fail-on = "missing"` can make source builds exit 0, so read `summary.with_gaps` and each package's `results`.
 - **`results`** maps a target label to `wheel`, `source`, `missing`, `unknown`, `n/a` (the package isn't installed on that target, per its markers) or `bundled` (shipped by Pyodide, with `--pyodide-lock`). Labels come from `targets[].label`: the platform alone with one Python, `"3.13 linux-x86_64"` with several.
 - **`unknown`** means a lookup failed; the package's `error` field says why. Never report it as fine.
 - **`skipped`** lists packages that weren't checked (editable, git, path), so don't claim every dependency was covered.
+- **Installation scope:** by default, `uv.lock` checks conservatively include extras and development groups. Compare a reported gap with the deployment's actual `uv sync` options before treating it as a deployment failure.
 - **Why:** `--explain` adds each rejected wheel and the reason (`rejected`), and for `uv.lock` the dependency path that pulls the package in (`via`).
 
 ## What to tell the user

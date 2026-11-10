@@ -19,7 +19,7 @@ try:  # packaging's parsed-marker node types (private, so guarded: without them 
 except ImportError:  # pragma: no cover
     _Value = _Variable = None  # type: ignore[assignment,misc]
 
-from .sources import Edge, Package, Source
+from .sources import Edge, Package, Source, uv_extra_names, uv_group_names, uv_selected_roots
 from .targets import ANDROID_FLOOR, IOS_FLOOR, MANYLINUX_FLOOR, MANYLINUX_X86_ARCHES, PLATFORMS, Target
 
 
@@ -252,7 +252,7 @@ def _quote(text: str) -> str | None:
     return f"'{text}'" if "'" not in text else None  # both kinds of quote: can't re-serialise safely
 
 
-def _atom(node: tuple, target: Target) -> bool | None:
+def _atom(node: tuple, target: Target, environment: dict | None = None) -> bool | None:
     """One comparison: True/False, or None when it involves something we can't know."""
     if _Variable is None or _Value is None:
         return None  # packaging's internals changed: treat every comparison as unknown (never hide)
@@ -269,9 +269,14 @@ def _atom(node: tuple, target: Target) -> bool | None:
             parts.append(quoted)
         else:
             parts.append(str(n.value))  # the operator
-    if not names or names & _UNKNOWABLE:
+    if not names or names & (_UNKNOWABLE - (environment or {}).keys()):
         return None
     text = " ".join(parts)
+    if environment is not None:
+        try:
+            return Marker(text).evaluate({**target.marker_env, **environment}, context="lock_file")
+        except Exception:
+            return None
     key = (text, target)
     if key not in _atom_cache:
         try:
@@ -281,7 +286,7 @@ def _atom(node: tuple, target: Target) -> bool | None:
     return _atom_cache[key]
 
 
-def _evaluate3(markers: list, target: Target) -> bool | None:
+def _evaluate3(markers: list, target: Target, environment: dict | None = None) -> bool | None:
     """Kleene evaluation of packaging's parsed marker list: `and` binds tighter than `or`."""
     groups: list[list[bool | None]] = [[]]
     for item in markers:
@@ -290,16 +295,22 @@ def _evaluate3(markers: list, target: Target) -> bool | None:
         elif item == "and":
             continue
         elif isinstance(item, list):
-            groups[-1].append(_evaluate3(item, target))
+            groups[-1].append(_evaluate3(item, target, environment))
         else:
-            groups[-1].append(_atom(item, target))
+            groups[-1].append(_atom(item, target, environment))
     results: list[bool | None] = []
     for group in groups:
         results.append(False if False in group else None if None in group else True)
     return True if True in results else None if None in results else False
 
 
-def marker_holds(marker: str | None, target: Target) -> bool:
+def marker_holds(
+    marker: str | None,
+    target: Target,
+    *,
+    extras: frozenset[str] | None = None,
+    groups: frozenset[str] | None = None,
+) -> bool:
     if not marker:
         return True
     if marker not in _marker_cache:
@@ -311,7 +322,21 @@ def marker_holds(marker: str | None, target: Target) -> bool:
     if m is None:
         return True  # can't parse it: assume the package is needed rather than hide a gap
     try:
-        return _evaluate3(m._markers, target) is not False
+        if extras is None and groups is None:
+            return _evaluate3(m._markers, target) is not False
+        # uv's synthetic conflict marker names aren't public extra names. Preserve their
+        # existing unknown/conservative treatment rather than hiding a potentially needed wheel.
+        synthetic = bool(re.search(r"(?:extra|group)-\d+-", marker))
+        contexts = extras | {""} if extras is not None and not synthetic else {None}
+        for extra in contexts:
+            environment: dict = {}
+            if extra is not None:
+                environment.update(extra=extra, extras=extras)
+            if groups is not None:
+                environment["dependency_groups"] = groups
+            if _evaluate3(m._markers, target, environment) is not False:
+                return True
+        return False
     except Exception:  # packaging changed its internals: count it as needed rather than hide a gap
         return True
 
@@ -321,11 +346,89 @@ def marker_holds(marker: str | None, target: Target) -> bool:
 Parent = int | str | None
 
 
+def _uv_reachable(source: Source, target: Target, paths: dict[int, list[str]] | None = None) -> dict[int, Parent]:
+    """Walk selected uv roots, re-visiting a package when another edge activates more extras."""
+    selection = source.uv_selection
+    assert selection is not None
+    packages = source.uv_packages or []
+    roots = uv_selected_roots(source)
+    available_groups = {canonicalize_name(name) for name in source.uv_manifest.get("dependency-groups", {})} | {
+        name for i in roots for name in uv_group_names(packages[i])
+    }
+    if selection.only_groups:
+        groups = selection.only_groups | selection.groups
+    else:
+        defaults = available_groups if "*" in source.uv_default_groups else frozenset(source.uv_default_groups)
+        groups = selection.groups | defaults
+    if selection.no_dev:
+        groups = groups - {"dev"}
+    groups = frozenset(groups)
+    by_name: dict[str, list[int]] = {}
+    for i, package in enumerate(source.packages):
+        by_name.setdefault(package.key, []).append(i)
+    parents: dict[int, Parent] = {}
+    active: dict[int, frozenset[str]] = {}
+    queue: deque[tuple[int, frozenset[str], list[str]]] = deque()
+    paths = paths if paths is not None else {}
+
+    def visit(i: int, parent: Parent, extras: frozenset[str], path: list[str]) -> None:
+        if i not in parents:
+            parents[i] = parent
+            active[i] = extras
+            paths[i] = path
+            queue.append((i, extras, path))
+        elif not extras <= active[i]:
+            active[i] |= extras
+            queue.append((i, active[i], path))
+
+    def follow(dependencies: list[dict], parent: Parent, extras: frozenset[str], path: list[str]) -> None:
+        for dependency in dependencies:
+            if not marker_holds(dependency.get("marker"), target, extras=extras, groups=groups):
+                continue
+            candidates = by_name.get(canonicalize_name(dependency["name"]), [])
+            if version := dependency.get("version"):
+                exact = [i for i in candidates if source.packages[i].version == version]
+                candidates = exact or candidates  # retain conservative fallback for incomplete lock metadata
+            requested = frozenset(
+                canonicalize_name(extra) for extra in dependency.get("extra", dependency.get("extras", []))
+            )
+            for i in candidates:
+                visit(i, parent, requested, [*path, source.packages[i].name])
+
+    def dependencies(i: int, extras: frozenset[str], path: list[str]) -> None:
+        package = packages[i]
+        follow(package.get("dependencies", []), i, extras, path)
+        for name, optional in package.get("optional-dependencies", {}).items():
+            if canonicalize_name(name) in extras:
+                follow(optional, i, extras, path)
+
+    if not selection.only_groups:
+        for i in roots:
+            optional = uv_extra_names(packages[i])
+            visit(i, None, optional if selection.all_extras else selection.extras & optional, [source.packages[i].name])
+        # Runtime paths take priority over equally short group paths in --explain.
+        for _ in roots:
+            dependencies(*queue.popleft())
+        follow(source.uv_manifest.get("requirements", []), None, selection.extras, [])
+    for i in roots:
+        for name, group in packages[i].get("dev-dependencies", {}).items():
+            if canonicalize_name(name) in groups:
+                follow(group, canonicalize_name(name), frozenset(), [f"({canonicalize_name(name)} group)"])
+    for name, group in source.uv_manifest.get("dependency-groups", {}).items():
+        if canonicalize_name(name) in groups:
+            follow(group, canonicalize_name(name), frozenset(), [f"({canonicalize_name(name)} group)"])
+    while queue:
+        dependencies(*queue.popleft())
+    return parents
+
+
 def reachable(source: Source, target: Target) -> dict[int, Parent]:
     """Packages installed on `target`, each mapped to the parent it was first reached from.
 
     The walk is breadth-first from the roots, so following the parents gives a shortest path.
     """
+    if source.uv_selection is not None:
+        return _uv_reachable(source, target)
     by_name: dict[str, list[int]] = {}
     for i, p in enumerate(source.packages):
         by_name.setdefault(p.key, []).append(i)
@@ -404,7 +507,15 @@ def applies(pkg: Package, target: Target) -> bool:
 def check(sources: list[Source], targets: list[Target]) -> list[Row]:
     rows = []
     for source in sources:
-        installed = {t: reachable(source, t) for t in targets} if source.edges is not None else None
+        paths: dict[Target, dict[int, list[str]]] = {target: {} for target in targets}
+        installed = (
+            {
+                t: _uv_reachable(source, t, paths[t]) if source.uv_selection is not None else reachable(source, t)
+                for t in targets
+            }
+            if source.edges is not None
+            else None
+        )
         for i, pkg in enumerate(source.packages):
             if pkg.skip:
                 continue
@@ -415,6 +526,8 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                 needed = i in installed[t] if installed is not None else applies(pkg, t)
                 row.results[t] = status_for(files, t, wheels, pkg.yanked) if needed else Status.NOT_NEEDED
                 if needed and installed is not None:
-                    row.via[t] = dependency_path(source, installed[t], i)
+                    row.via[t] = (
+                        paths[t][i] if source.uv_selection is not None else dependency_path(source, installed[t], i)
+                    )
             rows.append(row)
     return rows

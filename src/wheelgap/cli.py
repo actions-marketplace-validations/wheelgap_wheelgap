@@ -10,15 +10,25 @@ import sys
 import tomllib
 from pathlib import Path
 
+from packaging.markers import InvalidMarker, Marker
 from packaging.utils import canonicalize_name
 
 from . import __version__
 from .api import running_python
-from .check import Row, Status, check, explain, has_sdist
+from .check import Row, Status, check, explain, has_sdist, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
 from .pyodide import PyodideLock, PyodideLockError, apply_bundled, check_targets, load_pyodide_lock
-from .pypi import check_index_url, fill_all, recheck_lock
-from .sources import Package, SourceError, load_inputs, pythons_outside_lock
+from .pypi import check_index_url, fill_all, is_pypi, keeps_locked_files, recheck_lock, split_credentials
+from .sources import (
+    Package,
+    Source,
+    SourceError,
+    UvSelection,
+    load_inputs,
+    pythons_outside_lock,
+    select_uv_dependencies,
+    uv_selected_roots,
+)
 from .targets import (
     ALIASES,
     DEFAULT_ANDROID_API,
@@ -27,9 +37,12 @@ from .targets import (
     DEFAULT_MACOS,
     DEFAULT_MUSL,
     DEFAULT_PLATFORMS,
+    DISTRO_ALIASES,
+    DISTROS,
     EXTRA_ARCHES,
     MANYLINUX_FLOOR,
     MANYLINUX_X86_ARCHES,
+    NATIVE_PLATFORMS,
     PLATFORMS,
     PYODIDE_PLATFORMS,
     Target,
@@ -38,7 +51,9 @@ from .targets import (
     parse_api_level,
     parse_ios_version,
     parse_version_pair,
+    resolve_distro,
     resolve_platform,
+    single_python,
 )
 
 EXAMPLES = """\
@@ -104,6 +119,11 @@ def make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--glibc", metavar="X.Y", help=f"glibc version for linux-* targets (default: {DEFAULT_GLIBC})")
     p.add_argument("--musl", metavar="X.Y", help=f"musl version for musl-* targets (default: {DEFAULT_MUSL})")
+    p.add_argument(
+        "--distro",
+        metavar="NAME",
+        help="default glibc/musl version from a distro, e.g. ubuntu-22.04 (does not select -t)",
+    )
     p.add_argument("--macos", metavar="X.Y", help=f"minimum macOS for macos-* targets (default: {DEFAULT_MACOS})")
     p.add_argument("--ios", metavar="X.Y", help=f"minimum iOS for ios-* targets (default: {DEFAULT_IOS})")
     p.add_argument(
@@ -121,9 +141,17 @@ def make_parser() -> argparse.ArgumentParser:
         metavar="PATH_OR_HTTPS_URL",
         help="a Pyodide release's pyodide-lock.json: packages Pyodide ships itself count as available on -t pyodide",
     )
+    p.add_argument("--extra", action="append", metavar="NAME", help="include a uv project extra (repeatable)")
+    p.add_argument("--all-extras", action="store_true", help="include every uv project extra")
+    p.add_argument("--group", action="append", metavar="NAME", help="include a uv dependency group (repeatable)")
+    p.add_argument("--no-dev", action="store_true", help="exclude the default uv dev group")
+    p.add_argument(
+        "--only-group", action="append", metavar="NAME", help="check only a uv dependency group (repeatable)"
+    )
     p.add_argument(
         "--online", action="store_true", help="re-check lockfile packages against PyPI instead of trusting the lockfile"
     )
+    p.add_argument("--offline", action="store_true", help="never contact an index; fail if an input needs one")
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
     p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
     p.add_argument(
@@ -152,6 +180,13 @@ def make_parser() -> argparse.ArgumentParser:
         choices=FAIL_ON,
         help="exit 1 on any gap ('source', the default) or only when a package can't install ('missing')",
     )
+    p.add_argument(
+        "--index-url",
+        metavar="URL",
+        help="look packages up in this simple index (PEP 691 JSON) instead of PyPI's JSON API "
+        "(lockfiles that list their files are still read offline unless --online); "
+        "credentials can go in the URL (https://user:token@host/simple)",
+    )
     p.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     p.add_argument("--list-targets", action="store_true", help="list platforms, aliases and compatibility limits")
     p.add_argument("-V", "--version", action="version", version=f"wheelgap {__version__}")
@@ -159,8 +194,8 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 FAIL_ON = ("source", "missing")
-LIST_KEYS = ("python", "targets", "ignore")
-STR_KEYS = ("glibc", "musl", "macos", "ios", "android-api", "fail-on", "pyodide-lock")
+LIST_KEYS = ("python", "targets", "ignore", "extras", "groups")
+STR_KEYS = ("glibc", "musl", "macos", "ios", "android-api", "fail-on", "distro", "pyodide-lock", "index-url")
 
 
 def project_dir(inputs: list[str]) -> Path:
@@ -223,6 +258,7 @@ def load_config(path: Path) -> dict:
                     "musl": 'a string like "1.2"',
                     "macos": 'a string like "14.0"',
                     "fail-on": 'a string like "missing"',
+                    "distro": 'a string like "ubuntu-22.04"',
                     "pyodide-lock": "a path or URL string",
                 }.get(key, 'a string like "2.31"')
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be {example}")
@@ -235,6 +271,37 @@ def load_config(path: Path) -> dict:
             raise SourceError(f"{path}: unknown key in [tool.wheelgap]: {key}")
         config[key] = value
     return config
+
+
+def load_uv_targets(path: Path, pythons: list[str]) -> list[str]:
+    """Native platforms needed by any required-environments marker for any selected Python."""
+    table = tomllib.loads(path.read_text(encoding="utf-8")).get("tool", {}).get("uv", {})
+    if not isinstance(table, dict):
+        raise SourceError(f"{path}: [tool.uv] must be a table")
+    markers = table.get("required-environments", [])
+    if isinstance(markers, str):  # uv accepts a single marker as well as a list
+        markers = [markers]
+    if not isinstance(markers, list) or not all(isinstance(m, str) for m in markers):
+        raise SourceError(f"{path}: [tool.uv] required-environments must be a string or a list of strings")
+    if not markers:
+        return []
+    # marker_holds conservatively accepts unparseable package markers. A project setting
+    # should instead report a typo, rather than silently select every native platform.
+    for marker in markers:
+        try:
+            Marker(marker)
+        except InvalidMarker as e:
+            raise SourceError(f"{path}: [tool.uv] required-environments has an invalid marker {marker!r}: {e}") from e
+    targets = build_targets(pythons, NATIVE_PLATFORMS)
+    platforms = list(dict.fromkeys(t.platform for t in targets if any(marker_holds(m, t) for m in markers)))
+    if not platforms:
+        # e.g. a mobile-only project, or `wheelgap requests` run in a project folder: don't fail the run
+        print(
+            f"wheelgap: note: {path} [tool.uv] required-environments matches none of the native targets "
+            f"for Python {', '.join(pythons)}, so the default targets are checked; select targets with -t",
+            file=sys.stderr,
+        )
+    return platforms
 
 
 class Style:
@@ -393,14 +460,29 @@ def report_json(
     )
 
 
+def libc_versions(args: argparse.Namespace, config: dict) -> tuple[str, str]:
+    """CLI libc > CLI distro > Dockerfile/config libc > config distro > built-ins."""
+    defaults = {}
+    if "distro" in config:
+        key, version = resolve_distro(config["distro"])  # validate it even when --distro wins
+        if args.distro is None:
+            defaults[key] = version
+    defaults.update(config)
+    if args.distro is not None:
+        key, version = resolve_distro(args.distro)
+        defaults[key] = version
+    return args.glibc or defaults.get("glibc", DEFAULT_GLIBC), args.musl or defaults.get("musl", DEFAULT_MUSL)
+
+
 def print_target_list(args: argparse.Namespace, config: dict) -> None:
     aliases: dict[str, list[str]] = {name: [] for name in PLATFORMS}
     for alias, name in ALIASES.items():
         aliases[name].append(alias)
 
+    glibc_version, musl_version = libc_versions(args, config)
     versions = {
-        "manylinux": ("glibc", args.glibc or config.get("glibc", DEFAULT_GLIBC)),
-        "musllinux": ("musl", args.musl or config.get("musl", DEFAULT_MUSL)),
+        "manylinux": ("glibc", glibc_version),
+        "musllinux": ("musl", musl_version),
         "macos": ("macOS", args.macos or config.get("macos", DEFAULT_MACOS)),
     }
     limits = {}
@@ -443,6 +525,10 @@ def print_target_list(args: argparse.Namespace, config: dict) -> None:
     for name, names, accepts in table:
         print(f"{name:<{name_width}}  {names:<{alias_width}}  {accepts}")
     print("Docker platform names like linux/arm64 also work.")
+    print("\nDistros (--distro supplies a libc version, not a target):")
+    for name, (libc, version) in DISTROS.items():
+        names = ", ".join(alias for alias, canonical in DISTRO_ALIASES.items() if canonical == name)
+        print(f"  {name:<18} {libc} {version}" + (f" (also {names})" if names else ""))
 
 
 def worst_status(row: Row) -> Status:
@@ -467,6 +553,28 @@ def gap_summary(gaps: list[Row], total: int, style: Style) -> str:
     verb = "has" if len(gaps) == 1 else "have"
     noun = "package" if total == 1 else "packages"
     return f"{style.bold(f'{len(gaps)} of {total} {noun}')} {verb} gaps: " + ", ".join(parts) + "."
+
+
+def target_lines(gaps: list[Row], targets: list[Target], style: Style) -> list[str]:
+    if len(targets) < 2:
+        return []
+
+    multi_py = len({target.python for target in targets}) > 1
+    lines = []
+    for target in targets:
+        statuses = [row.results[target] for row in gaps]
+        parts = []
+        if source := statuses.count(Status.SOURCE):
+            parts.append(style.yellow(f"{source} from source"))
+        if missing := statuses.count(Status.MISSING):
+            parts.append(style.red(f"{missing} missing"))
+        if unknown := statuses.count(Status.UNKNOWN):
+            parts.append(style.dim(f"{unknown} unknown"))
+        if parts:
+            lines.append((target.label(multi_py), ", ".join(parts)))
+
+    width = max((len(label) for label, _ in lines), default=0)
+    return [f"{label:<{width}}  {counts}" for label, counts in lines]
 
 
 _MD_SPECIAL = re.compile(r"([\\`*_\[\]<>#|~&])")
@@ -549,6 +657,42 @@ def render_markdown(
     return out
 
 
+def input_error_json(e: Exception) -> int:
+    """With --json, also put an input error on stdout so scripts don't have to parse stderr."""
+    print(json.dumps({"error": {"message": str(e), "type": type(e).__name__}}))
+    return 2
+
+
+def selected_packages(source: Source, targets: list[Target]) -> list[Package]:
+    if source.uv_selection is None:
+        return source.packages
+    selected = set().union(*(reachable(source, target) for target in targets))
+    return [package for index, package in enumerate(source.packages) if index in selected]
+
+
+def require_offline(sources: list[Source]) -> None:
+    """--offline: raise SourceError if an input has packages that can only be answered by looking them up."""
+    problems = []
+    for s in sources:
+        # A private-index package with no files is skipped by fill_all, not looked up, so it doesn't count.
+        need = [p.name for p in s.packages if not p.skip and p.files is None and is_pypi(p.registry)]
+        if need:
+            names = ", ".join(need[:3]) + (", …" if len(need) > 3 else "")
+            problems.append(
+                f"{s.label} needs the index for {len(need)} package{'s' if len(need) != 1 else ''} ({names})"
+            )
+    if problems:
+        raise SourceError(
+            f"--offline: {'; '.join(problems)}; use a lockfile that lists each package's files, or drop --offline"
+        )
+
+
+def refuse_pyodide_url(spec: str) -> None:
+    """--offline: a pyodide-lock.json URL would be downloaded, so ask for a local copy instead."""
+    if "://" in spec:
+        raise PyodideLockError(f"--offline: {spec} would be downloaded; save it and pass its path, or drop --offline")
+
+
 def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         # Don't crash printing ✓ to a non-UTF-8 pipe (e.g. Windows cp1252).
@@ -567,6 +711,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--json and --markdown can't be used together")
     if args.list_targets and args.markdown:
         parser.error("--list-targets has no Markdown form (use --json)")
+    if args.offline and args.online:
+        parser.error("--offline and --online can't be used together")
     try:
         if args.list_targets:
             pyproject = find_pyproject(args.inputs)
@@ -585,20 +731,70 @@ def main(argv: list[str] | None = None) -> int:
                 args.target = [musl_docker_names(item) for item in args.target]
             config.update(python=[image.python], targets=[image.platform])
             config.update({k: v for k, v in (("glibc", image.glibc), ("musl", image.musl)) if v})
+        glibc_version, musl_version = libc_versions(args, config)
+        pythons = (
+            args.python or config.get("python") or read_python_version(project_dir(args.inputs)) or [running_python()]
+        )
+        platforms = args.target or config.get("targets", [])
+        if not platforms and pyproject:
+            platforms = load_uv_targets(pyproject, pythons)
+            if platforms and not quiet:
+                note = (
+                    f"wheelgap: note: targets from {pyproject} [tool.uv] required-environments: {', '.join(platforms)}"
+                )
+                if any(p.startswith("musl-") for p in platforms):
+                    note += "; Linux markers select both glibc and musl targets"
+                print(note, file=sys.stderr)
         targets = build_targets(
-            args.python or config.get("python") or read_python_version(project_dir(args.inputs)) or [running_python()],
-            args.target or config.get("targets", []),
-            args.glibc or config.get("glibc", DEFAULT_GLIBC),
-            args.musl or config.get("musl", DEFAULT_MUSL),
+            pythons,
+            platforms,
+            glibc_version,
+            musl_version,
             args.macos or config.get("macos", DEFAULT_MACOS),
             args.ios or config.get("ios", DEFAULT_IOS),
             args.android_api or config.get("android-api", DEFAULT_ANDROID_API),
         )
-        check_index_url()
+        index_url = args.index_url if args.index_url is not None else config.get("index-url")
+        if index_url is not None:
+            _, auth = split_credentials(index_url)
+            if auth is not None and args.index_url is None:
+                raise SourceError(
+                    "[tool.wheelgap] index-url must not contain credentials: "
+                    "pass the URL with --index-url from a CI secret instead"
+                )
+        else:
+            check_index_url()  # WHEELGAP_INDEX_URL only matters for the JSON API
         sources = load_inputs(args.inputs or ["."])
+        extra_names = args.extra if args.extra is not None else config.get("extras")
+        group_names = args.group if args.group is not None else config.get("groups")
+        if args.only_group:
+            if args.extra is None:
+                extra_names = None
+            if args.group is None:
+                group_names = None
+        if args.no_dev and args.group is None and group_names is not None:
+            group_names = [name for name in group_names if canonicalize_name(name) != "dev"]
+        from_cli = args.extra is not None or args.group is not None or args.all_extras or args.no_dev
+        if from_cli or args.only_group or extra_names is not None or group_names is not None:
+            select_uv_dependencies(
+                sources,
+                UvSelection(
+                    extras=frozenset(canonicalize_name(name) for name in extra_names or []),
+                    all_extras=args.all_extras,
+                    groups=frozenset(canonicalize_name(name) for name in group_names or []),
+                    no_dev=args.no_dev,
+                    only_groups=frozenset(canonicalize_name(name) for name in args.only_group or []),
+                ),
+                # Configured extras/groups apply to uv.lock inputs only; on the command line they need one.
+                strict=bool(from_cli or args.only_group),
+            )
+        if args.offline:
+            require_offline(sources)
         fail_on = args.fail_on or config.get("fail-on", "source")
         pyodide_lock = None
         if args.pyodide_lock:
+            if args.offline:
+                refuse_pyodide_url(args.pyodide_lock)
             pyodide_lock = load_pyodide_lock(args.pyodide_lock)
             check_targets(pyodide_lock, targets)  # asked for explicitly, so a mismatch is an error
         elif (lock_spec := config.get("pyodide-lock")) and any(PLATFORMS[t.platform][0] == "pyodide" for t in targets):
@@ -606,39 +802,76 @@ def main(argv: list[str] | None = None) -> int:
             # affects `wheelgap -t linux` in the same project. A relative path is relative to pyproject.toml.
             if pyproject and not lock_spec.lower().startswith(("http://", "https://")):
                 lock_spec = str(pyproject.parent / lock_spec)
+            if args.offline:
+                refuse_pyodide_url(lock_spec)
             pyodide_lock = load_pyodide_lock(lock_spec)
             check_targets(pyodide_lock, targets)  # pyodide targets but none for this lock's Python: say so
     except (TargetError, SourceError, DockerfileError, PyodideLockError, OSError) as e:
         print(f"wheelgap: error: {e}", file=sys.stderr)
-        return 2
+        return input_error_json(e) if args.json else 2
     except Exception as e:  # malformed TOML and friends
         print(f"wheelgap: error: {type(e).__name__}: {e}", file=sys.stderr)
-        return 2
+        return input_error_json(e) if args.json else 2
 
-    packages = [p for s in sources for p in s.packages]
-    fill_all(packages, refresh=args.online)
-    if not args.online:
-        for s in sources:
-            if outside := pythons_outside_lock(s, targets):
-                other, failed = recheck_lock(s.packages)
-                note = (
-                    f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it may be missing "
-                    f"wheels for Python {', '.join(outside)}; looked its PyPI packages up on the index too"
+    needed_by_source = [selected_packages(source, targets) for source in sources]
+    packages = [package for needed in needed_by_source for package in needed]
+    for s, needed in zip(sources, needed_by_source, strict=True):
+        if s.uv_selection is not None and not s.uv_selection.only_groups and not quiet:
+            kept, start = {id(p) for p in needed}, set(uv_selected_roots(s))
+            members = {s.packages[i].name for i in s.roots if i not in start and id(s.packages[i]) not in kept}
+            if unchecked := sorted(members):
+                print(
+                    f"wheelgap: note: {s.label}: the selection checks the root project and what it installs; "
+                    f"workspace members outside it aren't checked: {', '.join(unchecked)}",
+                    file=sys.stderr,
                 )
-                unchecked = [f"{other} from other indexes"] * bool(other) + [
-                    f"{failed} that couldn't be looked up"
-                ] * bool(failed)
-                if unchecked:
-                    note += f"; {' and '.join(unchecked)} may show false gaps for those Pythons"
-                if unchecked or not quiet:  # quiet runs stay quiet unless the answer may be wrong
-                    print(note, file=sys.stderr)
+    other_index = fill_all(packages, refresh=args.online, python=single_python(targets), simple_index=index_url)
+    if args.online and other_index and not quiet:
+        print(
+            f"wheelgap: note: --online looks up PyPI packages only; kept the locked files of {other_index} "
+            f"package{'s' if other_index != 1 else ''} from other indexes",
+            file=sys.stderr,
+        )
+    for s, needed in zip(sources, needed_by_source, strict=True):
+        if outside := pythons_outside_lock(s, targets):
+            if args.offline:  # no re-check, so every locked package may lack wheels for those Pythons
+                print(
+                    f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it may be missing "
+                    f"wheels for Python {', '.join(outside)}; with --offline its packages weren't re-checked on the "
+                    "index, so they may show false gaps for those Pythons",
+                    file=sys.stderr,
+                )
+                continue
+            if args.online:  # fill_all looked up the PyPI packages; the others kept the lock's files
+                other = sum(1 for p in needed if keeps_locked_files(p))
+                failed = 0
+                if not other:
+                    continue
+            else:
+                other, failed = recheck_lock(needed, simple_index=index_url)
+            note = (
+                f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it may be missing "
+                f"wheels for Python {', '.join(outside)}; looked its PyPI packages up on the index too"
+            )
+            unchecked = [f"{other} from other indexes"] * bool(other)
+            unchecked += [f"{failed} that couldn't be looked up"] * bool(failed)
+            if unchecked:
+                note += f"; {' and '.join(unchecked)} may show false gaps for those Pythons"
+            if unchecked or not quiet:  # quiet runs stay quiet unless the answer may be wrong
+                print(note, file=sys.stderr)
     skipped = [p for p in packages if p.skip]
     rows = [r for r in check(sources, targets) if r.needed]
     if pyodide_lock:
         apply_bundled(rows, targets, pyodide_lock)
     rows.sort(key=lambda r: r.package.key)
     ignore_names = args.ignore or config.get("ignore", [])
-    ignore = {canonicalize_name(name.strip()) for item in ignore_names for name in item.split(",") if name.strip()}
+    raw_ignore = [name.strip() for item in ignore_names for name in item.split(",") if name.strip()]
+    ignore = {canonicalize_name(name) for name in raw_ignore}
+    if raw_ignore and not quiet:
+        known_keys = {p.key for s in sources for p in s.packages}  # every package read, selected or not
+        unmatched = list(dict.fromkeys(name for name in raw_ignore if canonicalize_name(name) not in known_keys))
+        if unmatched:
+            print(f"wheelgap: note: --ignore matches no package: {', '.join(unmatched)}", file=sys.stderr)
     # One entry per package, named as its first input writes it (PyYAML, not pyyaml).
     first_names = {r.package.key: r.package.name for r in reversed(rows) if r.package.key in ignore}
     ignored = sorted(first_names.values(), key=str.lower)
@@ -715,6 +948,8 @@ def main(argv: list[str] | None = None) -> int:
         print(style.green(f"✓ {what} a wheel for {'every one of ' if n_t > 1 else ''}{n_t} target{'s' * (n_t > 1)}."))
         return 0
 
+    for line in target_lines(gaps, targets, style):
+        print(line)
     print(gap_summary(gaps, len(rows), style))
     if not args.explain:
         print(style.dim("Run with --explain to see which wheels were rejected and why."))

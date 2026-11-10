@@ -4,6 +4,9 @@ Closes #
 
 ### What this changes
 
+
+AI tools used (if any):
+
 ### Checklist
 
 - [ ] Tests added or updated (no network access: use `fake_pypi` or a fixture)

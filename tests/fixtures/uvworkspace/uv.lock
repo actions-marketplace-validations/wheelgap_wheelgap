@@ -1,0 +1,95 @@
+version = 1
+revision = 5
+requires-python = ">=3.11"
+
+[manifest]
+members = [
+    "basepkg",
+    "devpkg",
+    "docspkg",
+    "featurepkg",
+    "gpupkg",
+    "libpkg",
+    "oracle-app",
+    "unusedmember",
+]
+
+[[package]]
+name = "basepkg"
+version = "1.0"
+source = { editable = "packages/basepkg" }
+
+[[package]]
+name = "devpkg"
+version = "1.0"
+source = { editable = "packages/devpkg" }
+
+[[package]]
+name = "docspkg"
+version = "1.0"
+source = { editable = "packages/docspkg" }
+
+[[package]]
+name = "featurepkg"
+version = "1.0"
+source = { editable = "packages/featurepkg" }
+
+[[package]]
+name = "gpupkg"
+version = "1.0"
+source = { editable = "packages/gpupkg" }
+
+[[package]]
+name = "libpkg"
+version = "1.0"
+source = { editable = "packages/libpkg" }
+
+[package.optional-dependencies]
+feature = [
+    { name = "featurepkg" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "featurepkg", marker = "extra == 'feature'", editable = "packages/featurepkg" }]
+provides-extras = ["feature"]
+
+[[package]]
+name = "oracle-app"
+version = "1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "basepkg" },
+]
+
+[package.optional-dependencies]
+api = [
+    { name = "libpkg", extra = ["feature"] },
+]
+gpu = [
+    { name = "gpupkg" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "devpkg" },
+]
+docs = [
+    { name = "docspkg" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "basepkg", editable = "packages/basepkg" },
+    { name = "gpupkg", marker = "extra == 'gpu'", editable = "packages/gpupkg" },
+    { name = "libpkg", extras = ["feature"], marker = "extra == 'api'", editable = "packages/libpkg" },
+]
+provides-extras = ["api", "gpu", "empty"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "devpkg", editable = "packages/devpkg" }]
+docs = [{ name = "docspkg", editable = "packages/docspkg" }]
+
+[[package]]
+name = "unusedmember"
+version = "1.0"
+source = { editable = "packages/unusedmember" }

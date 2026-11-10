@@ -29,6 +29,7 @@ from .targets import (
     DEFAULT_PLATFORMS,
     Target,
     build_targets,
+    single_python,
 )
 
 _OK = (Status.WHEEL, Status.NOT_NEEDED, Status.BUNDLED)
@@ -119,7 +120,7 @@ def check_packages(
     pkgs = [Package(p, None) if isinstance(p, str) else Package(p[0], p[1]) for p in packages]
     for p in pkgs:
         p.origin = "api"
-    fill_all(pkgs, workers=workers)
+    fill_all(pkgs, workers=workers, python=single_python(targets))
     return [
         _result(p, {t: status_for(None if p.error else p.files, t, yanked=p.yanked) for t in targets}) for p in pkgs
     ]
@@ -155,7 +156,7 @@ def check_lockfile(
     targets = list(targets) if targets is not None else make_targets()
     p = Path(path)
     source: Source = load_file(find_lockfile(p) if p.is_dir() else p)
-    fill_all(source.packages, refresh=online)
+    fill_all(source.packages, refresh=online, python=single_python(targets))
     if not online and pythons_outside_lock(source, targets):
         recheck_lock(source.packages)
     rows: list[Row] = [r for r in check([source], targets) if r.needed]

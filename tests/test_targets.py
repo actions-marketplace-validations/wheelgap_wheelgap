@@ -1,6 +1,7 @@
 import pytest
 from packaging.utils import parse_wheel_filename
 
+from wheelgap import targets as target_module
 from wheelgap.targets import (
     DEFAULT_PLATFORMS,
     EVERY_NATIVE_PLATFORM,
@@ -17,6 +18,40 @@ from wheelgap.targets import (
 
 def accepts(target: Target, filename: str) -> bool:
     return target.accepts(parse_wheel_filename(filename)[3])
+
+
+@pytest.mark.parametrize(
+    "names,libc,version",
+    [
+        (("ubuntu-20.04",), "glibc", "2.31"),
+        (("ubuntu-22.04", " UBUNTU-22.04 "), "glibc", "2.35"),
+        (("ubuntu-24.04",), "glibc", "2.39"),
+        (("debian-11", "bullseye"), "glibc", "2.31"),
+        (("debian-12", "bookworm"), "glibc", "2.36"),
+        (("debian-13", "trixie"), "glibc", "2.41"),
+        (("rhel-8", "rocky-8", "alma-8"), "glibc", "2.28"),
+        (("rhel-9", "rocky-9", "alma-9"), "glibc", "2.34"),
+        (("amazonlinux-2",), "glibc", "2.26"),
+        (("amazonlinux-2023",), "glibc", "2.34"),
+        (("alpine",), "musl", "1.2"),
+    ],
+)
+def test_distro_versions_and_wheel_boundaries(names, libc, version):
+    for name in names:
+        assert target_module.resolve_distro(name) == (libc, version)
+        platform, family = ("linux-x86_64", "manylinux") if libc == "glibc" else ("musl-x86_64", "musllinux")
+        target = build_targets(["3.13"], [platform], **{libc: version})[0]
+        major, minor = map(int, version.split("."))
+        assert accepts(target, f"pkg-1.0-cp313-cp313-{family}_{major}_{minor}_x86_64.whl")
+        assert not accepts(target, f"pkg-1.0-cp313-cp313-{family}_{major}_{minor + 1}_x86_64.whl")
+
+
+@pytest.mark.parametrize("name", ["", "ubuntu-99.04", "alpine-3.12", "rocky-10"])
+def test_unknown_distro_lists_supported_names(name):
+    with pytest.raises(TargetError, match="unknown distro") as caught:
+        target_module.resolve_distro(name)
+    for known in ("ubuntu-22.04", "bookworm", "rocky-9", "alma-8", "alpine"):
+        assert known in str(caught.value)
 
 
 def t(platform: str, py: str = "3.13", **kw) -> Target:
