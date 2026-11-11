@@ -1,10 +1,13 @@
 import json
+import shutil
+import subprocess
+import sys
 
 import pytest
 
 from wheelgap.api import Result, make_targets
 from wheelgap.check import Status
-from wheelgap.diff import main, merge, worse
+from wheelgap.diff import git_ref_input, main, merge, worse
 
 TARGET = ["-p", "3.13", "-t", "linux-x86_64"]
 TWO_TARGETS = ["-p", "3.13", "-t", "linux-x86_64", "-t", "win-amd64"]
@@ -363,3 +366,163 @@ def test_diff_json_unknown_version_is_an_empty_list(fake_pypi, tmp_path, capsys)
     assert main([old, new, *TARGET, "--json"]) == 1
     (item,) = json.loads(capsys.readouterr().out)["new"]
     assert item["versions"] == [] and item["targets"]["linux-x86_64"] == {"status": "unknown"}
+
+
+# REF:PATH inputs (#199): `wheelgap diff origin/main:uv.lock uv.lock` reads the old side with `git show`.
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git isn't installed")
+UV_OLD = uv_lock(['{ name = "purewheel" }']) + UV_PUREWHEEL
+UV_NEW = (
+    uv_lock(
+        [
+            """{ name = "purewheel", version = "3.1", source = { registry = "https://pypi.org/simple" }, """
+            """marker = "sys_platform == 'win32'" }""",
+            f"""{{ name = "purewheel", version = "3.2", source = {GIT_SOURCE}, """
+            """marker = "sys_platform != 'win32'" }""",
+        ]
+    )
+    + UV_PUREWHEEL
+    + UV_GIT
+)
+
+
+def git(*args, cwd):
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+    )
+
+
+@pytest.fixture
+def repo(tmp_path, monkeypatch):
+    """A git repo whose HEAD has UV_OLD as uv.lock, with UV_NEW in the working copy."""
+    git("init", "-q", cwd=tmp_path)
+    (tmp_path / "uv.lock").write_text(UV_OLD)
+    git("add", "uv.lock", cwd=tmp_path)
+    git("commit", "-q", "-m", "old", cwd=tmp_path)
+    (tmp_path / "uv.lock").write_text(UV_NEW)
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+@needs_git
+def test_diff_reads_a_git_ref(fake_pypi, repo, capsys):
+    assert main(["HEAD:uv.lock", "uv.lock", *TWO_TARGETS]) == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "purewheel 3.1 → 3.1, 3.2",
+        "  linux-x86_64: ✓ → skipped (git)",
+        "1 package got worse.",
+    ]
+    # The same ref on both sides: nothing changed, and no temporary file is left in the repo.
+    assert main(["HEAD:uv.lock", "HEAD:./uv.lock", *TWO_TARGETS]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]
+    assert sorted(p.name for p in repo.iterdir()) == [".git", "uv.lock"]
+
+
+@needs_git
+def test_diff_reads_a_git_ref_json(fake_pypi, repo, capsys):
+    assert main(["HEAD:uv.lock", "uv.lock", *TWO_TARGETS, "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    assert [item["name"] for item in data["worse"]] == ["purewheel"]
+    assert data["summary"] == {"worse": 1, "new": 0}
+
+
+@needs_git
+@pytest.mark.parametrize(
+    ("ref", "message"),
+    [
+        ("nosuchbranch:uv.lock", "invalid object name 'nosuchbranch'"),
+        ("HEAD:poetry.lock", "path 'poetry.lock' does not exist in 'HEAD'"),
+        # A ref that looks like an option stays a ref: git doesn't write the file.
+        ("--output=out.txt:uv.lock", "can't read --output=out.txt:uv.lock from git"),
+    ],
+)
+def test_diff_bad_git_ref_exits_2(fake_pypi, repo, capsys, ref, message):
+    assert main([*TARGET, "--", ref, "uv.lock"]) == 2  # `--`: argparse would read --output=... as its own option
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.startswith("wheelgap: error: GitInputError: ") and message in err
+    assert sorted(p.name for p in repo.iterdir()) == [".git", "uv.lock"]  # git wrote nothing
+
+
+@needs_git
+def test_diff_bad_git_ref_json_error(fake_pypi, repo, capsys):
+    assert main(["nosuchbranch:uv.lock", "uv.lock", *TARGET, "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["error"]["type"] == "GitInputError"
+
+
+def test_diff_git_ref_without_git_exits_2(fake_pypi, tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path / "nothing-here"))
+    assert main(["origin/main:uv.lock", str(tmp_path), *TARGET]) == 2
+    assert "origin/main:uv.lock looks like a git ref, but git isn't on PATH" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("arg", "expected"),
+    [
+        ("origin/main:uv.lock", ("origin/main", "uv.lock")),
+        ("HEAD~1:sub/dir/poetry.lock", ("HEAD~1", "sub/dir/poetry.lock")),
+        ("uv.lock", None),
+        ("HEAD:", None),
+        (":uv.lock", None),
+        ("HEAD:sub/", None),
+        ("C:\\proj\\uv.lock", None),
+        ("C:/proj/uv.lock", None),
+    ],
+)
+def test_git_ref_input(arg, expected):
+    assert git_ref_input(arg) == expected
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="':' isn't allowed in a Windows file name (a:uv.lock is on drive A:)"
+)
+def test_git_ref_input_prefers_an_existing_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a:uv.lock").mkdir()
+    assert git_ref_input("a:uv.lock") is None
+
+
+POETRY_1X_LOCK = """\
+[[package]]
+name = "click"
+version = "8.1.7"
+description = ""
+optional = false
+python-versions = ">=3.7"
+files = [{file = "click-8.1.7-py3-none-any.whl", hash = "sha256:00"}]
+
+[package.dependencies]
+colorama = {version = "*", markers = "platform_system == \\"Windows\\""}
+
+[[package]]
+name = "colorama"
+version = "0.4.6"
+description = ""
+optional = false
+python-versions = "*"
+files = [{file = "colorama-0.4.6.tar.gz", hash = "sha256:00"}]
+
+[metadata]
+lock-version = "2.0"
+python-versions = "^3.11"
+content-hash = "0"
+"""
+
+
+@needs_git
+def test_diff_git_ref_brings_the_pyproject_along(fake_pypi, tmp_path, monkeypatch, capsys):
+    # A Poetry lock older than 2.1 takes its direct dependencies (here colorama, which click only needs on
+    # Windows) from the pyproject.toml beside it. Without it at the ref, colorama would look like a new gap.
+    git("init", "-q", cwd=tmp_path)
+    (tmp_path / "poetry.lock").write_text(POETRY_1X_LOCK, encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.poetry.dependencies]\npython = "^3.11"\nclick = "*"\ncolorama = "*"\n', encoding="utf-8"
+    )
+    git("add", "poetry.lock", "pyproject.toml", cwd=tmp_path)
+    git("commit", "-q", "-m", "lock", cwd=tmp_path)
+    monkeypatch.chdir(tmp_path)
+    assert main(["HEAD:poetry.lock", "poetry.lock", *TARGET]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]

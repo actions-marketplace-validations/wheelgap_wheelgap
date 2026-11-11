@@ -179,8 +179,8 @@ project extras are included only when requested. `--no-dev` removes `dev`, while
 excludes project dependencies and default groups. Combine `--only-group` with `--group` to add more
 groups, but not with `--extra`/`--all-extras`. An explicit `dev` group conflicts with `--no-dev`.
 Unknown extra/group names are errors. Command-line selectors need a `uv.lock` input, or for groups a Poetry 2.x
-`poetry.lock`, or for `--extra`/`--all-extras` a `pyproject.toml` (see below); configured `groups` apply to
-`uv.lock` and Poetry 2.x `poetry.lock` inputs, and configured `extras` only to `uv.lock` inputs.
+`poetry.lock` or a `pdm.lock`, or for `--extra`/`--all-extras` a `pyproject.toml` (see below); configured `groups`
+apply to `uv.lock`, Poetry 2.x `poetry.lock` and `pdm.lock` inputs, and configured `extras` only to `uv.lock` inputs.
 
 `poetry.lock` (Poetry 2.x) inputs accept `--group`, `--only-group` and `--no-dev` with Poetry's meanings, and
 configured `groups` apply to them too. `main` and every group not marked `optional = true` in
@@ -188,6 +188,16 @@ configured `groups` apply to them too. `main` and every group not marked `option
 and `--only-group` checks only the named groups (`main` only if named). A package counts if any of its groups is
 selected, with the markers of those groups. `--extra` isn't supported for `poetry.lock` yet, and a command-line
 selection on a Poetry 1.x lock (no per-package groups) is an error; configured `groups` leave a 1.x lock unfiltered.
+
+`pdm.lock` inputs take the same selectors with PDM's meanings, and configured `groups` apply to them too. Every
+group the lock was made for (its `[metadata] groups`: `default`, the dev groups and any optional-dependencies groups
+locked with `pdm lock -G`) counts, as with a plain `pdm install`; `--no-dev` leaves out `dev` (like
+`pdm install --without dev`), and `--only-group` checks only the named groups (`default` only if named), so PDM's
+`--prod` is `--only-group default` here. `--group` only checks that the group is locked, since it already counts. A
+group that's in `pyproject.toml` but not in the lock is an error (lock it with `pdm lock -G <name>`), as in PDM. A
+package counts if any of its groups is selected. `--extra` isn't supported for `pdm.lock`, and a command-line
+selection on a lock without package groups (one locked without the `inherit_metadata` strategy) is an error;
+configured `groups` leave such a lock unfiltered.
 
 Default selections can also be configured:
 
@@ -336,6 +346,8 @@ for r in wheelgap.check_lockfile("uv.lock", targets):  # markers and the uv grap
 
 `check_lockfile(..., offline=True)` never contacts an index: it raises `wheelgap.sources.SourceError` if an input has no locked file list and skips the re-check for Python versions outside the lock's `requires-python` (so those versions may show false gaps). It cannot be combined with `online=True`.
 
+The package ships a `py.typed` marker (PEP 561), so mypy, pyright and other type checkers use its annotations.
+
 `check_packages([...])` checks many packages in parallel, and `check_package(..., files=[...])` works offline from filenames you already have.
 
 To count packages that Pyodide ships itself, as `--pyodide-lock` does, pass `pyodide_locks=[wheelgap.pyodide.load_pyodide_lock("pyodide-lock.json")]` (a path or https URL, one lock per Python) to `check_packages()`, `check_package()` or `check_lockfile()`. They show as `bundled` on pyodide targets for the lock's Python, and the result's `bundled_version` is the version Pyodide ships. A different version from your pin or range still counts as `bundled` (`ok` stays `True`, as in the CLI), so check `bundled_version_differs`; `to_dict()` includes both as `"bundled"` and `"bundled_version_differs"`. A lock that no pyodide target can use raises `PyodideLockError`, as on the command line.
@@ -354,9 +366,10 @@ Add `--pyodide-lock PATH_OR_URL` once per Pyodide release (each is for one Pytho
 
 ```bash
 wheelgap diff old/uv.lock uv.lock -p 3.13 -t linux-aarch64,musl-aarch64
+wheelgap diff origin/main:uv.lock uv.lock -p 3.13 -t linux-aarch64   # the base branch's lockfile, no checkout needed
 ```
 
-This checks both lockfiles and lists the packages that got worse on a target (a wheel that became a source build, say) and the new packages with gaps, so a dependency bump that drops a platform fails CI. It exits 1 if there are any, 0 if not, and 2 on bad input. A package that can no longer be checked counts as worse: `unknown`, or now installed from git, a path, a URL or a private index (a new one of those counts as a new gap). Packages are matched by name, so a requirements-file path with no name (`./pkg`, or `-e ./pkg` without `#egg=`) shows up as a new package rather than as the one it replaced. The same `-p` and `-t` apply to both lockfiles, and `[tool.wheelgap]` and `.python-version` aren't read yet, so pass them explicitly. `--json` prints one object with `worse` (each package's `old_versions` and `new_versions` lists and, per target, `old_status` and `new_status`), `new` (each new package's `versions` and per-target `status`), `unchecked` and `summary` counts; a skipped cell has the status `skipped` and a `skip_reason` (`git`, `url`, `private index`, ...). `diff` is a subcommand only as the first argument when there's no file or folder named `diff` in the current directory (then it's read as an input, with a note; `python -m wheelgap.diff` always compares, and a pinned `diff==2023.12.6` checks the PyPI package of that name). `python -m wheelgap.diff` works the same way.
+This checks both lockfiles and lists the packages that got worse on a target (a wheel that became a source build, say) and the new packages with gaps, so a dependency bump that drops a platform fails CI. It exits 1 if there are any, 0 if not, and 2 on bad input. A package that can no longer be checked counts as worse: `unknown`, or now installed from git, a path, a URL or a private index (a new one of those counts as a new gap). Packages are matched by name, so a requirements-file path with no name (`./pkg`, or `-e ./pkg` without `#egg=`) shows up as a new package rather than as the one it replaced. Either input can be a git `REF:PATH` (`origin/main:uv.lock`, `HEAD~1:poetry.lock`) when no file or folder of that name exists: wheelgap reads it with git into a temporary folder under the same file name (with the `pyproject.toml` beside it at that ref, if any), so its format is detected and read as usual. PATH is relative to the repository root: use `REF:./uv.lock` from a subfolder. In a shallow CI checkout, fetch the base ref first. A ref or path git can't find exits 2 with git's message, and so does a missing `git`. The same `-p` and `-t` apply to both lockfiles, and `[tool.wheelgap]` and `.python-version` aren't read yet, so pass them explicitly. `--json` prints one object with `worse` (each package's `old_versions` and `new_versions` lists and, per target, `old_status` and `new_status`), `new` (each new package's `versions` and per-target `status`), `unchecked` and `summary` counts; a skipped cell has the status `skipped` and a `skip_reason` (`git`, `url`, `private index`, ...). `diff` is a subcommand only as the first argument when there's no file or folder named `diff` in the current directory (then it's read as an input, with a note; `python -m wheelgap.diff` always compares, and a pinned `diff==2023.12.6` checks the PyPI package of that name). `python -m wheelgap.diff` works the same way.
 
 ### With an AI coding agent
 
@@ -379,7 +392,7 @@ On Claude Code 2.1.275 or later, `/plugin install wheelgap --marketplace wheelga
 claude mcp add wheelgap -- uvx --from git+https://github.com/wheelgap/wheelgap wheelgap-mcp
 ```
 
-Other clients take the same command (`uvx`) and arguments in their MCP settings. Pass `check_lockfile`, `check_dockerfile` and `diff_lockfiles` an absolute path or a `file://` URI, since the server's working directory may not be your project. If the client shares its [roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots), a relative path such as `uv.lock` is resolved against the first root that contains it.
+Other clients take the same command (`uvx`) and arguments in their MCP settings; the [MCP setup guide](https://github.com/wheelgap/wheelgap/blob/main/docs/mcp.md) has a copy-paste snippet for Claude Code, Cursor, VS Code, Codex and Claude Desktop. Pass `check_lockfile`, `check_dockerfile` and `diff_lockfiles` an absolute path or a `file://` URI, since the server's working directory may not be your project. If the client shares its [roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots), a relative path such as `uv.lock` is resolved against the first root that contains it.
 
 Contributing to wheelgap with an agent? See [AGENTS.md](https://github.com/wheelgap/wheelgap/blob/main/AGENTS.md).
 

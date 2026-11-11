@@ -986,3 +986,10 @@ def test_diff_lockfiles_errors(fake_pypi, tmp_path, arguments, message):
     assert reply["result"]["isError"] is True
     assert message in reply["result"]["content"][0]["text"]
     assert not fake_pypi
+
+
+def test_mcp_docs_name_every_tool():
+    """docs/mcp.md lists the server's tools; a new tool should be described there too."""
+    text = (Path(__file__).resolve().parent.parent / "docs" / "mcp.md").read_text(encoding="utf-8")
+    for tool in mcp.TOOLS:
+        assert f"`{tool['name']}`" in text

@@ -986,8 +986,8 @@ def main(argv: list[str] | None = None) -> int:
                     no_dev=args.no_dev,
                     only_groups=frozenset(canonicalize_name(name) for name in args.only_group or []),
                 ),
-                # Configured extras apply to uv.lock inputs only, configured groups to uv.lock and Poetry 2.x
-                # poetry.lock inputs; on the command line they need one of those.
+                # Configured extras apply to uv.lock inputs only, configured groups to uv.lock, Poetry 2.x
+                # poetry.lock and pdm.lock inputs; on the command line they need one of those.
                 strict=bool(from_cli or args.only_group),
                 configured_extras=args.extra is None and extra_names is not None,
                 poetry=bool(from_cli or args.only_group) or group_names is not None,
