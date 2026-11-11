@@ -53,9 +53,15 @@ from wheelgap.dockerfile import (
         ("--platform=linux/riscv64 python:3.14-trixie", ImageTarget("3.14", "linux-riscv64", glibc="2.41")),
         ("--platform=linux/s390x python:3.13-alpine", ImageTarget("3.13", "musl-s390x", musl="1.2")),
         ("--platform=linux/riscv64 python:3.13", ImageTarget("3.13", "linux-riscv64", glibc="2.41")),
+        ("--platform=linux/386 python:3.13-bookworm", ImageTarget("3.13", "linux-i686", glibc="2.36")),
+        ("--platform=linux/386 python:3.11-slim-bullseye", ImageTarget("3.11", "linux-i686", glibc="2.31")),
+        ("--platform=linux/386 python:3.13-alpine", ImageTarget("3.13", "musl-i686", musl="1.2")),
+        ("--platform=linux/i386 python:3.13-bookworm", ImageTarget("3.13", "linux-i686", glibc="2.36")),
         # Tags Docker Hub stopped rebuilding before it dropped s390x and ppc64le for bookworm and bullseye
         ("--platform=linux/s390x python:3.9-bookworm", ImageTarget("3.9", "linux-s390x", glibc="2.36")),
         ("--platform=linux/s390x python:3.12.7-bookworm", ImageTarget("3.12", "linux-s390x", glibc="2.36")),
+        ("--platform=linux/386 python:3.9-bookworm", ImageTarget("3.9", "linux-i686", glibc="2.36")),
+        ("--platform=linux/386 python:3.12.7-bookworm", ImageTarget("3.12", "linux-i686", glibc="2.36")),
         ("--platform=linux/ppc64le python:3.11.0-slim-bullseye", ImageTarget("3.11", "linux-ppc64le", glibc="2.31")),
         ("--platform=linux/s390x python:3.6", ImageTarget("3.6", "linux-s390x", glibc="2.31")),
         (
@@ -79,7 +85,8 @@ def test_parse_from(line, expected):
         ("ghcr.io/astral-sh/uv:0.13.7-alpine", r"must specify a Python version like python3\.13-alpine"),
         ("python:${PY}-slim", "build arguments"),
         ("--platform=$BUILDPLATFORM python:3.13", "build arguments"),
-        ("--platform=linux/386 python:3.13", "only linux/amd64"),
+        ("--platform=linux/mips64le python:3.13", "only linux/amd64"),
+        ("--platform=linux/386 ghcr.io/astral-sh/uv:python3.13-bookworm-slim", "only published for linux/amd64"),
         ("--platform=linux/s390x ghcr.io/astral-sh/uv:python3.13-bookworm-slim", "only published for linux/amd64"),
         ("python:3.13-slim-buster", "unknown image variant 'buster'"),
         ("--platform=linux/riscv64 python:3.13-bookworm", r"python:3\.13-bookworm isn't published for linux/riscv64"),
@@ -527,6 +534,8 @@ def test_python_imports_in_heredocs_are_not_from_lines(tmp_path):
         "FROM python:3.12-slim AS base\nFROM python:3.13-alpine\nRUN rm -rf /tmp/* \\\n# note\nFROM base\n",
         # With `# escape=` + "`", a trailing backtick continues the line (and a backslash doesn't).
         "# escape=`\nFROM python:3.12-windowsservercore AS base\nFROM python:3.13-alpine\nRUN echo `\nFROM base\n",
+        # A line of Go whitespace (U+3000 is unicode.IsSpace) is blank too, so FROM base is still part of the RUN.
+        "FROM python:3.12-slim AS base\nFROM python:3.13-alpine\nRUN rm -rf /tmp/* \\\n\u3000\nFROM base\n",
     ],
 )
 def test_continuations_like_docker(tmp_path, text):
@@ -542,10 +551,21 @@ def test_continuations_like_docker(tmp_path, text):
         "FROM python:3.13-alpine AS app\nRUN echo \\\\\nFROM python:3.12-slim\n",
         # Under `# escape=` + "`", a trailing backslash is just a character.
         "# escape=`\nFROM python:3.13-alpine AS app\nRUN dir C:\\\nFROM python:3.12-slim\n",
+        # \x1c-\x1f aren't Go's unicode.IsSpace, so a \x1c-only line isn't blank to Docker: it ends the RUN.
+        "FROM python:3.13-alpine AS app\nRUN echo \\\n\x1c\nFROM python:3.12-slim\n",
+        # Nor is a \x1f before # a comment line: the RUN ends there too.
+        "FROM python:3.13-alpine AS app\nRUN echo \\\n\x1f# note\nFROM python:3.12-slim\n",
     ],
 )
 def test_lines_that_do_not_continue(tmp_path, text):
     assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.12", "linux-x86_64", glibc="2.41")
+
+
+def test_x1c_before_a_hash_is_not_a_comment(tmp_path):
+    # Docker's isComment trims unicode.IsSpace only, so this line isn't a comment: it continues onto the FROM
+    # below, and the final stage is the 3.13 one.
+    text = "FROM python:3.13-alpine AS app\n\x1c# note \\\nFROM python:3.12-slim\n"
+    assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.13", "musl-x86_64", musl="1.2")
 
 
 @pytest.mark.parametrize(
@@ -646,6 +666,16 @@ def test_escape_directive_rules(tmp_path):
         ],
         # Outside a heredoc, a Python import is a FROM with the wrong arguments.
         ("FROM python:3.13\nfrom app import main\n", "expected 'IMAGE' or 'IMAGE AS NAME'"),
+        # Docker trims only unicode.IsSpace, so \x1cFROM is an unknown instruction to it, as FROM\x1d is.
+        ("FROM python:3.12-slim\n\x1cFROM python:3.13-alpine\n", "unknown instruction '\\\\x1cFROM'"),
+        ("FROM python:3.12-slim\nFROM\x1d python:3.13-alpine\n", "unknown instruction 'FROM\\\\x1d'"),
+        # With a space or tab after the \x1c, Docker's keyword is "\x1c" alone: still unknown, never a fallback.
+        ("FROM python:3.12-slim\n\x1c FROM python:3.13-alpine\n", "unknown instruction '\\\\x1c'"),
+        ("FROM python:3.12-slim\n\x1c\tFROM python:3.13-alpine\n", "unknown instruction '\\\\x1c'"),
+        # The same when the file ends mid-continuation.
+        ("FROM python:3.13-alpine\n\x1cFROM python:3.12-slim \\\n", "unknown instruction"),
+        # A trailing \x1c is part of the image reference to Docker, which rejects the tag.
+        ("FROM python:3.13-alpine\x1c\n", "invalid tag"),
     ],
 )
 def test_dockerfiles_docker_rejects(tmp_path, text, message):

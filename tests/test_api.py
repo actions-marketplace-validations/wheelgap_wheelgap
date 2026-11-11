@@ -279,3 +279,11 @@ def test_check_lockfile_rejects_online_and_offline_before_loading(fake_pypi, tmp
     with pytest.raises(ValueError, match="online.*offline"):
         wheelgap.check_lockfile(tmp_path / "absent.lock", online=True, offline=True)
     assert not fake_pypi
+
+
+def test_check_lockfile_refuses_pyproject(fake_pypi, tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text('[project]\nname = "x"\ndependencies = ["purewheel"]\n', encoding="utf-8")
+    with pytest.raises(SourceError, match="lists direct dependencies only.*pass a lockfile"):
+        wheelgap.check_lockfile(path)
+    assert not fake_pypi

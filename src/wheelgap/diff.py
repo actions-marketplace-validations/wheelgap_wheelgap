@@ -1,6 +1,7 @@
 """Compare two lockfiles: which packages got worse on a target, and which new packages have gaps.
 
-    python -m wheelgap.diff old/uv.lock uv.lock -p 3.13 -t linux-aarch64,musl-aarch64
+    wheelgap diff old/uv.lock uv.lock -p 3.13 -t linux-aarch64,musl-aarch64
+    python -m wheelgap.diff old/uv.lock uv.lock -p 3.13 -t linux-aarch64 --json
 
 Both sides are checked with `check_lockfile()` and packages are matched by canonical name. Exit 1 if
 anything got worse (a new package with a gap counts), 0 otherwise, and 2 on bad input.
@@ -28,12 +29,14 @@ How statuses rank, per target:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from dataclasses import dataclass, field
 
 from packaging.utils import canonicalize_name
 
+from . import __version__
 from .api import Result, _check_lockfile, make_targets
 from .check import CELL, Status, applies, reachable
 from .sources import Source
@@ -73,6 +76,10 @@ class Package:
     def cell(self, t: Target) -> str:
         return f"skipped ({self.skips[t]})" if t in self.skips else CELL[self.statuses[t]][0]
 
+    def status(self, t: Target) -> str:
+        """The status for --json: a Status value, or "skipped" (the reason is in skip_reason)."""
+        return "skipped" if t in self.skips else self.statuses[t].value
+
 
 def merge(results: list[Result], targets: list[Target]) -> dict[str, Package]:
     """The results keyed by canonical name, with entries for the same name combined."""
@@ -86,7 +93,7 @@ def merge(results: list[Result], targets: list[Target]) -> dict[str, Package]:
             found = [r.statuses.get(t, Status.NOT_NEEDED) for r in rs]
             needed = [s for s in found if s is not Status.NOT_NEEDED]
             statuses[t] = max(needed, key=RANK.__getitem__) if needed else Status.NOT_NEEDED
-        versions = list(dict.fromkeys(r.version or "?" for r in rs))
+        versions = list(dict.fromkeys(r.version for r in rs if r.version))
         merged[key] = Package(rs[0].name, versions, statuses)
     return merged
 
@@ -130,22 +137,41 @@ def new_gap(pkg: Package, t: Target) -> bool:
     return pkg.statuses[t] in GAPS
 
 
-def compare(
-    before: dict[str, Package], after: dict[str, Package], targets: list[Target]
-) -> tuple[list[str], int, int, list[str]]:
-    """The report lines, how many packages got worse, how many new packages have gaps, and the names
-    that couldn't be checked at the same version on either side."""
+@dataclass
+class Report:
+    """What compare() found, for the text report and --json."""
+
+    lines: list[str] = field(default_factory=list)
+    worse: list[dict] = field(default_factory=list)
+    new: list[dict] = field(default_factory=list)
+    unchecked: list[str] = field(default_factory=list)
+
+
+def _side(pkg: Package, t: Target, prefix: str = "") -> dict[str, str]:
+    out = {f"{prefix}status": pkg.status(t)}
+    if t in pkg.skips:
+        out[f"{prefix}skip_reason"] = pkg.skips[t]
+    return out
+
+
+def compare(before: dict[str, Package], after: dict[str, Package], targets: list[Target]) -> Report:
+    """Packages that got worse and new packages with gaps, with the names that couldn't be checked at the
+    same version on either side."""
     multi_py = len({t.python for t in targets}) > 1
-    lines: list[str] = []
-    n_worse = n_new = 0
-    unchecked = []
+    report = Report()
     for key, pkg in after.items():
         if key not in before:
             gaps = [t for t in targets if new_gap(pkg, t)]
             if gaps:
-                n_new += 1
-                lines.append(f"{pkg.name} {pkg.version} (new)")
-                lines += [f"  {t.label(multi_py)}: {pkg.cell(t)}" for t in gaps]
+                report.lines.append(f"{pkg.name} {pkg.version} (new)")
+                report.lines += [f"  {t.label(multi_py)}: {pkg.cell(t)}" for t in gaps]
+                report.new.append(
+                    {
+                        "name": pkg.name,
+                        "versions": pkg.versions,
+                        "targets": {t.label(multi_py): _side(pkg, t) for t in gaps},
+                    }
+                )
             continue
         was = before[key]
         changed = [t for t in targets if worse_on(was, pkg, t)]
@@ -153,13 +179,38 @@ def compare(
             was.statuses[t] is Status.UNKNOWN and pkg.statuses[t] is Status.UNKNOWN and t not in changed
             for t in targets
         ):
-            unchecked.append(pkg.name)
+            report.unchecked.append(pkg.name)
         if changed:
-            n_worse += 1
             version = pkg.version if pkg.version == was.version else f"{was.version} → {pkg.version}"
-            lines.append(f"{pkg.name} {version}")
-            lines += [f"  {t.label(multi_py)}: {was.cell(t)} → {pkg.cell(t)}" for t in changed]
-    return lines, n_worse, n_new, unchecked
+            report.lines.append(f"{pkg.name} {version}")
+            report.lines += [f"  {t.label(multi_py)}: {was.cell(t)} → {pkg.cell(t)}" for t in changed]
+            report.worse.append(
+                {
+                    "name": pkg.name,
+                    "old_versions": was.versions,
+                    "new_versions": pkg.versions,
+                    "targets": {t.label(multi_py): _side(was, t, "old_") | _side(pkg, t, "new_") for t in changed},
+                }
+            )
+    return report
+
+
+def json_report(report: Report, targets: list[Target]) -> str:
+    """--json: one object. Its keys are a public interface, like the main command's --json. Versions are
+    lists: empty when the input gives no version (an unpinned or unknown package, or a requirements line
+    installing from git, a path or a URL); several for a uv.lock fork."""
+    multi_py = len({t.python for t in targets}) > 1
+    return json.dumps(
+        {
+            "version": __version__,
+            "targets": [{"label": t.label(multi_py), "python": t.python, "platform": t.platform} for t in targets],
+            "worse": report.worse,
+            "new": report.new,
+            "unchecked": report.unchecked,
+            "summary": {"worse": len(report.worse), "new": len(report.new)},
+        },
+        indent=2,
+    )
 
 
 def summary(n_worse: int, n_new: int) -> str:
@@ -173,7 +224,7 @@ def summary(n_worse: int, n_new: int) -> str:
     return ", ".join(parts) + "."
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, prog: str = "python -m wheelgap.diff") -> int:
     for stream in (sys.stdout, sys.stderr):
         # As in cli.main: write UTF-8 to a non-UTF-8 pipe (Windows cp1252) instead of crashing on ✓ and →.
         reconfigure = getattr(stream, "reconfigure", None)
@@ -183,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
                 reconfigure(encoding="utf-8", errors="replace")
             else:
                 reconfigure(errors="replace")
-    p = argparse.ArgumentParser(prog="python -m wheelgap.diff", description=__doc__.splitlines()[0])
+    p = argparse.ArgumentParser(prog=prog, description=__doc__.splitlines()[0])
     p.add_argument("old", metavar="OLD", help="the lockfile before the change (or a directory)")
     p.add_argument("new", metavar="NEW", help="the lockfile after the change (or a directory)")
     p.add_argument(
@@ -197,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "-t", "--target", action="append", default=[], metavar="PLATFORM", help="target platform (repeatable)"
     )
+    p.add_argument("--json", action="store_true", help="print one JSON object instead of the text report")
     args = p.parse_args(argv)
     try:
         targets = make_targets(args.python or None, args.target or None)
@@ -208,15 +260,20 @@ def main(argv: list[str] | None = None) -> int:
             sides.append(packages)
     except Exception as e:  # unknown targets, unreadable or malformed lockfiles
         print(f"wheelgap: error: {type(e).__name__}: {e}", file=sys.stderr)
+        if args.json:  # as the main command does, so scripts needn't parse stderr
+            print(json.dumps({"error": {"message": str(e), "type": type(e).__name__}}))
         return 2
 
-    lines, n_worse, n_new, unchecked = compare(sides[0], sides[1], targets)
-    for line in lines:
-        print(line)
-    print(summary(n_worse, n_new))
-    if unchecked:
-        print(f"wheelgap: note: couldn't check {', '.join(unchecked)} in either lockfile", file=sys.stderr)
-    return 1 if n_worse or n_new else 0
+    report = compare(sides[0], sides[1], targets)
+    if args.json:
+        print(json_report(report, targets))
+    else:
+        for line in report.lines:
+            print(line)
+        print(summary(len(report.worse), len(report.new)))
+    if report.unchecked:
+        print(f"wheelgap: note: couldn't check {', '.join(report.unchecked)} in either lockfile", file=sys.stderr)
+    return 1 if report.worse or report.new else 0
 
 
 if __name__ == "__main__":  # pragma: no cover

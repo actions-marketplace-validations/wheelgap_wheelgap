@@ -7,11 +7,14 @@ from wheelgap.check import Status, check
 from wheelgap.sources import (
     Source,
     SourceError,
+    UvSelection,
     find_lockfile,
     load_inputs,
     parse_poetry_lock,
     parse_requirements,
     pythons_outside_lock,
+    select_pyproject_extras,
+    select_uv_dependencies,
 )
 from wheelgap.targets import build_targets
 
@@ -724,3 +727,164 @@ def test_poetry_lock_records_a_legacy_source_as_the_registry(tmp_path):
     )
     (pkg,) = parse_poetry_lock(path).packages
     assert pkg.registry == "https://pkgs.example.com/simple"
+
+
+PYPROJECT = """\
+[project]
+name = "My_Lib"
+dependencies = ["ranged>=1.5,<2", "fastlib==2.0.0", "winonly; sys_platform == 'win32'"]
+
+[project.optional-dependencies]
+Fast = ["purewheel"]
+test = ["nowheels", "my-lib[fast]"]
+"""
+
+
+def test_pyproject_direct_dependencies(tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(PYPROJECT, encoding="utf-8")
+    (source,) = load_inputs([str(path)])
+    pkgs = by_name(source)
+    assert set(pkgs) == {"ranged", "fastlib", "winonly"}
+    assert pkgs["ranged"].spec == "<2,>=1.5" and pkgs["ranged"].version is None
+    assert pkgs["fastlib"].version == "2.0.0"
+    assert pkgs["winonly"].markers == ['sys_platform == "win32"']
+    assert source.pyproject_extras == {"fast": ["purewheel"], "test": ["nowheels", "my-lib[fast]"]}
+
+
+def test_pyproject_records_requires_python(tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        '[project]\nname = "x"\ndependencies = []\nrequires-python = ">=3.11"\n',
+        encoding="utf-8",
+    )
+    (source,) = load_inputs([str(path)])
+    assert source.requires_python == ">=3.11"
+
+
+@pytest.mark.parametrize(
+    "extras,all_extras,added",
+    [
+        (["fast"], False, {"purewheel"}),
+        (["FAST"], False, {"purewheel"}),
+        (["test"], False, {"nowheels", "purewheel"}),  # my-lib[fast] pulls in the fast extra
+        ([], True, {"nowheels", "purewheel"}),
+        ([], False, set()),
+    ],
+)
+def test_pyproject_extras(tmp_path, extras, all_extras, added):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(PYPROJECT, encoding="utf-8")
+    (source,) = load_inputs([str(path)])
+    select_pyproject_extras(source, extras, all_extras)
+    names = [p.name for p in source.packages]
+    assert sorted(names) == sorted({"ranged", "fastlib", "winonly"} | added)  # each once, and never my-lib itself
+
+
+def test_pyproject_unknown_extra(tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(PYPROJECT, encoding="utf-8")
+    (source,) = load_inputs([str(path)])
+    with pytest.raises(SourceError, match="unknown extras: docs"):
+        select_pyproject_extras(source, ["docs"], False)
+
+
+@pytest.mark.parametrize(
+    "text,error",
+    [
+        ('[project]\nname = "x"\ndynamic = ["dependencies"]\n', "dependencies is dynamic"),
+        ('[tool.poetry]\nname = "x"\n', "no \\[project\\] table"),
+        ('[project]\nname = "x"\ndependencies = "numpy"\n', "must be a list of strings"),
+        ('[project]\nname = "x"\ndependencies = ["numpy>=="]\n', "can't parse requirement"),
+        ("[project\n", "invalid TOML"),
+        (
+            '[project]\nname = "x"\n\n[tool.poetry.dependencies]\npython = ">=3.10"\nnumpy = "^2"\n',
+            "dependencies are in \\[tool.poetry.dependencies\\].*check poetry.lock",
+        ),
+        (
+            '[project]\nname = "x"\ndependencies = []\n\n[tool.poetry.dependencies]\nnumpy = "^2"\n',
+            "dependencies are in \\[tool.poetry.dependencies\\].*check poetry.lock",
+        ),
+        ('[project]\nname = "x"\n[project.optional-dependencies]\nTest = ["a"]\ntest = ["b"]\n', "PEP 685"),
+        ('[project]\nname = "x"\ndependencies = ["x[nope]"]\n', "names unknown extras: nope"),
+        ('[project]\nname = "x"\ndependencies = ["x[a]"]\ndynamic = ["optional-dependencies"]\n', "is dynamic"),
+        ('[project]\nname = "x"\ndependencies = ["x[a]; os_name == \'nt\'"]\n', "refers to the project itself"),
+    ],
+)
+def test_pyproject_input_errors(tmp_path, text, error):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(SourceError, match=error):
+        load_inputs([str(path)])
+
+
+def test_pyproject_dynamic_optional_dependencies_with_extra(tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text('[project]\nname = "x"\ndependencies = []\ndynamic = ["optional-dependencies"]\n', encoding="utf-8")
+    (source,) = load_inputs([str(path)])
+    select_pyproject_extras(source, [], False)  # no extra asked for: fine
+    with pytest.raises(SourceError, match="optional-dependencies is dynamic"):
+        select_pyproject_extras(source, ["test"], False)
+    with pytest.raises(SourceError, match="optional-dependencies is dynamic"):
+        select_pyproject_extras(source, [], True)  # --all-extras can't mean "none"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '[project]\nname = "x"\n\n[tool.poetry.dependencies]\npython = ">=3.10"\n',  # python isn't a dependency
+        '[project]\nname = "x"\ndependencies = ["purewheel"]\n\n[tool.poetry.dependencies]\nnumpy = "^2"\n',
+    ],
+)
+def test_pyproject_reads_project_dependencies_alongside_tool_poetry(tmp_path, text):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(text, encoding="utf-8")
+    (source,) = load_inputs([str(path)])
+    assert [p.name for p in source.packages] == (["purewheel"] if "purewheel" in text else [])
+
+
+def test_pyproject_extras_add_each_requirement_once(tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        '[project]\nname = "x"\ndependencies = ["numpy>=2"]\n\n[project.optional-dependencies]\n'
+        'plot = ["matplotlib"]\nall = ["matplotlib", "scipy", "numpy >= 2"]\n',
+        encoding="utf-8",
+    )
+    (source,) = load_inputs([str(path)])
+    select_pyproject_extras(source, [], True)
+    assert sorted(p.name for p in source.packages) == ["matplotlib", "numpy", "scipy"]
+
+
+def test_pyproject_self_reference_in_dependencies_adds_the_extra(tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(PYPROJECT.replace('"fastlib==2.0.0", ', '"fastlib==2.0.0", "my-lib[test]", '), encoding="utf-8")
+    (source,) = load_inputs([str(path)])
+    # my-lib[test] pulls in test, and test's my-lib[fast] pulls in fast; my-lib itself is never looked up
+    assert sorted(p.name for p in source.packages) == ["fastlib", "nowheels", "purewheel", "ranged", "winonly"]
+    select_pyproject_extras(source, ["test"], False)  # asking for it again adds nothing twice
+    assert sorted(p.name for p in source.packages) == ["fastlib", "nowheels", "purewheel", "ranged", "winonly"]
+
+
+def test_no_lockfile_suggests_pyproject(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\n', encoding="utf-8")
+    with pytest.raises(SourceError, match="no lockfile found.*wheelgap .*pyproject.toml"):
+        find_lockfile(tmp_path)
+
+
+def test_no_lockfile_without_project_table_has_no_pyproject_hint(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[tool.ruff]\nline-length = 120\n", encoding="utf-8")
+    with pytest.raises(SourceError, match="no lockfile found") as e:
+        find_lockfile(tmp_path)
+    assert "pyproject.toml`" not in str(e.value)
+
+
+def test_poetry_group_selection_keeps_markers_per_group(tmp_path):
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "colorama"\nversion = "0.4.6"\ngroups = ["main", "dev"]\n'
+        'markers = { main = "sys_platform == \\"win32\\"" }\nfiles = []\n\n[metadata]\nlock-version = "2.1"\n',
+        encoding="utf-8",
+    )
+    sources = load_inputs([str(tmp_path)])
+    select_uv_dependencies(sources, UvSelection(no_dev=True))
+    # Without dev, only main's marker applies.
+    assert sources[0].packages[0].markers == ['sys_platform == "win32"']

@@ -259,7 +259,8 @@ _marker_cache: dict[str, Marker | None] = {}
 # (uv writes its [tool.uv] conflicts as extra == '...' terms) and the OS release/version of the machine
 # that installs. A comparison on one of them is "unknown", combined with the known parts in three-valued
 # logic: "sys_platform != 'darwin' and extra == 'cpu'" is unknown on Linux (so the package counts) and
-# false on macOS (so it doesn't). Only a definite False hides a package.
+# false on macOS (so it doesn't). Only a definite False hides a package. Target.unknown_markers adds
+# platform_machine on 32-bit x86 and Arm, where it depends on the machine rather than the Python.
 _UNKNOWABLE = frozenset({"extra", "extras", "dependency_groups", "platform_release", "platform_version"})
 _atom_cache: dict[tuple[str, Target], bool | None] = {}
 
@@ -287,7 +288,7 @@ def _atom(node: tuple, target: Target, environment: dict | None = None) -> bool 
             parts.append(quoted)
         else:
             parts.append(str(n.value))  # the operator
-    if not names or names & (_UNKNOWABLE - (environment or {}).keys()):
+    if not names or names & ((_UNKNOWABLE - (environment or {}).keys()) | target.unknown_markers):
         return None
     text = " ".join(parts)
     if environment is not None:

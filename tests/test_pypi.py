@@ -408,3 +408,15 @@ def test_online_keeps_a_mirror_package_s_locked_files(monkeypatch, fake_pypi):
 )
 def test_keeps_locked_files(package, expected):
     assert pypi.keeps_locked_files(package) is expected
+
+
+def test_fill_all_reports_progress_only_when_asked(fake_pypi):
+    seen = []
+    packages = [Package("purewheel", "3.1"), Package("nowheels", "0.9"), Package("doesnotexist", "1.0")]
+    with pypi.reporting_progress(lambda done, total: seen.append((done, total))):
+        pypi.fill_all(packages, workers=2)
+    assert seen == [(0, 3), (1, 3), (2, 3), (3, 3)]
+    assert [p.error for p in packages] == [None, None, "not on index"]  # a failed lookup still counts as done
+    seen.clear()
+    pypi.fill_all([Package("winonly", "311")])  # outside the context nothing is reported, as in the CLI
+    assert seen == []

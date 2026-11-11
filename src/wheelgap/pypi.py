@@ -10,7 +10,10 @@ import os
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial
 from typing import IO
 from urllib.parse import quote, unquote, urlparse, urlsplit, urlunsplit
@@ -418,6 +421,23 @@ def recheck_lock(
     return len(locked) - len(todo), failed
 
 
+Progress = Callable[[int, int], None]
+"""Called as progress(done, total) by fill_all: (0, total) before the first lookup, then once per finished one."""
+
+_progress: ContextVar[Progress | None] = ContextVar("wheelgap_progress", default=None)
+
+
+@contextmanager
+def reporting_progress(progress: Progress) -> Iterator[None]:
+    """Make every fill_all in this thread (or context) report to `progress`. A context rather than an argument, so
+    the MCP server's check_lockfile gets progress through cli.main without changing the CLI or the API."""
+    token = _progress.set(progress)
+    try:
+        yield
+    finally:
+        _progress.reset(token)
+
+
 def fill_all(
     packages: list[Package],
     refresh: bool = False,
@@ -434,6 +454,7 @@ def fill_all(
     With `simple_index` (--index-url), lookups go to that PEP 691 simple index instead of PyPI's JSON API.
     `read_cache` and `write_cache` read pinned JSON API lookups from, and save them to, the on-disk cache (see
     cache.py); simple-index lookups never use it.
+    Inside reporting_progress, it reports to that callback as lookups finish.
     Returns how many kept their locked files for that reason."""
     fn = partial(fill, python=python, read_cache=read_cache, write_cache=write_cache)
     if simple_index is not None:
@@ -445,7 +466,14 @@ def fill_all(
     kept = {id(p) for p in packages if refresh and keeps_locked_files(p)}
     # An error from parsing (a constraint wheelgap can't apply) stays unknown: a lookup would hide it.
     todo = [p for p in packages if not p.skip and not p.error and id(p) not in kept and (refresh or p.files is None)]
+    report = _progress.get()
     if todo:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(fn, todo))
+            if report is None:
+                list(pool.map(fn, todo))
+            else:
+                report(0, len(todo))
+                for done, future in enumerate(as_completed([pool.submit(fn, p) for p in todo]), 1):
+                    future.result()
+                    report(done, len(todo))
     return len(kept)

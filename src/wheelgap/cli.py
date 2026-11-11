@@ -15,9 +15,10 @@ from pathlib import Path
 
 import packaging
 from packaging.markers import InvalidMarker, Marker
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 
-from . import __version__
+from . import __version__, cache
 from .api import running_python
 from .check import CELL, Row, Status, check, explain, has_sdist, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
@@ -39,6 +40,7 @@ from .sources import (
     UvSelection,
     load_inputs,
     pythons_outside_lock,
+    select_pyproject_extras,
     select_uv_dependencies,
     uv_selected_roots,
 )
@@ -119,7 +121,7 @@ def make_parser() -> argparse.ArgumentParser:
         metavar="INPUT",
         help=(
             "uv.lock, pylock.toml, poetry.lock, Pipfile.lock, requirements.txt, "
-            "a directory, or package specs (default: .)"
+            "pyproject.toml (direct dependencies), a directory, or package specs (default: .)"
         ),
     )
     p.add_argument(
@@ -138,7 +140,8 @@ def make_parser() -> argparse.ArgumentParser:
         metavar="PLATFORM",
         help=(
             "target platform (repeatable; 'all' for the 8 common ones, 'everything' adds armv7l, ppc64le, "
-            f"s390x and riscv64 Linux, 'mobile' is iOS and Android; default: {','.join(DEFAULT_PLATFORMS)})"
+            "s390x, riscv64 and i686 Linux and win32, 'mobile' is iOS and Android; "
+            f"default: {','.join(DEFAULT_PLATFORMS)})"
         ),
     )
     p.add_argument("--glibc", metavar="X.Y", help=f"glibc version for linux-* targets (default: {DEFAULT_GLIBC})")
@@ -165,8 +168,13 @@ def make_parser() -> argparse.ArgumentParser:
         metavar="PATH_OR_HTTPS_URL",
         help="a Pyodide release's pyodide-lock.json: packages Pyodide ships itself count as available on -t pyodide",
     )
-    p.add_argument("--extra", action="append", metavar="NAME", help="include a uv project extra (repeatable)")
-    p.add_argument("--all-extras", action="store_true", help="include every uv project extra")
+    p.add_argument(
+        "--extra",
+        action="append",
+        metavar="NAME",
+        help="include a uv project extra, or a pyproject.toml optional-dependencies group (repeatable)",
+    )
+    p.add_argument("--all-extras", action="store_true", help="include every uv project extra (or pyproject.toml extra)")
     p.add_argument("--group", action="append", metavar="NAME", help="include a uv dependency group (repeatable)")
     p.add_argument("--no-dev", action="store_true", help="exclude the default uv dev group")
     p.add_argument(
@@ -180,6 +188,11 @@ def make_parser() -> argparse.ArgumentParser:
         "--no-cache",
         action="store_true",
         help="don't read or save the 24-hour cache of pinned package lookups",
+    )
+    p.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="delete the cache of pinned package lookups first; with no INPUT, do only that",
     )
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
     p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
@@ -851,6 +864,18 @@ def main(argv: list[str] | None = None) -> int:
                 reconfigure(encoding="utf-8", errors="replace")
             else:
                 reconfigure(errors="replace")
+    argv = sys.argv[1:] if argv is None else argv
+    # `wheelgap diff OLD NEW`: a subcommand only when "diff" comes first and isn't a file or folder here, so
+    # `wheelgap ./diff` still checks a folder named diff (and `wheelgap diff==1.0` the PyPI package).
+    if argv[:1] == ["diff"]:
+        if not Path("diff").exists():
+            from .diff import main as diff_main
+
+            return diff_main(argv[1:], prog="wheelgap diff")
+        print(
+            "wheelgap: note: reading ./diff as an input; for the comparison, run python -m wheelgap.diff",
+            file=sys.stderr,
+        )
     parser = make_parser()
     args = parser.parse_args(argv)
     if args.json and args.markdown:
@@ -860,6 +885,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.offline and args.online:
         parser.error("--offline and --online can't be used together")
     try:
+        if args.clear_cache:
+            folder, count = cache.clear()
+            print(f"wheelgap: removed {count} cached lookup{'' if count == 1 else 's'} from {folder}", file=sys.stderr)
+            if not args.inputs and not args.list_targets:
+                return 0
         if args.list_targets:
             pyproject = find_pyproject(args.inputs)
             print_target_list(args, load_config(pyproject) if pyproject else {})
@@ -932,9 +962,23 @@ def main(argv: list[str] | None = None) -> int:
         if args.no_dev and args.group is None and group_names is not None:
             group_names = [name for name in group_names if canonicalize_name(name) != "dev"]
         from_cli = args.extra is not None or args.group is not None or args.all_extras or args.no_dev
-        if from_cli or args.only_group or extra_names is not None or group_names is not None:
+        # pyproject.toml inputs take --extra / --all-extras for [project] optional-dependencies. Configured
+        # extras stay uv.lock-only, and [dependency-groups] isn't read.
+        pyproject_sources = [s for s in sources if s.pyproject_extras is not None]
+        lock_sources = [s for s in sources if s.pyproject_extras is None]
+        if pyproject_sources:
+            if args.group is not None or args.only_group or args.no_dev:
+                raise SourceError(
+                    "--group, --only-group and --no-dev don't apply to pyproject.toml: "
+                    "[dependency-groups] isn't read, only [project] dependencies and --extra groups"
+                )
+            for source in pyproject_sources:
+                select_pyproject_extras(source, args.extra or [], args.all_extras)
+        if (from_cli or args.only_group or extra_names is not None or group_names is not None) and (
+            lock_sources or not pyproject_sources
+        ):
             select_uv_dependencies(
-                sources,
+                lock_sources,
                 UvSelection(
                     extras=frozenset(canonicalize_name(name) for name in extra_names or []),
                     all_extras=args.all_extras,
@@ -942,8 +986,11 @@ def main(argv: list[str] | None = None) -> int:
                     no_dev=args.no_dev,
                     only_groups=frozenset(canonicalize_name(name) for name in args.only_group or []),
                 ),
-                # Configured extras/groups apply to uv.lock inputs only; on the command line they need one.
+                # Configured extras apply to uv.lock inputs only, configured groups to uv.lock and Poetry 2.x
+                # poetry.lock inputs; on the command line they need one of those.
                 strict=bool(from_cli or args.only_group),
+                configured_extras=args.extra is None and extra_names is not None,
+                poetry=bool(from_cli or args.only_group) or group_names is not None,
             )
         if offline:
             require_offline(sources, offline_how, simple_index=index_url)
@@ -972,6 +1019,31 @@ def main(argv: list[str] | None = None) -> int:
 
     if not quiet:
         note_unpinned_requirements(sources)
+    for source in sources:
+        if source.pyproject_extras is not None:  # always: this answer differs from a lockfile's
+            print(
+                f"wheelgap: note: {source.label} lists direct dependencies only; "
+                "their own dependencies aren't checked (use a lockfile for that), and ranges were checked at "
+                "the newest matching release",
+                file=sys.stderr,
+            )
+            if source.requires_python and not quiet:  # the answer is right either way, so -q drops these
+                try:
+                    SpecifierSet(source.requires_python)
+                except InvalidSpecifier:
+                    print(
+                        f"wheelgap: note: {source.label}: ignoring requires-python "
+                        f"{source.requires_python!r}, which isn't a valid specifier",
+                        file=sys.stderr,
+                    )
+                else:
+                    if outside := pythons_outside_lock(source, targets, bounds_only=False):
+                        print(
+                            f"wheelgap: note: {source.label} requires Python {source.requires_python}, "
+                            f"which leaves out Python {', '.join(outside)}; those targets are checked anyway "
+                            "because you asked for them",
+                            file=sys.stderr,
+                        )
 
     needed_by_source = [selected_packages(source, targets) for source in sources]
     packages = [package for needed in needed_by_source for package in needed]
@@ -997,7 +1069,8 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     for s, needed in zip(sources, needed_by_source, strict=True):
-        if outside := pythons_outside_lock(s, targets):
+        # A pyproject.toml has no lock to re-check, so it never goes down the uv.lock path below.
+        if s.pyproject_extras is None and (outside := pythons_outside_lock(s, targets)):
             if offline:  # no re-check, so every locked package may lack wheels for those Pythons
                 print(
                     f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it may be missing "
@@ -1036,7 +1109,8 @@ def main(argv: list[str] | None = None) -> int:
             ignore_on.setdefault(canonicalize_name(name), set()).update(checked.intersection(platforms))
     ignore_on = {key: platforms for key, platforms in ignore_on.items() if platforms}
     if ignores and not quiet:
-        known_keys = {p.key for s in sources for p in s.packages}  # every package read, selected or not
+        # Every package read, selected or not.
+        known_keys = {p.key for s in sources for p in s.packages}.union(*(s.unselected_keys for s in sources))
         unmatched = list(dict.fromkeys(item for item, name, _ in ignores if canonicalize_name(name) not in known_keys))
         if unmatched:
             print(f"wheelgap: note: --ignore matches no package: {', '.join(unmatched)}", file=sys.stderr)

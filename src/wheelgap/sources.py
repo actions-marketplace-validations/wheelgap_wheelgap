@@ -98,18 +98,34 @@ class Source:
     uv_selection: UvSelection | None = None
     # A requirements file (requirements.txt, .in, requirements.lock): unpinned lines get the newest release.
     requirements: bool = False
+    # pyproject.toml only: [project] optional-dependencies by canonical extra name, applied with --extra.
+    # None when the input isn't a pyproject.toml.
+    pyproject_extras: dict[str, list[str]] | None = None
+    # pyproject.toml only: optional-dependencies is listed in [project] dynamic, so the extras can't be read.
+    pyproject_dynamic_extras: bool = False
+    # pyproject.toml only: the canonical [project] name, to spot `myproject[extra]` self-references.
+    pyproject_name: str | None = None
+    # poetry.lock only: each package's [[package]] table, kept so --group/--only-group/--no-dev can pick packages
+    # by the groups Poetry records on them.
+    poetry_tables: list[dict] | None = None
+    poetry_pyproject: Path | None = None
+    # poetry.lock after a group selection: the packages it left out, which were still read (for --ignore notes).
+    unselected_keys: set[str] = field(default_factory=set)
 
 
-def pythons_outside_lock(source: Source, targets: Iterable[Target]) -> list[str]:
-    """Target Pythons the lockfile's requires-python leaves out, e.g. ['3.14t'] for `==3.13.*`.
+def pythons_outside_lock(source: Source, targets: Iterable[Target], *, bounds_only: bool = True) -> list[str]:
+    """Target Pythons the source's requires-python leaves out, e.g. ['3.14t'] for `==3.13.*`.
 
-    uv keeps only the wheels that can serve requires-python (abi3 and pure wheels survive), so the lock may
-    be missing wheels for those Pythons. Like uv, only the bounds count: `!=3.12.*` doesn't exclude 3.12.
+    For a lockfile, uv keeps only the wheels that can serve requires-python (abi3 and pure wheels survive), so
+    the lock may be missing wheels for those Pythons. Like uv, only the bounds count there: `!=3.12.*` doesn't
+    exclude 3.12. With bounds_only=False (a library's pyproject.toml, which pip checks in full against the
+    running Python), every clause counts, so `!=3.12.*` leaves out 3.12 but `!=3.12.0` doesn't.
     """
     if not source.requires_python:
         return []
     try:
-        spec = SpecifierSet(",".join(str(s) for s in SpecifierSet(source.requires_python) if s.operator != "!="))
+        clauses = SpecifierSet(source.requires_python)
+        spec = SpecifierSet(",".join(str(s) for s in clauses if not (bounds_only and s.operator == "!=")))
     except InvalidSpecifier:
         return []
     out = []
@@ -211,16 +227,35 @@ def uv_group_names(package: dict) -> frozenset[str]:
     )
 
 
-def select_uv_dependencies(sources: list[Source], selection: UvSelection, strict: bool = True) -> None:
-    """Apply `selection` to the uv.lock sources. With strict (selectors from the command line), other inputs are an
-    error; otherwise (from [tool.wheelgap]) they're left as they are."""
+def select_uv_dependencies(
+    sources: list[Source],
+    selection: UvSelection,
+    strict: bool = True,
+    *,
+    configured_extras: bool = False,
+    poetry: bool = True,
+) -> None:
+    """Apply `selection` to the uv.lock sources, and its groups to Poetry 2.x poetry.lock sources. With strict
+    (selectors from the command line), other inputs are an error; otherwise (from [tool.wheelgap]) they're left as
+    they are. configured_extras: the extras come from [tool.wheelgap], which apply to uv.lock inputs only, so a
+    poetry.lock doesn't reject them. poetry=False leaves poetry.lock inputs as they are (only extras configured)."""
     if selection.only_groups and (selection.extras or selection.all_extras):
         raise SourceError("--only-group cannot be combined with --extra or --all-extras")
     if selection.no_dev and "dev" in selection.groups | selection.only_groups:
         raise SourceError("--no-dev cannot be combined with an explicit dev group")
     if strict and (not sources or any(source.uv_packages is None for source in sources)):
-        raise SourceError("extra/group selection requires uv.lock inputs")
+        others = [source for source in sources if source.uv_packages is None]
+        if sources and all(source.poetry_tables is not None for source in others):
+            if selection.all_extras or (selection.extras and not configured_extras):
+                raise SourceError("extra selection requires uv.lock inputs (poetry.lock supports groups only)")
+        else:
+            raise SourceError("extra/group selection requires uv.lock inputs")
     for source in sources:
+        if source.poetry_tables is not None:
+            # A Poetry 1.x lock doesn't record groups per package; configured groups leave it as it is.
+            if poetry and (strict or source.edges is None):
+                _select_poetry_groups(source, selection)
+            continue
         if source.uv_packages is None:
             continue
         pyproject = source.uv_pyproject
@@ -250,6 +285,60 @@ def select_uv_dependencies(sources: list[Source], selection: UvSelection, strict
             if unknown:
                 raise SourceError(f"{source.label}: unknown {label}: {', '.join(sorted(unknown))}")
         source.uv_selection = selection
+
+
+def _poetry_markers(p: dict, groups: Iterable[str]) -> list[str] | None:
+    """A Poetry 2.x package's markers for the given groups: None (always installed) if a group has no marker."""
+    markers = p.get("markers")
+    if isinstance(markers, str):
+        return [markers]
+    if not isinstance(markers, dict):
+        return None
+    # Poetry leaves a group out of the dict when the package is always installed for it.
+    if any(g not in markers for g in groups):
+        return None
+    return [m for g in groups if isinstance(m := markers.get(g), str)] or None
+
+
+def _select_poetry_groups(source: Source, selection: UvSelection) -> None:
+    """Keep the poetry.lock packages that Poetry would install for `selection`, with Poetry's meanings: `main` and
+    every non-optional group by default, `--group` adds a group (like `poetry install --with`), `--no-dev` leaves
+    out `dev`, and `--only-group` installs only the named groups (`main` too only if named)."""
+    tables = source.poetry_tables or []
+    if source.edges is not None or any(not isinstance(t.get("groups"), list) for t in tables):
+        raise SourceError(f"{source.label}: group selection needs a poetry.lock from Poetry 2.x (with package groups)")
+    known = {"main"} | {canonicalize_name(g) for t in tables for g in t["groups"]}
+    optional: set[str] = set()
+    pyproject = source.poetry_pyproject
+    if pyproject is not None and pyproject.is_file():
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        # PEP 735 groups (Poetry 2.2+): an empty one is in no package's groups, but it's still a known group.
+        pep735 = data.get("dependency-groups")
+        known.update(canonicalize_name(name) for name in (pep735 if isinstance(pep735, dict) else {}))
+        declared = data.get("tool", {}).get("poetry", {})
+        for name, group in (declared.get("group") or {}).items():
+            known.add(canonicalize_name(name))
+            if isinstance(group, dict) and group.get("optional") is True:
+                optional.add(canonicalize_name(name))
+    unknown = (selection.groups | selection.only_groups) - known
+    if unknown:
+        raise SourceError(f"{source.label}: unknown groups: {', '.join(sorted(unknown))}")
+    if selection.only_groups:
+        chosen = set(selection.only_groups | selection.groups)
+    else:
+        chosen = (known - optional) | selection.groups
+    if selection.no_dev:
+        chosen.discard("dev")
+    kept = []
+    for pkg, table in zip(source.packages, tables, strict=True):
+        groups = [g for g in table["groups"] if canonicalize_name(g) in chosen]
+        if groups:
+            pkg.markers = _poetry_markers(table, groups)
+            kept.append(pkg)
+        else:
+            source.unselected_keys.add(pkg.key)
+    source.packages = kept
+    source.poetry_tables = None
 
 
 def parse_pylock(path: Path) -> Source:
@@ -321,8 +410,10 @@ def parse_poetry_lock(path: Path) -> Source:
         # under a marker (colorama directly, and via click only on Windows).
         declared = _project_dependencies(path.parent / "pyproject.toml")
         roots |= {i for i, p in enumerate(pkgs) if p.key in declared}
-        return Source(path.name, pkgs, edges=edges, roots=sorted(roots))
-    return Source(path.name, pkgs)
+        return Source(path.name, pkgs, edges=edges, roots=sorted(roots), poetry_tables=data.get("package", []))
+    return Source(
+        path.name, pkgs, poetry_tables=data.get("package", []), poetry_pyproject=path.parent / "pyproject.toml"
+    )
 
 
 def _graph_roots(pkgs: list[Package], edges: dict[int, list[Edge]]) -> list[int]:
@@ -538,6 +629,127 @@ def _pinned_version(req: Requirement) -> str | None:
     return None
 
 
+def parse_pyproject(path: Path) -> Source:
+    """A library's direct dependencies: [project] dependencies, read as requirement lines. Their own
+    dependencies aren't known without a lockfile, so they aren't checked."""
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as e:
+        raise SourceError(f"{path}: invalid TOML: {e}") from None
+    project = data.get("project")
+    if not isinstance(project, dict):
+        raise SourceError(f"{path}: no [project] table, so there are no dependencies to read")
+    dynamic = project.get("dynamic", [])
+    if not isinstance(dynamic, list):
+        raise SourceError(f"{path}: [project] dynamic must be a list of strings")
+    if "dependencies" in dynamic:
+        raise SourceError(
+            f"{path}: [project] dependencies is dynamic (set by the build backend), so wheelgap can't read it; "
+            "check a lockfile instead"
+        )
+    if not project.get("dependencies") and not project.get("optional-dependencies"):
+        # poetry-core 2 builds [tool.poetry.dependencies] into the package whenever [project] lists no dependencies
+        # or optional-dependencies (missing or empty: DependencyGroup.dependencies' "legacy mode").
+        tool = data.get("tool")
+        poetry = tool.get("poetry") if isinstance(tool, dict) else None
+        poetry_deps = poetry.get("dependencies") if isinstance(poetry, dict) else None
+        if isinstance(poetry_deps, dict) and any(dep.lower() != "python" for dep in poetry_deps):
+            raise SourceError(
+                f"{path}: the dependencies are in [tool.poetry.dependencies], not [project] dependencies, "
+                "so wheelgap can't read them; check poetry.lock instead"
+            )
+    dependencies = project.get("dependencies", [])
+    if not isinstance(dependencies, list) or not all(isinstance(d, str) for d in dependencies):
+        raise SourceError(f"{path}: [project] dependencies must be a list of strings")
+    optional = project.get("optional-dependencies", {})
+    if not isinstance(optional, dict) or not all(
+        isinstance(v, list) and all(isinstance(d, str) for d in v) for v in optional.values()
+    ):
+        raise SourceError(f"{path}: [project] optional-dependencies must be a table of lists of strings")
+    extras: dict[str, list[str]] = {}
+    for extra_name, lines in optional.items():
+        key = canonicalize_name(extra_name)
+        if key in extras:
+            raise SourceError(
+                f"{path}: [project] optional-dependencies has two extras that are both {key!r} once normalized "
+                "(PEP 685)"
+            )
+        extras[key] = list(lines)
+    source = Source(path.name, pyproject_extras=extras, pyproject_dynamic_extras="optional-dependencies" in dynamic)
+    if isinstance(requires_python := project.get("requires-python"), str):
+        source.requires_python = requires_python
+    if isinstance(name := project.get("name"), str):
+        source.pyproject_name = canonicalize_name(name)
+    self_extras: list[str] = []
+    for line in dependencies:
+        pkg = requirement_to_package(line, path.name)
+        if pkg.key != source.pyproject_name:
+            source.packages.append(pkg)
+            continue
+        # `myproject[extra]` in its own dependencies: installing the project installs that extra too.
+        self_extras.extend(_self_reference_extras(source, line, Requirement(line)))
+    _add_extras(source, self_extras)
+    return source
+
+
+def select_pyproject_extras(source: Source, extras: Iterable[str], all_extras: bool) -> None:
+    """Add the requirements of the chosen [project] optional-dependencies groups to a pyproject.toml source.
+    A self-reference such as `myproject[test]` inside an extra pulls in that extra, as pip does."""
+    available = source.pyproject_extras
+    if available is None:
+        return
+    wanted: list[str] = list(available) if all_extras else [canonicalize_name(e) for e in extras]
+    if source.pyproject_dynamic_extras and (all_extras or wanted):
+        raise SourceError(
+            f"{source.label}: [project] optional-dependencies is dynamic (set by the build backend), "
+            "so its extras can't be read"
+        )
+    if unknown := sorted(set(wanted) - set(available)):
+        raise SourceError(f"{source.label}: unknown extras: {', '.join(unknown)}")
+    _add_extras(source, wanted)
+
+
+def _self_reference_extras(source: Source, line: str, req: Requirement) -> list[str]:
+    """The extras that `myproject[extra]`, a requirement on the project itself, pulls in."""
+    if req.marker or req.url or req.specifier:
+        raise SourceError(
+            f"{source.label}: {line!r} refers to the project itself with a marker, URL or version, "
+            "which isn't supported"
+        )
+    wanted: list[str] = [canonicalize_name(e) for e in req.extras]
+    if wanted and source.pyproject_dynamic_extras:
+        raise SourceError(
+            f"{source.label}: {line!r} names extras, but [project] optional-dependencies is dynamic "
+            "(set by the build backend), so its extras can't be read"
+        )
+    missing = sorted(set(wanted) - set(source.pyproject_extras or {}))
+    if missing:
+        raise SourceError(f"{source.label}: {line!r} names unknown extras: {', '.join(missing)}")
+    return wanted
+
+
+def _add_extras(source: Source, wanted: list[str]) -> None:
+    """Add each wanted extra's requirements, following self-references, and each identical requirement once."""
+    available = source.pyproject_extras or {}
+    seen: set[str] = set()
+    while wanted:
+        extra = wanted.pop(0)
+        if extra in seen:
+            continue
+        seen.add(extra)
+        for line in available.get(extra, []):
+            try:
+                req = Requirement(line)
+            except InvalidRequirement as e:
+                raise SourceError(f"{source.label}: can't parse requirement {line!r}: {e}") from None
+            if source.pyproject_name is not None and canonicalize_name(req.name) == source.pyproject_name:
+                wanted.extend(_self_reference_extras(source, line, req))
+                continue
+            pkg = requirement_to_package(line, source.label)
+            if pkg not in source.packages:  # also in another extra or in dependencies: one row
+                source.packages.append(pkg)
+
+
 def requirement_to_package(text: str, origin: str) -> Package:
     try:
         req = Requirement(text)
@@ -646,6 +858,8 @@ PARSERS = {
 
 def load_file(path: Path) -> Source:
     name = path.name
+    if name == "pyproject.toml":
+        return parse_pyproject(path)
     if name in PARSERS:
         return PARSERS[name](path)
     if name.startswith("pylock.") and name.endswith(".toml"):
@@ -658,7 +872,8 @@ def load_file(path: Path) -> Source:
         return parse_requirements(path)
     raise SourceError(
         f"don't know how to read {path} "
-        "(expected uv.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock, requirements.lock or requirements.txt)"
+        "(expected uv.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock, requirements.lock, requirements.txt "
+        "or pyproject.toml)"
     )
 
 
@@ -667,10 +882,19 @@ def find_lockfile(directory: Path) -> Path:
         candidate = directory / name
         if candidate.is_file():
             return candidate
-    raise SourceError(
-        f"no lockfile found in {directory} (looked for {', '.join(LOCKFILES)}). "
-        "Pass a file, or package names like `wheelgap numpy psycopg2`."
-    )
+    hint = "Pass a file, or package names like `wheelgap numpy psycopg2`."
+    if _has_project_table(directory / "pyproject.toml"):
+        pyproject = directory / "pyproject.toml"
+        hint = f"To check the direct dependencies in its pyproject.toml, run `wheelgap {pyproject}`. " + hint
+    raise SourceError(f"no lockfile found in {directory} (looked for {', '.join(LOCKFILES)}). {hint}")
+
+
+def _has_project_table(pyproject: Path) -> bool:
+    """For the "no lockfile" hint only: a missing or unreadable file just means no hint."""
+    try:
+        return isinstance(tomllib.loads(pyproject.read_text(encoding="utf-8")).get("project"), dict)
+    except (OSError, ValueError):
+        return False
 
 
 def load_inputs(inputs: list[str]) -> list[Source]:

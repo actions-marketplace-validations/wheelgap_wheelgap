@@ -21,7 +21,7 @@ from .check import Row, Status, check, status_for, wheel_tags
 from .offline import require_offline
 from .pyodide import PyodideLock, bundled_version_differs, bundles, check_locks
 from .pypi import fill_all, recheck_lock
-from .sources import Package, Source, find_lockfile, load_file, pythons_outside_lock
+from .sources import Package, Source, SourceError, find_lockfile, load_file, pythons_outside_lock
 from .targets import (
     DEFAULT_ANDROID_API,
     DEFAULT_GLIBC,
@@ -218,7 +218,13 @@ def _check_lockfile(
         raise ValueError("online=True and offline=True cannot be combined")
     check_locks(pyodide_locks, targets)
     p = Path(path)
-    source: Source = load_file(find_lockfile(p) if p.is_dir() else p)
+    lockfile = find_lockfile(p) if p.is_dir() else p
+    if lockfile.name == "pyproject.toml":  # direct dependencies only; the command line says so in a note
+        raise SourceError(
+            f"{lockfile}: a pyproject.toml lists direct dependencies only, so check_lockfile() and "
+            "wheelgap.diff don't read it; pass a lockfile (the wheelgap command checks a pyproject.toml)"
+        )
+    source: Source = load_file(lockfile)
     if offline:
         require_offline([source], "offline=True", undo="set offline=False")
     fill_all(source.packages, refresh=online, python=single_python(targets))

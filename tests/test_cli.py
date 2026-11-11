@@ -2141,3 +2141,145 @@ def test_version_includes_packaging(capsys):
     python = f"{platform.python_implementation()} {platform.python_version()}{free_threaded}"
     assert out == f"wheelgap {wheelgap.__version__} (packaging {packaging.__version__}, {python})\n"
     assert not err
+
+
+# ranged: 1.5 wheel, 1.9 sdist only, 2.0 wheel. nowheels has only an sdist.
+LIB_PYPROJECT = """\
+[project]
+name = "mylib"
+dependencies = ["ranged<2", "fastlib==2.0.0", "winonly; sys_platform == 'win32'"]
+
+[project.optional-dependencies]
+test = ["nowheels"]
+"""
+
+
+def test_pyproject_checks_direct_dependencies(capsys, fake_pypi, tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(LIB_PYPROJECT, encoding="utf-8")
+    code, out, err = run(capsys, str(path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 1  # ranged<2 picks 1.9, which has only an sdist
+    rows = {row["name"]: row for row in json.loads(out)["packages"]}
+    assert set(rows) == {"ranged", "fastlib"}  # winonly's marker doesn't hold on Linux
+    assert rows["ranged"]["version"] == "1.9"
+    assert rows["ranged"]["results"] == {"linux-x86_64": "source"}
+    assert "pyproject.toml lists direct dependencies only; their own dependencies aren't checked" in err
+    assert "use a lockfile for that" in err
+    assert "ranges were checked at the newest matching release" in err
+    assert "direct dependencies" not in out  # the note stays out of --json
+    # The note is printed even with --quiet.
+    code, _, err = run(capsys, str(path), "-p", "3.13", "-t", "linux-x86_64", "-q")
+    assert "lists direct dependencies only" in err
+
+
+def _write_requires_python_pyproject(tmp_path, requires_python):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        f'[project]\nname = "mylib"\ndependencies = []\nrequires-python = "{requires_python}"\n',
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_pyproject_requires_python_note_names_unsupported_pythons(capsys, fake_pypi, tmp_path):
+    path = _write_requires_python_pyproject(tmp_path, ">=3.11")
+    code, out, err = run(capsys, str(path), "-p", "3.10", "-t", "linux-x86_64", "--json")
+    assert code == 0
+    assert "requires Python >=3.11" in err
+    assert "leaves out Python 3.10" in err
+    assert "is locked for Python" not in err  # the uv.lock wording doesn't apply
+    assert "requires Python" not in out  # notes stay out of --json
+
+
+def test_pyproject_requires_python_note_absent_when_supported(capsys, fake_pypi, tmp_path):
+    path = _write_requires_python_pyproject(tmp_path, ">=3.11")
+    code, _, err = run(capsys, str(path), "-p", "3.12", "-t", "linux-x86_64")
+    assert code == 0
+    assert "leaves out Python" not in err
+
+
+@pytest.mark.parametrize(
+    ("requires_python", "pythons", "left_out"),
+    [
+        ("!=3.12.*", ["3.12", "3.13"], "3.12"),  # pip applies every clause, unlike uv.lock's bounds-only rule
+        (">=3.11,!=3.12.*", ["3.10", "3.12", "3.13"], "3.10, 3.12"),
+        ("!=3.12.0", ["3.12"], None),  # 3.12.1 and later are fine
+        ("<3.13", ["3.12", "3.13", "3.14t"], "3.13, 3.14t"),
+        (">=3.11", ["3.14t"], None),
+    ],
+)
+def test_pyproject_requires_python_clauses(capsys, fake_pypi, tmp_path, requires_python, pythons, left_out):
+    path = _write_requires_python_pyproject(tmp_path, requires_python)
+    args = [arg for p in pythons for arg in ("-p", p)]
+    code, _, err = run(capsys, str(path), *args, "-t", "linux-x86_64")
+    assert code == 0
+    if left_out is None:
+        assert "leaves out Python" not in err
+    else:
+        assert f"leaves out Python {left_out};" in err
+
+
+def test_pyproject_requires_python_notes_respect_quiet(capsys, fake_pypi, tmp_path):
+    for spec in (">=3.11", "3.11"):  # left out, and invalid
+        path = _write_requires_python_pyproject(tmp_path, spec)
+        _, _, err = run(capsys, str(path), "-p", "3.10", "-t", "linux-x86_64", "-q")
+        assert "requires-python" not in err and "requires Python" not in err
+
+
+def test_pyproject_invalid_requires_python_is_ignored_with_a_note(capsys, fake_pypi, tmp_path):
+    path = _write_requires_python_pyproject(tmp_path, "3.11")
+    code, _, err = run(capsys, str(path), "-p", "3.12", "-t", "linux-x86_64")
+    assert code == 0
+    assert "ignoring requires-python '3.11'" in err
+    assert "is locked for Python" not in err
+
+
+@pytest.mark.parametrize("flags", [["--extra", "test"], ["--all-extras"]])
+def test_pyproject_extra_adds_optional_dependencies(capsys, fake_pypi, tmp_path, flags):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(LIB_PYPROJECT, encoding="utf-8")
+    code, out, _ = run(capsys, str(path), "-p", "3.13", "-t", "linux-x86_64", "--json", *flags)
+    assert code == 1
+    rows = {row["name"]: row for row in json.loads(out)["packages"]}
+    assert rows["nowheels"]["results"] == {"linux-x86_64": "source"}
+
+
+@pytest.mark.parametrize(
+    "text,flags,error",
+    [
+        (LIB_PYPROJECT, ["--extra", "docs"], "unknown extras: docs"),
+        (LIB_PYPROJECT, ["--group", "dev"], "don't apply to pyproject.toml"),
+        (LIB_PYPROJECT, ["--no-dev"], "don't apply to pyproject.toml"),
+        ('[project]\nname = "x"\ndynamic = ["dependencies"]\n', [], "dependencies is dynamic"),
+        (
+            '[project]\nname = "x"\ndependencies = []\ndynamic = ["optional-dependencies"]\n',
+            ["--all-extras"],
+            "optional-dependencies is dynamic",
+        ),
+    ],
+)
+def test_pyproject_input_errors_exit_2(capsys, fake_pypi, tmp_path, text, flags, error):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(text, encoding="utf-8")
+    code, _, err = run(capsys, str(path), "-p", "3.13", "-t", "linux-x86_64", *flags)
+    assert code == 2
+    assert error in err
+    assert fake_pypi == []  # nothing was looked up
+
+
+def test_pyproject_self_reference_in_dependencies_is_not_looked_up(capsys, fake_pypi, tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(LIB_PYPROJECT.replace('"fastlib==2.0.0", ', '"fastlib==2.0.0", "MyLib[test]", '), encoding="utf-8")
+    code, out, _ = run(capsys, str(path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 1
+    rows = {row["name"]: row for row in json.loads(out)["packages"]}
+    assert set(rows) == {"ranged", "fastlib", "nowheels"}  # MyLib[test] adds the test extra
+    assert not any("mylib" in url.lower() for url in fake_pypi)
+
+
+def test_directory_without_lockfile_suggests_pyproject(capsys, fake_pypi, tmp_path):
+    (tmp_path / "pyproject.toml").write_text(LIB_PYPROJECT, encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2
+    assert "no lockfile found" in err
+    assert f"wheelgap {tmp_path / 'pyproject.toml'}" in err

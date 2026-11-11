@@ -57,6 +57,10 @@ PLATFORMS: dict[str, tuple[str, str]] = {
     "musl-ppc64le": ("musllinux", "ppc64le"),
     "musl-s390x": ("musllinux", "s390x"),
     "musl-riscv64": ("musllinux", "riscv64"),
+    # 32-bit x86: 32-bit Python on Windows, old CI images and linux/386 containers.
+    "win32": ("windows", "win32"),
+    "linux-i686": ("manylinux", "i686"),
+    "musl-i686": ("musllinux", "i686"),
     # PEP 730 / PEP 738: the arch is the multiarch / ABI part of the wheel tag.
     "ios-arm64": ("ios", "arm64_iphoneos"),
     "ios-simulator-arm64": ("ios", "arm64_iphonesimulator"),
@@ -69,11 +73,11 @@ PLATFORMS: dict[str, tuple[str, str]] = {
 # dependencies are installed by cross-platform pip runs, which need --only-binary :all:.
 WHEEL_ONLY_FAMILIES = {"pyodide", "ios", "android"}
 
-# Less common Linux architectures: checked by name, or with `-t everything`.
-EXTRA_ARCHES = {"armv7l", "ppc64le", "s390x", "riscv64"}
+# Less common architectures: checked by name, or with `-t everything`.
+EXTRA_ARCHES = {"armv7l", "ppc64le", "s390x", "riscv64", "i686", "win32"}
 
 # `-t all` means the eight common native platforms; `-t everything` adds the extra Linux
-# architectures. Pyodide, iOS and Android are only checked when asked for by name (or `-t mobile`).
+# architectures and 32-bit Windows. Pyodide, iOS and Android are only checked when asked for by name (or `-t mobile`).
 NATIVE_PLATFORMS = [
     name for name, (family, arch) in PLATFORMS.items() if family not in WHEEL_ONLY_FAMILIES and arch not in EXTRA_ARCHES
 ]
@@ -120,6 +124,17 @@ ALIASES: dict[str, str] = {
     "musllinux-ppc64le": "musl-ppc64le",
     "musllinux-s390x": "musl-s390x",
     "musllinux-riscv64": "musl-riscv64",
+    "windows-x86": "win32",
+    "win-x86": "win32",
+    "linux-x86": "linux-i686",
+    "linux-386": "linux-i686",
+    "linux-i386": "linux-i686",
+    "manylinux-i686": "linux-i686",
+    "musl-x86": "musl-i686",
+    "musl-386": "musl-i686",
+    "alpine-i686": "musl-i686",
+    "alpine-x86": "musl-i686",
+    "musllinux-i686": "musl-i686",
     "ios": "ios-arm64",
     "iphoneos": "ios-arm64",
     "ios-simulator": "ios-simulator-arm64",
@@ -148,11 +163,21 @@ _MARKER_OS = {
 _MARKER_MACHINE = {
     "win_amd64": "AMD64",
     "win_arm64": "ARM64",
+    "win32": "x86",
     "arm64_iphoneos": "arm64",
     "arm64_iphonesimulator": "arm64",
     "x86_64_iphonesimulator": "x86_64",
     "arm64_v8a": "aarch64",
 }
+# On 32-bit x86, platform_machine is the machine's, not the Python's: 32-bit Python reports "AMD64" on 64-bit
+# Windows (WOW64) and "ARM64" on Windows on ARM, and only real 32-bit Windows says "x86"; a linux/386 container on
+# an x86_64 host says "x86_64" unless it runs under linux32. So a comparison on it is unknown for these targets.
+# 32-bit Arm has the same problem: a 32-bit userland on a 64-bit kernel reports the kernel's "aarch64", and
+# Raspberry Pi OS 32-bit boots a 64-bit kernel by default on a Pi 4 and 5
+# (https://github.com/raspberrypi/linux/issues/5981); a linux/arm/v7 container on an arm64 host can too, and
+# under linux32 an arm64 kernel says "armv8l".
+# ppc64le, s390x and riscv64 userlands are 64-bit only, so their platform_machine is the target's.
+_UNKNOWN_MACHINE_ARCHES = {"win32", "i686", "armv7l"}
 
 DEFAULT_PLATFORMS = ["linux-x86_64", "linux-aarch64", "macos-arm64", "win-amd64"]
 DEFAULT_GLIBC = "2.36"
@@ -360,6 +385,13 @@ class Target:
         if family == "android":
             return list(tags.android_platforms(self.android_api, arch))
         return [arch]
+
+    @property
+    def unknown_markers(self) -> frozenset[str]:
+        """Marker names whose value this target doesn't decide (on top of check.py's _UNKNOWABLE)."""
+        return (
+            frozenset({"platform_machine"}) if PLATFORMS[self.platform][1] in _UNKNOWN_MACHINE_ARCHES else frozenset()
+        )
 
     @cached_property
     def marker_env(self) -> dict[str, str]:

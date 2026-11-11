@@ -204,6 +204,40 @@ def test_markers_wheelgap_cannot_know_count_as_needed():
     assert not marker_holds("sys_platform == 'win32'", t)
 
 
+def test_platform_machine_is_unknown_on_32bit_x86():
+    win32, i686, musl = build_targets(["3.13"], ["win32", "linux-i686", "musl-i686"])
+    # 32-bit Python on 64-bit Windows reports AMD64, and a linux/386 container on an x86_64 host reports x86_64.
+    assert marker_holds('platform_machine == "AMD64"', win32)
+    assert marker_holds("platform_machine == 'x86_64'", i686) and marker_holds("platform_machine == 'x86_64'", musl)
+    # SQLAlchemy 2.0's greenlet marker: must not hide greenlet, which has no wheels for these targets.
+    greenlet = (
+        'platform_machine == "aarch64" or (platform_machine == "ppc64le" or (platform_machine == "x86_64" or '
+        '(platform_machine == "amd64" or (platform_machine == "AMD64" or (platform_machine == "win32" or '
+        'platform_machine == "WIN32")))))'
+    )
+    assert marker_holds(greenlet, win32) and marker_holds(greenlet, i686)
+    # The rest of the marker still decides.
+    assert not marker_holds("sys_platform == 'linux' and platform_machine == 'x86_64'", win32)
+    assert not marker_holds("sys_platform == 'win32' and platform_machine == 'AMD64'", i686)
+    (amd64,) = build_targets(["3.13"], ["win-amd64"])
+    assert not marker_holds("platform_machine == 'x86'", amd64)
+
+
+def test_platform_machine_is_unknown_on_32bit_arm():
+    glibc, musl = build_targets(["3.13"], ["linux-armv7l", "musl-armv7l"])
+    # Raspberry Pi OS 32-bit on a 64-bit kernel, or a linux/arm/v7 container on an arm64 host, reports aarch64.
+    assert marker_holds('platform_machine == "aarch64"', glibc) and marker_holds('platform_machine == "aarch64"', musl)
+    assert marker_holds("platform_machine == 'armv7l'", glibc)
+    # The rest of the marker still decides.
+    assert not marker_holds("sys_platform == 'win32' and platform_machine == 'aarch64'", glibc)
+    assert not marker_holds("sys_platform == 'win32' and platform_machine == 'aarch64'", musl)
+    # 64-bit-only userlands keep their own value.
+    ppc, s390x = build_targets(["3.13"], ["linux-ppc64le", "linux-s390x"])
+    assert not marker_holds("platform_machine == 'aarch64'", ppc) and not marker_holds(
+        "platform_machine == 'x86_64'", s390x
+    )
+
+
 def test_more_sdist_formats():
     (t,) = build_targets(["3.13"], ["linux-x86_64"])
     assert status_for(["foo-1.0.tar"], t) is Status.SOURCE

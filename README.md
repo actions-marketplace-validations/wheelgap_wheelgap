@@ -178,8 +178,16 @@ unless `--only-group` is given;
 project extras are included only when requested. `--no-dev` removes `dev`, while `--only-group`
 excludes project dependencies and default groups. Combine `--only-group` with `--group` to add more
 groups, but not with `--extra`/`--all-extras`. An explicit `dev` group conflicts with `--no-dev`.
-Unknown extra/group names are errors. Command-line selectors need a `uv.lock` input; configured
-`extras`/`groups` apply only to `uv.lock` inputs.
+Unknown extra/group names are errors. Command-line selectors need a `uv.lock` input, or for groups a Poetry 2.x
+`poetry.lock`, or for `--extra`/`--all-extras` a `pyproject.toml` (see below); configured `groups` apply to
+`uv.lock` and Poetry 2.x `poetry.lock` inputs, and configured `extras` only to `uv.lock` inputs.
+
+`poetry.lock` (Poetry 2.x) inputs accept `--group`, `--only-group` and `--no-dev` with Poetry's meanings, and
+configured `groups` apply to them too. `main` and every group not marked `optional = true` in
+`pyproject.toml` count; `--group` adds a group (like `poetry install --with`), `--no-dev` leaves out `dev`,
+and `--only-group` checks only the named groups (`main` only if named). A package counts if any of its groups is
+selected, with the markers of those groups. `--extra` isn't supported for `poetry.lock` yet, and a command-line
+selection on a Poetry 1.x lock (no per-package groups) is an error; configured `groups` leave a 1.x lock unfiltered.
 
 Default selections can also be configured:
 
@@ -199,8 +207,34 @@ including local workspace dependencies, rather than enabling every extra of ever
 Unresolved marker conditions (including uv's synthetic conflict markers and unknown OS releases)
 remain conservative: wheelgap can still report a possible gap rather than silently hide one.
 Selection itself needs no network. Index refreshes (`--online`, or a target outside the lockfile's
-`requires-python`) only look up packages in the selected graph. Configured `extras` and `groups` only apply to `uv.lock` inputs; other inputs
-are checked as usual.
+`requires-python`) only look up packages in the selected graph. Configured `extras` only apply to `uv.lock` inputs, and configured `groups` to `uv.lock` and Poetry 2.x
+`poetry.lock` inputs; other inputs are checked as usual.
+
+### Check a library's direct dependencies
+
+Libraries usually don't commit a lockfile. Pass the library's `pyproject.toml` to check the
+dependencies it declares in `[project] dependencies`:
+
+```bash
+wheelgap pyproject.toml -t win-arm64 -t pyodide
+# Add [project.optional-dependencies] groups
+wheelgap pyproject.toml --extra test
+wheelgap pyproject.toml --all-extras
+```
+
+Each requirement is read like a line of a requirements file, so ranges and bare names use the newest
+matching release and markers are respected. With several `-p` versions, that release isn't filtered by
+`Requires-Python` ([#84](https://github.com/wheelgap/wheelgap/issues/84)), so ranges and bare names can
+show false gaps. Only direct dependencies are checked: their own dependencies aren't, and wheelgap always
+prints a note saying so. Use a lockfile for the full picture. If `[project] requires-python` leaves out a `-p`
+Python (every clause counts, as pip applies them), that target is still checked and a note names it; an invalid
+`requires-python` is ignored with a note.
+`[dependency-groups]` isn't read yet, so `--group`, `--only-group` and `--no-dev` are errors here, and a
+`dependencies` listed in `[project] dynamic` is an input error (exit 2), as are dynamic
+`optional-dependencies` with `--extra`/`--all-extras` and Poetry dependencies kept in
+`[tool.poetry.dependencies]` (check `poetry.lock` instead). `wheelgap .` in a directory with no lockfile
+doesn't switch to `pyproject.toml` on its own; the error suggests it. `check_lockfile()` and
+`wheelgap diff` don't read `pyproject.toml`.
 
 ### Targets
 
@@ -239,7 +273,9 @@ Only x86 Linux takes `manylinux` wheels older than glibc 2.17: every other archi
 | `win-arm64` | `windows-arm64` | `win_arm64` |
 | `linux-armv7l` | `linux-arm`, `linux-armv7`, `linux/arm/v7` | `manylinux_2_*_armv7l` from 2.17 (32-bit ARM, e.g. Raspberry Pi OS), legacy `manylinux2014`, and plain `linux_armv7l` (which PyPI allows for the Pi) |
 | `linux-ppc64le`, `linux-s390x`, `linux-riscv64` | `linux/ppc64le`, `linux/s390x`, `linux/riscv64` | `manylinux_2_*` from 2.17 for that arch (`riscv64` has no legacy `manylinux2014` tag) |
-| `musl-armv7l`, `musl-ppc64le`, `musl-s390x`, `musl-riscv64` | `alpine-armv7` | `musllinux_1_*` for that arch (pip would also take a plain `linux_armv7l` wheel on Alpine, but it's a glibc build, so wheelgap doesn't count it) |
+| `linux-i686` | `linux-x86`, `linux-386`, `linux/386` | `manylinux_2_*_i686` up to `--glibc`, legacy `manylinux2014`/`2010`/`1` (32-bit x86) |
+| `win32` | `windows-x86`, `win-x86` | `win32` (32-bit Python on Windows) |
+| `musl-armv7l`, `musl-ppc64le`, `musl-s390x`, `musl-riscv64`, `musl-i686` | `alpine-armv7`, `alpine-x86` | `musllinux_1_*` for that arch (pip would also take a plain `linux_armv7l` wheel on Alpine, but it's a glibc build, so wheelgap doesn't count it) |
 | `pyodide` | `wasm`, `wasm32`, `emscripten` | Pyodide's ABI for that Python: `pyodide_2024_0` (3.12), `pyodide_2025_0` / `pyemscripten_2025_0` (3.13), `pyemscripten_2026_0` (3.14) |
 | `ios-arm64` | `ios`, `iphoneos` | `ios_*_arm64_iphoneos` up to `--ios` (default 13.0) |
 | `ios-simulator-arm64`, `ios-simulator-x86_64` | `ios-simulator` | `ios_*_arm64_iphonesimulator` / `ios_*_x86_64_iphonesimulator` |
@@ -253,9 +289,9 @@ Only x86 Linux takes `manylinux` wheels older than glibc 2.17: every other archi
 wheelgap -p 3.12 -t pyodide --pyodide-lock https://cdn.jsdelivr.net/pyodide/v0.27.7/full/pyodide-lock.json
 ```
 
-Docker platform names also work with `-t`, for example `-t linux/amd64,linux/arm64` (also `linux/arm64/v8`, `linux/arm/v7`, `linux/ppc64le`, `linux/s390x` and `linux/riscv64`).
+Docker platform names also work with `-t`, for example `-t linux/amd64,linux/arm64` (also `linux/arm64/v8`, `linux/arm/v7`, `linux/ppc64le`, `linux/s390x`, `linux/riscv64` and `linux/386`, also spelled `linux/i386`).
 
-`-t all` checks the eight common native platforms, and `-t everything` adds the armv7l, ppc64le, s390x and riscv64 Linux targets (glibc and musl). Pyodide, iOS and Android are only checked when you name them. Python versions take a trailing `t` for free-threaded builds (`3.14t`), which correctly rejects `abi3` wheels. Without `-p`, wheelgap reads a `.python-version` file next to the lockfile (or `pyproject.toml`) if there is one, and otherwise uses the Python it is running on.
+`-t all` checks the eight common native platforms, and `-t everything` adds the armv7l, ppc64le, s390x, riscv64 and i686 Linux targets (glibc and musl) and `win32`. Pyodide, iOS and Android are only checked when you name them. Python versions take a trailing `t` for free-threaded builds (`3.14t`), which correctly rejects `abi3` wheels. Without `-p`, wheelgap reads a `.python-version` file next to the lockfile (or `pyproject.toml`) if there is one, and otherwise uses the Python it is running on.
 
 ### In CI (GitHub Action)
 
@@ -317,10 +353,10 @@ Add `--pyodide-lock PATH_OR_URL` once per Pyodide release (each is for one Pytho
 ### Comparing two lockfiles
 
 ```bash
-python -m wheelgap.diff old/uv.lock uv.lock -p 3.13 -t linux-aarch64,musl-aarch64
+wheelgap diff old/uv.lock uv.lock -p 3.13 -t linux-aarch64,musl-aarch64
 ```
 
-This checks both lockfiles and lists the packages that got worse on a target (a wheel that became a source build, say) and the new packages with gaps, so a dependency bump that drops a platform fails CI. It exits 1 if there are any, 0 if not, and 2 on bad input. A package that can no longer be checked counts as worse: `unknown`, or now installed from git, a path, a URL or a private index (a new one of those counts as a new gap). Packages are matched by name, so a requirements-file path with no name (`./pkg`, or `-e ./pkg` without `#egg=`) shows up as a new package rather than as the one it replaced. The same `-p` and `-t` apply to both lockfiles, and `[tool.wheelgap]` and `.python-version` aren't read yet, so pass them explicitly. It's a module entry point for now; `wheelgap diff` will follow.
+This checks both lockfiles and lists the packages that got worse on a target (a wheel that became a source build, say) and the new packages with gaps, so a dependency bump that drops a platform fails CI. It exits 1 if there are any, 0 if not, and 2 on bad input. A package that can no longer be checked counts as worse: `unknown`, or now installed from git, a path, a URL or a private index (a new one of those counts as a new gap). Packages are matched by name, so a requirements-file path with no name (`./pkg`, or `-e ./pkg` without `#egg=`) shows up as a new package rather than as the one it replaced. The same `-p` and `-t` apply to both lockfiles, and `[tool.wheelgap]` and `.python-version` aren't read yet, so pass them explicitly. `--json` prints one object with `worse` (each package's `old_versions` and `new_versions` lists and, per target, `old_status` and `new_status`), `new` (each new package's `versions` and per-target `status`), `unchecked` and `summary` counts; a skipped cell has the status `skipped` and a `skip_reason` (`git`, `url`, `private index`, ...). `diff` is a subcommand only as the first argument when there's no file or folder named `diff` in the current directory (then it's read as an input, with a note; `python -m wheelgap.diff` always compares, and a pinned `diff==2023.12.6` checks the PyPI package of that name). `python -m wheelgap.diff` works the same way.
 
 ### With an AI coding agent
 
@@ -337,6 +373,14 @@ On Claude Code 2.1.275 or later, `/plugin install wheelgap --marketplace wheelga
 
 **Codex, Cursor, GitHub Copilot and others:** copy [`integrations/claude-code/skills/check-wheels/`](integrations/claude-code/skills/check-wheels/) into your project's `.agents/skills/` folder. For a Cursor project rule instead, copy [`integrations/cursor/wheelgap.mdc`](integrations/cursor/wheelgap.mdc) to `.cursor/rules/`.
 
+**As an MCP server** (new, not yet released): `wheelgap-mcp` lets any agent that speaks the [Model Context Protocol](https://modelcontextprotocol.io/) call wheelgap as a tool, with no shell access needed. It runs over stdio and has four read-only tools: `check_package` (one package, latest or a given version), `check_lockfile`, `check_dockerfile` and `list_targets`. `check_lockfile` gives the same answer as `wheelgap PATH --json`, `[tool.wheelgap]` settings included: it returns the packages with gaps, the ones it skipped (git, path and private-index packages, which aren't checked) and any notes. `check_dockerfile` gives the answer of `wheelgap PATH --dockerfile DOCKERFILE --json` (`PATH` defaults to the Dockerfile's folder), plus the `image` it read (`python`, `platform`, `glibc`, `musl`), so an agent can ask before switching `python:3.13-slim` to `-alpine` or adding `--platform=linux/arm64`; a Dockerfile wheelgap can't read is a tool error. On `pyodide` targets, `check_package` and `check_lockfile` take an optional `pyodide_lock` (a path or https URL of a `pyodide-lock.json`, as `--pyodide-lock` does), so packages Pyodide ships itself show as `bundled`. Tool calls send progress notifications when the client asks for them and don't stop the server answering `ping`. A cancelled call sends no more progress and no result, but its index lookups still finish before the next call starts. Like wheelgap, it needs nothing beyond `packaging`. Until the next release, run it from GitHub; for Claude Code:
+
+```bash
+claude mcp add wheelgap -- uvx --from git+https://github.com/wheelgap/wheelgap wheelgap-mcp
+```
+
+Other clients take the same command (`uvx`) and arguments in their MCP settings. Pass `check_lockfile` an absolute path, since the server's working directory may not be your project.
+
 Contributing to wheelgap with an agent? See [AGENTS.md](https://github.com/wheelgap/wheelgap/blob/main/AGENTS.md).
 
 ## How it works
@@ -345,10 +389,10 @@ Contributing to wheelgap with an agent? See [AGENTS.md](https://github.com/wheel
 - **Lockfiles are read offline.** `uv.lock`, `pylock.toml`, `poetry.lock` and `pdm.lock` already record every file published for each pinned version (except a `uv.lock` or `pylock.toml` whose `requires-python` leaves out the Python you check; see below). wheelgap parses the wheel filenames' tags with [`packaging`](https://packaging.pypa.io/) and checks them against the exact tag set each target accepts. That is the same logic pip and uv use to pick a wheel.
 - **`requirements.txt`, `requirements.lock` and bare package names** are looked up on the PyPI JSON API. Feed it a fully pinned file (from Rye, `uv pip compile`, `pip-compile` or `uv export`): wheelgap checks the lines you give it and doesn't resolve dependencies. Rye's default (non-universal) locks are resolved for the machine that created them and carry no platform markers. Constraint files (`-c FILE`, `-cFILE`, `--constraint FILE` or `--constraint=FILE`) restrict unpinned requirements without adding packages. Exact constraints select a version; ranges are intersected. A constraint wheelgap can't apply leaves the package `unknown` rather than guessed: one with an environment marker (it can't yet be applied per target), a URL or path, or two different exact versions. Constraint files given as a URL or an environment variable (`-c https://…`, `-c ${PIP_CONSTRAINT}`) are skipped.
 - **`Pipfile.lock`** reads `default`, `develop` and any custom package categories (such as `docs` or `tests`) and looks up distribution filenames on PyPI for their pinned versions. Environment markers are preserved; Git, path, file and editable dependencies are skipped as non-index packages. Packages pinned to an `index` that isn't PyPI are skipped too (`private index`), so their names aren't sent to pypi.org. A PyPI mirror counts as a private index here, since wheelgap can't tell it apart from an internal one, unless `WHEELGAP_INDEX_URL` points at the JSON API of that same index (for a source `https://mirror.example.com/simple`, set `WHEELGAP_INDEX_URL=https://mirror.example.com/pypi`): then those packages are looked up there, on the index the lock already names. It must be the same repository, not just the same host: `<repo>/simple` matches `<repo>/pypi` with the same scheme, host and port, so another repository on the same Artifactory or Nexus server stays skipped. The index has to serve PyPI's JSON API, including pinned versions (`<WHEELGAP_INDEX_URL>/<name>/<version>/json`); on a mirror that only serves the simple API, such as the Tsinghua or Aliyun mirrors, those packages come back as lookup errors like `not on index` instead. `--index-url` lookups don't use this.
-- **Environment markers are respected.** A `pywin32 ; sys_platform == 'win32'` dependency won't show up as a Linux gap. For `uv.lock` the dependency graph is walked per target, so transitive platform-specific packages are handled too.
+- **Environment markers are respected.** A `pywin32 ; sys_platform == 'win32'` dependency won't show up as a Linux gap. For `uv.lock` the dependency graph is walked per target, so transitive platform-specific packages are handled too. On `win32`, `linux-i686`, `musl-i686`, `linux-armv7l` and `musl-armv7l` a `platform_machine` comparison counts as unknown, so the package is still checked. `platform_machine` reports the machine, not the Python: 32-bit Python on 64-bit Windows says `AMD64`, a `linux/386` container on an x86_64 host says `x86_64`, and 32-bit Raspberry Pi OS on a Pi 4 or 5 (which boots a 64-bit kernel) or a `linux/arm/v7` container on an arm64 host can say `aarch64`.
 - `--online` re-checks lockfile packages against PyPI. Packages the lock says came from another index keep their locked files, so their names are never sent to PyPI. Use it when a project has uploaded new wheels for an existing version since you locked, or if your `uv.lock` was generated with `environments` restrictions. A `uv.lock` or `pylock.toml` whose `requires-python` leaves out a target's Python (say `==3.13.*`, checked with `-p 3.14t`) may be missing wheels for it, because uv only keeps the wheels that can serve `requires-python`. Without `--online`, wheelgap then also looks up its PyPI packages on the index, keeps the lock's own files if a lookup fails, and prints a note (with `-q`, only when some packages couldn't be re-checked).
-- `--offline` never contacts an index, for CI and coding agents without network. Inputs that need a lookup (requirements files, `Pipfile.lock`, package names, lockfile entries with no file list) make it exit 2 with an error naming the packages, so use a lockfile instead. A `--pyodide-lock` URL is refused too: pass a downloaded copy. The `requires-python` re-check above is skipped, with a note that those Pythons may show false gaps. It can't be combined with `--online`. Set `offline = true` in `[tool.wheelgap]` to make it the project default; `--online` on the command line overrides it for one run.
-- **Cache:** lookups of a pinned version (`name==1.2.3`) are saved for 24 hours, so a repeat run needn't ask PyPI again. They're kept in `wheelgap/pinned-v1` inside `~/.cache` on Linux (or `$XDG_CACHE_HOME`), `~/Library/Caches` on macOS and `%LOCALAPPDATA%` on Windows. Each entry holds only the release's file names and yanked flags, named by a hash of the index URL (without any credentials in it), the package and the version; on Linux and macOS, wheelgap creates the folder and its entries readable by you only. `--online` always asks the index again and saves the fresh answer, so later runs use it; `--no-cache` neither reads nor saves the cache for one run. Unpinned names, version ranges and `--index-url` lookups aren't cached, and neither are lookups from the Python API.
+- `--offline` never contacts an index, for CI and coding agents without network. Inputs that need a lookup (requirements files, `pyproject.toml`, `Pipfile.lock`, package names, lockfile entries with no file list) make it exit 2 with an error naming the packages, so use a lockfile instead. A `--pyodide-lock` URL is refused too: pass a downloaded copy. The `requires-python` re-check above is skipped, with a note that those Pythons may show false gaps. It can't be combined with `--online`. Set `offline = true` in `[tool.wheelgap]` to make it the project default; `--online` on the command line overrides it for one run.
+- **Cache:** lookups of a pinned version (`name==1.2.3`) are saved for 24 hours, so a repeat run needn't ask PyPI again. They're kept in `wheelgap/pinned-v1` inside `~/.cache` on Linux (or `$XDG_CACHE_HOME`), `~/Library/Caches` on macOS and `%LOCALAPPDATA%` on Windows. Each entry holds only the release's file names and yanked flags, named by a hash of the index URL (without any credentials in it), the package and the version; on Linux and macOS, wheelgap creates the folder and its entries readable by you only. `--online` always asks the index again and saves the fresh answer, so later runs use it; `--no-cache` neither reads nor saves the cache for one run. Entries older than 24 hours are deleted, at most once a day, and `wheelgap --clear-cache` deletes all of them (add inputs to check them right after). Both touch only wheelgap's own entry files, and never follow a link. Unpinned names, version ranges and `--index-url` lookups aren't cached, and neither are lookups from the Python API.
 - **Private indexes:** `--index-url URL` (or `index-url` in `[tool.wheelgap]`) sends the PyPI lookups described above to a simple index that serves the JSON form (PEP 691) instead. The URL must be https (plain http only for localhost). Credentials can go in the URL passed to `--index-url` (`https://user:token@host/simple`) and never appear in output; in CI, `--index-url "$PRIVATE_INDEX"` keeps them out of your repo. They're refused in `[tool.wheelgap]`, since `pyproject.toml` is committed. An index that only serves HTML (PEP 503) gets a clear error.
 
 ## Why this exists
@@ -368,8 +412,6 @@ wheelgap is growing into **caniuse for Python wheels**: an open map of which pac
 Next up for the CLI, each with a first step written up and no PR yet:
 
 - "nearest version with a wheel" hints ([#20](https://github.com/wheelgap/wheelgap/issues/20))
-- `wheelgap diff`: the new gaps between two lockfiles, for PR comments ([#51](https://github.com/wheelgap/wheelgap/issues/51))
-- caching index lookups between runs ([#65](https://github.com/wheelgap/wheelgap/issues/65))
 - version ranges: picking the newest release that supports each target's Python ([#84](https://github.com/wheelgap/wheelgap/issues/84))
 
 The [roadmap](https://github.com/wheelgap/wheelgap/labels/roadmap) and [help wanted](https://github.com/wheelgap/wheelgap/labels/help%20wanted) labels have more.
