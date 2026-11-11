@@ -356,7 +356,7 @@ def test_automatic_narrow_lock_rechecks_only_selected_packages(fixtures, tmp_pat
     (tmp_path / "uv.lock").write_text(lock)
     calls = []
 
-    def recheck(packages, simple_index=None):
+    def recheck(packages, simple_index=None, read_cache=False, write_cache=False):
         calls.extend(p.name for p in packages)
         return 0, 0
 
@@ -396,7 +396,7 @@ def test_online_selection_preserves_private_index_and_python_context(fixtures, t
     (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
     calls = []
 
-    def fill(package, python=None):
+    def fill(package, python=None, read_cache=False, write_cache=False):
         calls.append((package.name, python))
 
     monkeypatch.setattr(pypi, "fill", fill)

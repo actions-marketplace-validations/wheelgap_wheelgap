@@ -32,6 +32,16 @@ def clean_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def lookup_cache(monkeypatch, tmp_path_factory) -> Path:
+    """Each test gets an empty cache of its own, so no test reads or writes the developer's real one."""
+    from wheelgap import cache
+
+    folder = tmp_path_factory.mktemp("cache")
+    monkeypatch.setattr(cache, "cache_dir", lambda: folder)
+    return folder
+
+
 @pytest.fixture
 def fixtures() -> Path:
     return FIXTURES
@@ -47,7 +57,8 @@ def fake_pypi(monkeypatch):
 
     def fetch_json(url, timeout=20.0):
         calls.append(url)
-        parts = url.removeprefix(pypi.DEFAULT_INDEX + "/").removesuffix("/json").split("/")
+        # Served at whatever WHEELGAP_INDEX_URL points at, so tests can assert which index was asked.
+        parts = url.removeprefix(pypi.index_url() + "/").removesuffix("/json").split("/")
         name = parts[0]
         if name not in FAKE_INDEX:
             raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)

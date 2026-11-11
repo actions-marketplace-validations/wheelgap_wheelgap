@@ -25,6 +25,7 @@ No local setup? [Open the repo in GitHub Codespaces](https://codespaces.new/whee
 - **Ask, and we'll assign the issue to you for 18 hours.** Comment "I'd like to take this" and we'll assign you. The 18 hours run from the moment you're assigned (our reply gives the end time). Open a pull request that links the issue (`Closes #N` or `Part of #N`) within those 18 hours (a draft is fine) to keep it. If there's no PR by then, the assignment lapses and we fix the issue ourselves, so please ask when you can start soon. If plans change, just tell us and we'll release it, no hard feelings. If your PR arrives after the 18 hours but before ours is open, we'll still review yours. An issue nobody has asked for goes to the first pull request opened for it.
 - **Check before you start.** Look at the issue's assignee and linked PRs. While an issue is held for someone else, please pick another one. A PR from anyone else during a hold waits until the hold ends: if the assigned person's PR arrives in time, theirs is merged and the other is closed with a pointer to another issue; if not, we review the waiting PR instead of fixing the issue ourselves. A later PR for an issue that already has one is closed the same way.
 - **Want to add something that isn't an issue yet?** Post it in [Discussions → Ideas](https://github.com/wheelgap/wheelgap/discussions/categories/ideas) first, so we can agree it fits before you spend time on it. Small fixes (typos, docs, obvious bugs) can go straight to a PR.
+- **No issue that fits? Find a real bug.** Run wheelgap on a real project's lockfile and check any result you doubt with `pip download --only-binary=:all: --platform …`. If the two disagree, that's a bug worth reporting, and you're welcome to fix it too. [AGENTS.md](AGENTS.md#no-issue-fits-find-a-real-bug) has the exact steps, for people and coding agents alike. Please keep to one open self-filed issue at a time, and only file what pip contradicts.
 
 ## Making a pull request
 
@@ -62,7 +63,7 @@ Using AI tools (coding agents, bug-fix bots and the like) is fine, and [AGENTS.m
 
 ## Reporting a wrong result
 
-Found a package that wheelgap misjudges? Open a [bug report](https://github.com/wheelgap/wheelgap/issues/new?template=bug_report.yml) with the output of the same command plus `--explain`. It lists the wheel filenames and why each was rejected, which is everything needed to write a test, so you don't have to share your lockfile.
+Found a package that wheelgap misjudges? Open a [bug report](https://github.com/wheelgap/wheelgap/issues/new?template=bug_report.yml) with the output of the same command plus `--explain`. It lists the wheel filenames and why each was rejected, which is everything needed to write a test, so you don't have to share your lockfile. If you checked the package with `pip download --only-binary=:all: --platform …`, paste that too: it settles who's right.
 
 ## Questions
 

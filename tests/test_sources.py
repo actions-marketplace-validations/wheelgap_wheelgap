@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from wheelgap import pypi
 from wheelgap.check import Status, check
 from wheelgap.sources import (
     Source,
@@ -113,6 +114,69 @@ def test_requirements(fixtures):
     assert pkgs["purewheel"].version == "3.1"  # pulled in via -r
     assert pkgs["./localpkg"].skip == "editable"
     assert len(src.packages) == 5
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["-c constraints.txt", "-cconstraints.txt", "--constraint constraints.txt", "--constraint=constraints.txt"],
+)
+def test_requirements_constraints_pin_without_adding_packages(tmp_path, option):
+    path = tmp_path / "requirements.txt"
+    path.write_text("ranged\n" + option + "\n", encoding="utf-8")
+    (tmp_path / "constraints.txt").write_text("ranged==1.9\nonly-constraint==2\n", encoding="utf-8")
+    packages = parse_requirements(path).packages
+    assert [(p.name, p.version, p.spec) for p in packages] == [("ranged", "1.9", None)]
+
+
+def test_requirements_nested_constraints_combine_ranges_and_keep_pins(tmp_path):
+    directory = tmp_path / "sub"
+    directory.mkdir()
+    path = tmp_path / "requirements.txt"
+    path.write_text("-r sub/more.txt\n-c sub/constraints.txt\n", encoding="utf-8")
+    (directory / "more.txt").write_text("ranged>=1.5\npinned==3\n", encoding="utf-8")
+    (directory / "constraints.txt").write_text("-c nested.txt\npinned==1\n", encoding="utf-8")
+    (directory / "nested.txt").write_text(
+        "ranged<2 \\\n    --hash=sha256:00  # note\n-c constraints.txt\n", encoding="utf-8"
+    )
+    ranged, pinned = parse_requirements(path).packages
+    assert ranged.spec == "<2,>=1.5"
+    assert ranged.version is None
+    assert pinned.version == "3"
+
+
+def test_requirements_marker_constraint_is_an_error(tmp_path):
+    path = tmp_path / "requirements.txt"
+    path.write_text("ranged\n-c constraints.txt\n", encoding="utf-8")
+    (tmp_path / "constraints.txt").write_text('ranged<2; sys_platform == "win32"\n', encoding="utf-8")
+    (pkg,) = parse_requirements(path).packages
+    assert pkg.error is not None and "marker" in pkg.error
+
+
+def test_requirements_url_and_env_var_constraints_are_skipped(tmp_path):
+    path = tmp_path / "requirements.txt"
+    path.write_text(
+        "ranged\n-c https://example.com/upper.txt\n--constraint=${PIP_CONSTRAINT}\n-c c-${PY}.txt\n", encoding="utf-8"
+    )
+    assert [(p.name, p.version, p.spec, p.error) for p in parse_requirements(path).packages] == [
+        ("ranged", None, None, None)
+    ]
+
+
+@pytest.mark.parametrize(
+    "lines,version,error",
+    [
+        ("ranged==1.9\nranged==1.9.0\n", "1.9", None),  # the same version, written two ways
+        ("ranged==1.9\nranged==2.0\n", None, "conflicting exact versions"),
+        ("ranged @ https://example.com/ranged-1.9.tar.gz\n", None, "isn't an index version"),
+    ],
+)
+def test_requirements_constraint_pins_and_unusable_constraints(tmp_path, lines, version, error):
+    path = tmp_path / "requirements.txt"
+    path.write_text("ranged\n-c constraints.txt\n", encoding="utf-8")
+    (tmp_path / "constraints.txt").write_text(lines, encoding="utf-8")
+    (pkg,) = parse_requirements(path).packages
+    assert pkg.version == version
+    assert (pkg.error is None) if error is None else (error in pkg.error)
 
 
 @pytest.mark.parametrize("input_name", ["pipenvproj", "pipenvproj/Pipfile.lock"])
@@ -290,24 +354,55 @@ def _two_source_pipfile_lock(tmp_path):
     return path
 
 
-def test_pipfile_lock_private_index_is_skipped(tmp_path):
+def test_pipfile_lock_private_index_is_skipped(tmp_path, fake_pypi):
     (src,) = load_inputs([str(_two_source_pipfile_lock(tmp_path))])
+    # Parsing records the index; fill_all decides whether it may be looked up (see test_may_look_up).
+    assert [(p.name, p.skip, p.registry) for p in src.packages] == [
+        ("acme-utils", None, "https://pkgs.example.com/simple"),
+        ("requests", None, None),
+        ("six", None, None),  # pypi.python.org is PyPI too
+        ("fastlib", None, None),
+        ("ghost", "private index", None),  # an index the lock doesn't describe: can't tell it's PyPI
+        ("oddball", None, "https://[bad/simple"),
+    ]
+    pypi.fill_all(src.packages)
     assert [(p.name, p.skip) for p in src.packages] == [
         ("acme-utils", "private index"),
         ("requests", None),
         ("six", None),
         ("fastlib", None),
-        ("ghost", "private index"),  # an index the lock doesn't describe: can't tell it's PyPI
-        ("oddball", "private index"),  # a URL urlparse rejects: skipped, not a crash
+        ("ghost", "private index"),
+        ("oddball", "private index"),  # a URL urlsplit rejects: skipped, not a crash
     ]
+    assert not [url for url in fake_pypi if "acme" in url or "ghost" in url or "oddball" in url], fake_pypi
 
 
-def test_pipfile_lock_private_index_in_one_category_skips_the_package(tmp_path):
+def test_pipfile_lock_private_index_in_one_category_skips_the_package(tmp_path, fake_pypi):
     # Pipenv writes "index" on direct dependencies: the same package can be direct in develop, transitive in default.
     path = tmp_path / "Pipfile.lock"
     lock = {
         "_meta": {"sources": [{"name": "internal", "url": "https://pkgs.example.com/simple"}]},
         "default": {"acme-utils": {"version": "==2.1.0"}},
+        "develop": {"acme-utils": {"version": "==2.1.0", "index": "internal"}},
+    }
+    path.write_text(json.dumps(lock), encoding="utf-8")
+    (src,) = load_inputs([str(path)])
+    assert [(p.name, p.registry) for p in src.packages] == [("acme-utils", "https://pkgs.example.com/simple")]
+    pypi.fill_all(src.packages)
+    assert [(p.name, p.skip) for p in src.packages] == [("acme-utils", "private index")]
+    assert fake_pypi == []
+
+
+def test_pipfile_lock_package_pinned_to_two_indexes_is_skipped(tmp_path):
+    path = tmp_path / "Pipfile.lock"
+    lock = {
+        "_meta": {
+            "sources": [
+                {"name": "mirror", "url": "https://mirror.example.com/simple"},
+                {"name": "internal", "url": "https://pkgs.example.com/simple"},
+            ]
+        },
+        "default": {"acme-utils": {"version": "==2.1.0", "index": "mirror"}},
         "develop": {"acme-utils": {"version": "==2.1.0", "index": "internal"}},
     }
     path.write_text(json.dumps(lock), encoding="utf-8")

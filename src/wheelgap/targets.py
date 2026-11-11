@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -203,10 +204,45 @@ def _norm(name: str) -> str:
 _LOOKUP = {_norm(k): k for k in PLATFORMS} | {_norm(k): v for k, v in ALIASES.items()}
 
 
+def _words(name: str) -> list[str]:
+    return name.replace("x86-64", "x86_64").split("-")  # _norm turns x86_64 into x86-64; keep it one word
+
+
+# Words that already name an OS or arch. A typo of one is worth a suggestion, but one of these in place of another
+# (macos-amd64, osx-arm64, linux-ppc64be, linux-armv8) is a different platform, and suggesting ours would be a wrong
+# answer.
+_REAL_WORDS = frozenset(word for key in _LOOKUP for word in _words(key)) | {
+    *("osx", "darwin", "macosx", "x86", "x64", "amd", "arm", "i386", "i586", "i686", "386", "mips64", "loong64"),
+    *("armv5", "armv6", "armv6l", "armv8", "armv8l", "arm32", "aarch32", "armel", "ppc64", "ppc64be", "riscv32"),
+    *("arm64ec", "arm64e"),
+}
+
+
+def _suggest(name: str) -> str | None:
+    """The platform an unknown name is a typo of, or None when it's unclear or names something else."""
+    if "/" in name:  # a Docker platform: glibc or musl depends on the image, so don't guess
+        return None
+    norm = _norm(name)
+    flat = norm.replace("-", "")
+    for key, platform in _LOOKUP.items():  # only the hyphens differ: linuxaarch64, linux-aarch-64
+        if key.replace("-", "") == flat:
+            return platform
+    for key in difflib.get_close_matches(norm, list(_LOOKUP), n=3, cutoff=0.8):
+        words, key_words = _words(norm), _words(key)
+        if len(words) == len(key_words) and all(
+            a == b or (a not in _REAL_WORDS and difflib.SequenceMatcher(None, a, b).ratio() >= 0.7)
+            for a, b in zip(words, key_words, strict=True)
+        ):
+            return _LOOKUP[key]
+    return None
+
+
 def resolve_platform(name: str) -> str:
     try:
         return _LOOKUP[_norm(name)]
     except KeyError:
+        if suggestion := _suggest(name):
+            raise TargetError(f"unknown target {name!r}; did you mean {suggestion!r}?") from None
         known = ", ".join(PLATFORMS)
         raise TargetError(f"unknown target {name!r} (known: {known})") from None
 
@@ -370,17 +406,10 @@ def single_python(targets: Iterable[Target]) -> str | None:
     return None
 
 
-def build_targets(
-    pythons: list[str],
-    platforms: list[str],
-    glibc: str = DEFAULT_GLIBC,
-    musl: str = DEFAULT_MUSL,
-    macos: str = DEFAULT_MACOS,
-    ios: str = DEFAULT_IOS,
-    android_api: str | int = DEFAULT_ANDROID_API,
-) -> list[Target]:
+def resolve_platforms(items: Iterable[str]) -> list[str]:
+    """Platform names for -t values: comma-separated names, aliases, Docker platforms, all, everything and mobile."""
     plats: list[str] = []
-    for item in platforms:
+    for item in items:
         for name in item.split(","):
             if not name.strip():
                 continue
@@ -392,7 +421,19 @@ def build_targets(
                 plats.extend(MOBILE_PLATFORMS)
             else:
                 plats.append(resolve_platform(name))
-    plats = list(dict.fromkeys(plats)) or list(DEFAULT_PLATFORMS)
+    return list(dict.fromkeys(plats))
+
+
+def build_targets(
+    pythons: list[str],
+    platforms: list[str],
+    glibc: str = DEFAULT_GLIBC,
+    musl: str = DEFAULT_MUSL,
+    macos: str = DEFAULT_MACOS,
+    ios: str = DEFAULT_IOS,
+    android_api: str | int = DEFAULT_ANDROID_API,
+) -> list[Target]:
+    plats = resolve_platforms(platforms) or list(DEFAULT_PLATFORMS)
 
     pys = list(dict.fromkeys(parse_python(p) for item in pythons for p in item.split(",") if p.strip()))
     versions = dict(

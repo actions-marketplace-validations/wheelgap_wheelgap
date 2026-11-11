@@ -32,6 +32,17 @@ class Status(StrEnum):
     BUNDLED = "bundled"  # no wheel on the index, but Pyodide ships its own build (--pyodide-lock)
 
 
+# How each status is shown in text output, and its colour.
+CELL = {
+    Status.WHEEL: ("✓", "green"),
+    Status.SOURCE: ("● source", "yellow"),
+    Status.MISSING: ("✗ missing", "red"),
+    Status.UNKNOWN: ("? unknown", "dim"),
+    Status.NOT_NEEDED: ("–", "dim"),
+    Status.BUNDLED: ("✓ bundled", "green"),
+}
+
+
 # The archive formats pip accepts as source distributions.
 SDIST_SUFFIXES = (
     ".tar.gz",
@@ -54,15 +65,22 @@ class Row:
     results: dict[Target, Status] = field(default_factory=dict)
     # uv.lock only: the shortest dependency path that installs this package on each target.
     via: dict[Target, list[str]] = field(default_factory=dict)
+    # --ignore NAME:TARGET: targets whose result is still reported but doesn't count as a gap.
+    ignored: frozenset[Target] = frozenset()
+
+    @property
+    def counted(self) -> list[Status]:
+        """The results that decide whether this package has a gap: every target's except the ignored ones."""
+        return [s for t, s in self.results.items() if t not in self.ignored]
 
     @property
     def ok(self) -> bool:
-        return all(s in (Status.WHEEL, Status.NOT_NEEDED, Status.BUNDLED) for s in self.results.values())
+        return all(s in (Status.WHEEL, Status.NOT_NEEDED, Status.BUNDLED) for s in self.counted)
 
     @property
     def fails_install(self) -> bool:
         """True if some target can't install this package at all, or it couldn't be checked."""
-        return any(s in (Status.MISSING, Status.UNKNOWN) for s in self.results.values())
+        return any(s in (Status.MISSING, Status.UNKNOWN) for s in self.counted)
 
     @property
     def needed(self) -> bool:

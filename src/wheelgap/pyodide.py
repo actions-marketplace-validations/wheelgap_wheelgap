@@ -6,12 +6,16 @@ import http.client
 import json
 import sys
 import urllib.error
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 
 from .check import Row, Status
+from .sources import Package
 from .targets import PLATFORMS, Target
 
 # Pyodide's ABI version for each Python (the `abi_version` in pyodide-lock.json).
@@ -107,15 +111,55 @@ def check_targets(lock: PyodideLock, targets: list[Target]) -> None:
         )
 
 
-def apply_bundled(rows: list[Row], targets: list[Target], lock: PyodideLock) -> None:
-    """Mark gaps on matching pyodide targets as BUNDLED when Pyodide ships the package itself.
+def check_locks(locks: Sequence[PyodideLock], targets: Sequence[Target]) -> None:
+    """Error unless each lock is for a different Python and some pyodide target uses it.
+
+    For the API and the scanner: a lock that applied to nothing would leave its packages as gaps without saying so,
+    and two locks for one Python would count packages that either release bundles.
+    """
+    seen: dict[tuple[int, int], str] = {}
+    for lock in locks:
+        py = f"{lock.python[0]}.{lock.python[1]}"
+        if lock.python in seen:
+            raise PyodideLockError(f"{seen[lock.python]} and {lock.source} are both for Python {py}; pass one")
+        seen[lock.python] = lock.source
+        if not any(lock.applies_to(t) for t in targets):
+            have = ", ".join(sorted({t.python for t in targets if PLATFORMS[t.platform][0] == "pyodide"})) or "none"
+            raise PyodideLockError(
+                f"{lock.source} is for Python {py} (Pyodide {lock.pyodide_version}), "
+                f"but no pyodide target uses Python {py} (pyodide targets: {have})"
+            )
+
+
+def bundles(lock: PyodideLock, key: str, target: Target, status: Status) -> bool:
+    """Whether a gap on this target counts as BUNDLED because Pyodide ships the package (canonical `key`) itself.
 
     Only SOURCE and MISSING become BUNDLED. UNKNOWN means the lookup failed (a typo'd pin, a network
     error), and that must stay a gap rather than pass because the name happens to be in the lock.
     """
+    return key in lock.packages and lock.applies_to(target) and status in (Status.SOURCE, Status.MISSING)
+
+
+def bundled_version_differs(pkg: Package, lock: PyodideLock) -> bool:
+    """Pyodide ships a version the input doesn't allow: micropip.install of that requirement would fail.
+
+    A pin is compared as a version (0.9 == 0.9.0), a range by whether it contains Pyodide's version, and a
+    requirement with neither (the index picked the newest release) never differs.
+    """
+    have = lock.packages[pkg.key]
+    if pkg.version_from_index:
+        return pkg.spec is not None and not SpecifierSet(pkg.spec).contains(have, prereleases=True)
+    if not pkg.version:
+        return False
+    try:
+        return Version(pkg.version) != Version(have)
+    except InvalidVersion:
+        return pkg.version != have
+
+
+def apply_bundled(rows: list[Row], targets: list[Target], lock: PyodideLock) -> None:
+    """Mark gaps on matching pyodide targets as BUNDLED when Pyodide ships the package itself."""
     for r in rows:
-        if r.package.key not in lock.packages:
-            continue
         for t in targets:
-            if lock.applies_to(t) and r.results[t] in (Status.SOURCE, Status.MISSING):
+            if bundles(lock, r.package.key, t, r.results[t]):
                 r.results[t] = Status.BUNDLED

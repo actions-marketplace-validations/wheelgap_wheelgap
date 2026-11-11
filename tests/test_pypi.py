@@ -304,6 +304,95 @@ def test_is_pypi(registry, expected):
     assert pypi.is_pypi(registry) is expected
 
 
+MIRROR = "https://mirror.example.com/simple"
+
+
+@pytest.mark.parametrize(
+    ("registry", "index", "simple_index", "expected"),
+    [
+        (None, None, None, True),
+        ("https://pypi.org/simple", "https://mirror.example.com/pypi", None, True),
+        (MIRROR, None, None, False),  # WHEELGAP_INDEX_URL unset: PyPI, as before
+        (MIRROR, "https://pypi.org/pypi", None, False),
+        (MIRROR, "https://mirror.example.com/pypi", None, True),
+        (MIRROR, "https://mirror.example.com/pypi/", None, True),
+        ("https://mirror.example.com/simple/", "https://mirror.example.com/pypi", None, True),
+        (MIRROR, "https://Mirror.Example.COM:443/pypi", None, True),  # hostnames ignore case; 443 is https's port
+        ("https://MIRROR.example.com:443/simple", "https://mirror.example.com/pypi", None, True),
+        ("https://user:tok@mirror.example.com/simple", "https://mirror.example.com/pypi", None, True),
+        ("https://${USER}:${PASS}@mirror.example.com/simple", "https://mirror.example.com/pypi", None, True),
+        (MIRROR, "https://mirror.example.com/pypi", "https://mirror.example.com/simple", False),  # --index-url
+        ("https://mirror.example.com:8443/simple", "https://mirror.example.com/pypi", None, False),
+        ("http://mirror.example.com/simple", "https://mirror.example.com/pypi", None, False),
+        ("https://mirror.example.com@evil.example/simple", "https://mirror.example.com/pypi", None, False),
+        ("https://mirror.example.com.evil.example/simple", "https://mirror.example.com/pypi", None, False),
+        ("https://pkgs.example.com/simple", "https://mirror.example.com/pypi", None, False),
+        ("https://mirror.example.com:99999/simple", "https://mirror.example.com/pypi", None, False),
+        ("https://[bad/simple", "https://mirror.example.com/pypi", None, False),
+        ("/simple", "https://mirror.example.com/pypi", None, False),
+        # One host, many repositories (Artifactory, Nexus): only the same repository matches.
+        (
+            "https://artifactory.example/api/pypi/pypi-remote/simple",
+            "https://artifactory.example/api/pypi/pypi-remote/pypi",
+            None,
+            True,
+        ),
+        (
+            "https://artifactory.example/api/pypi/internal/simple",
+            "https://artifactory.example/api/pypi/pypi-remote/pypi",
+            None,
+            False,
+        ),
+        ("https://mirror.example.com/Repo/simple", "https://mirror.example.com/repo/pypi", None, False),
+        ("https://devpi.example/root/pypi/+simple/", "https://devpi.example/root/pypi/pypi", None, False),
+        # WHEELGAP_INDEX_URL unset: only is_pypi()'s exact URL, as before, not every way of writing pypi.org.
+        ("https://PyPI.org/simple", None, None, False),
+        ("https://pypi.org:443/simple", None, None, False),
+        # Parsers disagree on these (pip may see host h where urlsplit sees mirror.example.com): no match.
+        ("https://h\\@mirror.example.com/simple", "https://mirror.example.com/pypi", None, False),
+        ("https://mirror.example.com\\simple", "https://mirror.example.com/pypi", None, False),
+        (MIRROR, "https://mirror.example.com\\pypi", None, False),
+        ("https://mirror.example.com/simple ", "https://mirror.example.com/pypi", None, False),
+        (" https://mirror.example.com/simple", "https://mirror.example.com/pypi", None, False),
+        ("https://mirror.exa\tmple.com/simple", "https://mirror.example.com/pypi", None, False),
+        ("https://mirror.example.com/sim\nple", "https://mirror.example.com/pypi", None, False),
+        ("https://mirror.example.com/simple\x00", "https://mirror.example.com/pypi", None, False),
+        ("https://mirror.example.com/simple\x7f", "https://mirror.example.com/pypi", None, False),
+        ("https://mirror.example.com/simple\u200b", "https://mirror.example.com/pypi", None, False),
+        (MIRROR, "https://mirror.example.com/py\rpi", None, False),
+        ("https://mirror.example.com:0/simple", "https://mirror.example.com/pypi", None, False),
+        (MIRROR, "https://mirror.example.com:0/pypi", None, False),
+        ("https://mirror.example.com/simple#top", "https://mirror.example.com/pypi", None, False),
+        (MIRROR, "https://mirror.example.com/pypi#top", None, False),
+        # Not plainly <repo>/simple and <repo>/pypi: no match.
+        ("https://mirror.example.com/", "https://mirror.example.com/pypi", None, False),
+        ("https://mirror.example.com/simple?x=1", "https://mirror.example.com/pypi", None, False),
+        (MIRROR, "https://mirror.example.com/json", None, False),
+        (MIRROR, "https://mirror.example.com", None, False),
+    ],
+)
+def test_may_look_up(monkeypatch, registry, index, simple_index, expected):
+    if index is not None:
+        monkeypatch.setenv("WHEELGAP_INDEX_URL", index)
+    assert pypi.may_look_up(registry, simple_index) is expected
+
+
+def test_fill_all_looks_up_a_mirror_package_on_wheelgap_index_url(monkeypatch, fake_pypi):
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://mirror.example.com/pypi")
+    pkg = Package(name="purewheel", version="3.1", files=None, registry=MIRROR)
+    assert pypi.fill_all([pkg]) == 0
+    assert pkg.skip is None and pkg.files == ["purewheel-3.1-py3-none-any.whl"]
+    assert fake_pypi == ["https://mirror.example.com/pypi/purewheel/3.1/json"]
+
+
+def test_online_keeps_a_mirror_package_s_locked_files(monkeypatch, fake_pypi):
+    # A lock that lists its files (uv.lock, poetry.lock) keeps them under --online, mirror or not: as before.
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://mirror.example.com/pypi")
+    pkg = Package(name="purewheel", version="3.1", files=["purewheel-3.1.tar.gz"], registry=MIRROR)
+    assert pypi.fill_all([pkg], refresh=True) == 1
+    assert pkg.files == ["purewheel-3.1.tar.gz"] and fake_pypi == []
+
+
 @pytest.mark.parametrize(
     ("package", "expected"),
     [

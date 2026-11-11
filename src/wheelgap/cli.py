@@ -5,20 +5,33 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import sys
+import sysconfig
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 
+import packaging
 from packaging.markers import InvalidMarker, Marker
 from packaging.utils import canonicalize_name
 
 from . import __version__
 from .api import running_python
-from .check import Row, Status, check, explain, has_sdist, marker_holds, reachable
+from .check import CELL, Row, Status, check, explain, has_sdist, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
-from .pyodide import PyodideLock, PyodideLockError, apply_bundled, check_targets, load_pyodide_lock
-from .pypi import check_index_url, fill_all, is_pypi, keeps_locked_files, recheck_lock, split_credentials
+from .junit import write_junit
+from .offline import require_offline, undo_offline
+from .pyodide import (
+    PyodideLock,
+    PyodideLockError,
+    apply_bundled,
+    bundled_version_differs,
+    check_targets,
+    load_pyodide_lock,
+)
+from .pypi import check_index_url, fill_all, keeps_locked_files, recheck_lock, split_credentials
 from .sources import (
     Package,
     Source,
@@ -53,6 +66,7 @@ from .targets import (
     parse_version_pair,
     resolve_distro,
     resolve_platform,
+    resolve_platforms,
     single_python,
 )
 
@@ -79,6 +93,16 @@ def musl_docker_names(item: str) -> str:
             name = resolved.replace("linux-", "musl-", 1) if resolved.startswith("linux-") else resolved
         out.append(name)
     return ",".join(out)
+
+
+def version_string() -> str:
+    """The --version line, including packaging and the running Python, for bug reports."""
+    gil_disabled = sysconfig.get_config_var("Py_GIL_DISABLED")
+    suffix = "t" if gil_disabled else ""
+    return (
+        f"wheelgap {__version__} (packaging {packaging.__version__}, "
+        f"{platform.python_implementation()} {platform.python_version()}{suffix})"
+    )
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -152,6 +176,11 @@ def make_parser() -> argparse.ArgumentParser:
         "--online", action="store_true", help="re-check lockfile packages against PyPI instead of trusting the lockfile"
     )
     p.add_argument("--offline", action="store_true", help="never contact an index; fail if an input needs one")
+    p.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="don't read or save the 24-hour cache of pinned package lookups",
+    )
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
     p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
     p.add_argument(
@@ -168,11 +197,17 @@ def make_parser() -> argparse.ArgumentParser:
         help="print a Markdown report (e.g. for $GITHUB_STEP_SUMMARY) instead of a table",
     )
     p.add_argument(
+        "--junit",
+        metavar="PATH",
+        help="also write a JUnit XML report to PATH, alongside the usual output",
+    )
+    p.add_argument(
         "--ignore",
         action="append",
         default=[],
-        metavar="NAME",
-        help="ignore known package gaps (repeatable, comma-separated); list ignored names in the report",
+        metavar="NAME[:TARGET]",
+        help="ignore known package gaps (repeatable, comma-separated), on every target or only on TARGET "
+        "(e.g. psycopg2:musl-x86_64); list ignored names in the report",
     )
     p.add_argument("--exit-zero", action="store_true", help="exit 0 even when gaps are found")
     p.add_argument(
@@ -189,7 +224,7 @@ def make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     p.add_argument("--list-targets", action="store_true", help="list platforms, aliases and compatibility limits")
-    p.add_argument("-V", "--version", action="version", version=f"wheelgap {__version__}")
+    p.add_argument("-V", "--version", action="version", version=version_string())
     return p
 
 
@@ -264,9 +299,9 @@ def load_config(path: Path) -> dict:
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be {example}")
             if key == "fail-on" and value not in FAIL_ON:
                 raise SourceError(f"{path}: [tool.wheelgap] fail-on must be one of: {', '.join(FAIL_ON)}")
-        elif key == "quiet":
+        elif key in ("quiet", "offline"):
             if not isinstance(value, bool):
-                raise SourceError(f"{path}: [tool.wheelgap] quiet must be a boolean")
+                raise SourceError(f"{path}: [tool.wheelgap] {key} must be a boolean")
         else:
             raise SourceError(f"{path}: unknown key in [tool.wheelgap]: {key}")
         config[key] = value
@@ -337,14 +372,36 @@ def use_color(mode: str) -> bool:
     return sys.stdout.isatty()
 
 
-CELL = {
-    Status.WHEEL: ("✓", "green"),
-    Status.SOURCE: ("● source", "yellow"),
-    Status.MISSING: ("✗ missing", "red"),
-    Status.UNKNOWN: ("? unknown", "dim"),
-    Status.NOT_NEEDED: ("–", "dim"),
-    Status.BUNDLED: ("✓ bundled", "green"),
-}
+def ignored_gaps(row: Row) -> list[Target]:
+    """Targets where this package has a gap that `--ignore NAME:TARGET` accepts."""
+    return [t for t in row.ignored if row.results[t] in (Status.SOURCE, Status.MISSING, Status.UNKNOWN)]
+
+
+def cell(row: Row, target: Target) -> tuple[str, str]:
+    """A table cell's text and color; a gap on a target `--ignore NAME:TARGET` ignores says so."""
+    text, color = CELL[row.results[target]]
+    if target in ignored_gaps(row):
+        return f"{text} (ignored)", "dim"
+    return text, color
+
+
+def apart_from_ignored(rows: list[Row]) -> str:
+    """', apart from 2 ignored gaps' for a clean run that only passes because of --ignore NAME:TARGET."""
+    n = sum(len(ignored_gaps(r)) for r in rows)
+    return f", apart from {n} ignored gap{'s' * (n != 1)}" if n else ""
+
+
+def hidden_line(hidden: list[Row]) -> str:
+    """'3 packages with wheels for every target hidden', not counting those with only ignored gaps as such."""
+    only_ignored = sum(1 for r in hidden if ignored_gaps(r))
+    wheels = len(hidden) - only_ignored
+    parts = []
+    if wheels:
+        parts.append(f"{wheels} package{'s' * (wheels != 1)} with wheels for every target")
+    if only_ignored:
+        noun = "" if wheels else f" package{'s' * (only_ignored != 1)}"
+        parts.append(f"{only_ignored}{noun} with only ignored gaps")
+    return " and ".join(parts) + " hidden"
 
 
 def render_table(rows: list[Row], targets: list[Target], style: Style) -> list[str]:
@@ -353,7 +410,7 @@ def render_table(rows: list[Row], targets: list[Target], style: Style) -> list[s
     body = []
     for r in rows:
         cells = [r.package.name, r.package.version or "?"]
-        cells += [CELL[r.results[t]][0] for t in targets]
+        cells += [cell(r, t)[0] for t in targets]
         body.append(cells)
     widths = [max(len(h), *(len(c[i]) for c in body)) for i, h in enumerate(headers)]
 
@@ -368,7 +425,7 @@ def render_table(rows: list[Row], targets: list[Target], style: Style) -> list[s
 
     out = [style.bold(line(headers))]
     for r, cells in zip(rows, body, strict=True):
-        colors = ["", "dim"] + [CELL[r.results[t]][1] for t in targets]
+        colors = ["", "dim"] + [cell(r, t)[1] for t in targets]
         out.append(line(cells, colors))
     return out
 
@@ -377,7 +434,7 @@ EXPLAIN_LIMIT = 8
 
 
 def gap_targets(row: Row, targets: list[Target]) -> list[Target]:
-    return [t for t in targets if row.results[t] in (Status.SOURCE, Status.MISSING)]
+    return [t for t in targets if row.results[t] in (Status.SOURCE, Status.MISSING) and t not in row.ignored]
 
 
 def render_explain(rows: list[Row], targets: list[Target], style: Style) -> list[str]:
@@ -408,9 +465,12 @@ def render_explain(rows: list[Row], targets: list[Target], style: Style) -> list
 
 def bundled_line(rows: list[Row], lock: PyodideLock) -> str:
     def one(r: Row) -> str:
-        have = lock.packages[r.package.key]
-        pinned = r.package.version
-        return f"{r.package.name} {have}" + (f" (you pinned {pinned})" if pinned and pinned != have else "")
+        have, pkg = lock.packages[r.package.key], r.package
+        if not bundled_version_differs(r.package, lock):
+            return f"{pkg.name} {have}"
+        return f"{pkg.name} {have} " + (
+            f"(outside {pkg.spec})" if pkg.version_from_index else f"(you pinned {pkg.version})"
+        )
 
     noun = "package comes" if len(rows) == 1 else "packages come"
     return f"{len(rows)} {noun} from Pyodide {lock.pyodide_version}'s own builds: " + ", ".join(map(one, rows))
@@ -421,7 +481,7 @@ def report_json(
     targets: list[Target],
     sources: list[str],
     skipped: list,
-    ignored: list[str],
+    ignored: list[tuple[str, list[str] | None]],
     explained: bool,
     pyodide_lock: PyodideLock | None = None,
 ) -> str:
@@ -437,6 +497,7 @@ def report_json(
         }
         if pyodide_lock and Status.BUNDLED in r.results.values():
             out["bundled"] = pyodide_lock.packages[r.package.key]
+            out["bundled_version_differs"] = bundled_version_differs(r.package, pyodide_lock)
         if explained:
             out["rejected"] = {
                 t.label(multi_py): [{"file": f, "reason": why} for f, why in explain(r.package.files or [], t)]
@@ -453,8 +514,11 @@ def report_json(
             "targets": [{"label": t.label(multi_py), "python": t.python, "platform": t.platform} for t in targets],
             "packages": [package(r) for r in rows],
             "skipped": [{"name": p.name, "reason": p.skip} for p in skipped],
-            "ignored": ignored,
-            "summary": {"packages": len(rows), "with_gaps": len(gaps)},
+            "ignored": [name for name, platforms in ignored if platforms is None],
+            "ignored_targets": [
+                {"name": name, "platforms": platforms} for name, platforms in ignored if platforms is not None
+            ],
+            "summary": {"packages": len(rows), "with_gaps": len(gaps), "per_target": target_counts(gaps, targets)},
         },
         indent=2,
     )
@@ -534,7 +598,7 @@ def print_target_list(args: argparse.Namespace, config: dict) -> None:
 def worst_status(row: Row) -> Status:
     """The status that best describes a gap package: can't install, then unknown, then from source."""
     for s in (Status.MISSING, Status.UNKNOWN, Status.SOURCE):
-        if s in row.results.values():
+        if s in row.counted:
             return s
     return Status.WHEEL
 
@@ -555,26 +619,43 @@ def gap_summary(gaps: list[Row], total: int, style: Style) -> str:
     return f"{style.bold(f'{len(gaps)} of {total} {noun}')} {verb} gaps: " + ", ".join(parts) + "."
 
 
-def target_lines(gaps: list[Row], targets: list[Target], style: Style) -> list[str]:
-    if len(targets) < 2:
-        return []
+def target_counts(gaps: list[Row], targets: list[Target]) -> dict[str, dict[str, int]]:
+    """Gap counts for every target (zeros included), keyed by target label. This is --json's summary.per_target.
 
+    Text and --markdown show a subset of it (shown_target_counts), so the three formats can't disagree.
+    """
     multi_py = len({target.python for target in targets}) > 1
-    lines = []
+    out = {}
     for target in targets:
-        statuses = [row.results[target] for row in gaps]
-        parts = []
-        if source := statuses.count(Status.SOURCE):
-            parts.append(style.yellow(f"{source} from source"))
-        if missing := statuses.count(Status.MISSING):
-            parts.append(style.red(f"{missing} missing"))
-        if unknown := statuses.count(Status.UNKNOWN):
-            parts.append(style.dim(f"{unknown} unknown"))
-        if parts:
-            lines.append((target.label(multi_py), ", ".join(parts)))
+        statuses = [row.results[target] for row in gaps if target not in row.ignored]
+        out[target.label(multi_py)] = {
+            s.value: statuses.count(s) for s in (Status.SOURCE, Status.MISSING, Status.UNKNOWN)
+        }
+    return out
 
-    width = max((len(label) for label, _ in lines), default=0)
-    return [f"{label:<{width}}  {counts}" for label, counts in lines]
+
+def shown_target_counts(gaps: list[Row], targets: list[Target]) -> dict[str, dict[str, int]]:
+    """The targets the text and Markdown summaries list: those with gaps, and none for a single target."""
+    if len(targets) < 2:
+        return {}
+    return {label: counts for label, counts in target_counts(gaps, targets).items() if any(counts.values())}
+
+
+def target_counts_text(counts: dict[str, int], style: Style) -> str:
+    parts = []
+    if source := counts["source"]:
+        parts.append(style.yellow(f"{source} from source"))
+    if missing := counts["missing"]:
+        parts.append(style.red(f"{missing} missing"))
+    if unknown := counts["unknown"]:
+        parts.append(style.dim(f"{unknown} unknown"))
+    return ", ".join(parts)
+
+
+def target_lines(gaps: list[Row], targets: list[Target], style: Style) -> list[str]:
+    per_target = shown_target_counts(gaps, targets)
+    width = max(map(len, per_target), default=0)
+    return [f"{label:<{width}}  {target_counts_text(counts, style)}" for label, counts in per_target.items()]
 
 
 _MD_SPECIAL = re.compile(r"([\\`*_\[\]<>#|~&])")
@@ -599,7 +680,7 @@ def render_markdown(
     targets: list[Target],
     source_labels: list[str],
     skipped: list[Package],
-    ignored: list[str],
+    ignored: list[tuple[str, list[str] | None]],
     args: argparse.Namespace,
     pyodide_lock: PyodideLock | None,
     source_allowed: bool = False,
@@ -613,7 +694,8 @@ def render_markdown(
         out = [f"### wheelgap: {len(gaps)} of {len(rows)} {noun} {'has' if len(gaps) == 1 else 'have'} gaps", ""]
     else:
         out = [
-            f"### wheelgap: every package has a wheel for {'all ' if n_t > 1 else ''}{n_t} target{'s' * (n_t > 1)}",
+            f"### wheelgap: every package has a wheel for {'all ' if n_t > 1 else ''}{n_t} target{'s' * (n_t > 1)}"
+            + apart_from_ignored(rows),
             "",
         ]
     pys = ", ".join(dict.fromkeys(t.python for t in targets))
@@ -627,15 +709,18 @@ def render_markdown(
         out.append("| " + " | ".join(_md(h) for h in headers) + " |")
         out.append("| " + " | ".join("---" for _ in headers) + " |")
         for r in shown:
-            cells = [r.package.name, r.package.version or "?"] + [CELL[r.results[t]][0] for t in targets]
+            cells = [r.package.name, r.package.version or "?"] + [cell(r, t)[0] for t in targets]
             out.append("| " + " | ".join(_md(c) for c in cells) + " |")
         out.append("")
-        hidden = len(rows) - len(shown)
+        hidden = [] if args.all else [r for r in rows if r.ok]
         if hidden:
-            noun = "package" if hidden == 1 else "packages"
-            out += [f"{hidden} {noun} with wheels for every target hidden (`--all` to show).", ""]
+            out += [f"{hidden_line(hidden)} (`--all` to show).", ""]
 
     if gaps:
+        per_target = shown_target_counts(gaps, targets)
+        if per_target:
+            out += [f"- {_md(label)}: {target_counts_text(counts, plain)}" for label, counts in per_target.items()]
+            out.append("")
         out += [gap_summary(gaps, len(rows), plain), ""]
         if source_allowed:
             out += ["Source builds are allowed (fail-on missing), so this run passes.", ""]
@@ -646,7 +731,7 @@ def render_markdown(
         names = ", ".join(f"{_code(p.name)} ({p.skip})" for p in skipped)
         out += [f"Skipped {len(skipped)} non-index package{'s' * (len(skipped) != 1)}: {names}", ""]
     if ignored:
-        out += [f"Ignored: {', '.join(map(_code, ignored))}", ""]
+        out += [f"Ignored: {ignored_list(ignored, _code)}", ""]
     for r in rows:
         if r.package.error:
             out += [f"Could not check {_md(r.package.name)}: {_code(r.package.error)}", ""]
@@ -654,6 +739,55 @@ def render_markdown(
         # Fenced, so wheel filenames and reasons need no escaping.
         lines = render_explain(gaps, targets, plain)
         out += ["<details><summary>Why (rejected wheels)</summary>", "", "```", *lines, "```", "", "</details>", ""]
+    return out
+
+
+def ignored_list(ignored: list[tuple[str, list[str] | None]], name: Callable[[str], str] = str) -> str:
+    """psycopg2, numpy (musl-x86_64): ignored packages, with the platforms of those ignored on some targets only."""
+    return ", ".join(name(n) + (f" ({', '.join(platforms)})" if platforms else "") for n, platforms in ignored)
+
+
+def split_ignore(item: str, how: str, docker_musl: bool) -> tuple[str, list[str] | None]:
+    """An --ignore NAME or NAME:TARGET: the name, and the platforms TARGET names (None: every target).
+
+    TARGET takes what -t does, resolved the same way: with an Alpine --dockerfile, linux/arm64 means musl.
+    """
+    name, colon, target = (part.strip() for part in item.partition(":"))
+    if not colon:
+        return name, None
+    if not name or not target:
+        raise TargetError(f"{how} {item!r}: expected NAME or NAME:TARGET")
+    try:
+        return name, resolve_platforms([musl_docker_names(target) if docker_musl else target])
+    except TargetError as e:
+        raise TargetError(f"{how} {item!r}: {e}") from None
+
+
+def split_ignore_value(value: str, how: str, docker_musl: bool) -> list[tuple[str, str, list[str] | None]]:
+    """The comma-separated entries of one --ignore value, as (entry, name, platforms).
+
+    The value is split on commas first, so `psycopg2:linux,musl` would ignore a package named musl everywhere. A
+    plain entry after a NAME:TARGET one that names a target is far more likely a second target, so it's an error.
+    """
+    out: list[tuple[str, str, list[str] | None]] = []
+    after_target = None
+    for entry in (part.strip() for part in value.split(",")):
+        if not entry:
+            continue
+        name, platforms = split_ignore(entry, how, docker_musl)
+        if platforms is not None:
+            after_target = name
+        elif after_target is not None:
+            try:
+                resolve_platforms([musl_docker_names(entry) if docker_musl else entry])
+            except TargetError:
+                pass  # a package name
+            else:
+                raise TargetError(
+                    f"{how} {value!r}: {entry!r} is a target, but each NAME:TARGET takes one target; "
+                    f"write {after_target}:{entry} (a package named {entry} goes in its own {how} value)"
+                )
+        out.append((entry, name, platforms))
     return out
 
 
@@ -670,27 +804,39 @@ def selected_packages(source: Source, targets: list[Target]) -> list[Package]:
     return [package for index, package in enumerate(source.packages) if index in selected]
 
 
-def require_offline(sources: list[Source]) -> None:
-    """--offline: raise SourceError if an input has packages that can only be answered by looking them up."""
-    problems = []
-    for s in sources:
-        # A private-index package with no files is skipped by fill_all, not looked up, so it doesn't count.
-        need = [p.name for p in s.packages if not p.skip and p.files is None and is_pypi(p.registry)]
-        if need:
-            names = ", ".join(need[:3]) + (", …" if len(need) > 3 else "")
-            problems.append(
-                f"{s.label} needs the index for {len(need)} package{'s' if len(need) != 1 else ''} ({names})"
-            )
-    if problems:
-        raise SourceError(
-            f"--offline: {'; '.join(problems)}; use a lockfile that lists each package's files, or drop --offline"
-        )
-
-
-def refuse_pyodide_url(spec: str) -> None:
+def refuse_pyodide_url(spec: str, how: str = "--offline") -> None:
     """--offline: a pyodide-lock.json URL would be downloaded, so ask for a local copy instead."""
     if "://" in spec:
-        raise PyodideLockError(f"--offline: {spec} would be downloaded; save it and pass its path, or drop --offline")
+        raise PyodideLockError(f"{how}: {spec} would be downloaded; save it and pass its path, or {undo_offline(how)}")
+
+
+def unpinned_requirement_names(source: Source) -> list[str]:
+    """Index requirements that aren't an exact pin, once each. Skipped and non-index lines are omitted, and so are
+    packages with an error (an unusable constraint), since nothing was checked for them."""
+    names: dict[str, str] = {}
+    for package in source.packages:
+        if package.skip or package.error:
+            continue
+        if package.version is None or package.spec:
+            names.setdefault(package.key, package.name)
+    return list(names.values())
+
+
+def note_unpinned_requirements(sources: list[Source]) -> None:
+    for source in sources:
+        if not source.requirements:
+            continue
+        names = unpinned_requirement_names(source)
+        if not names:
+            continue
+        noun = "package" if len(names) == 1 else "packages"
+        listed = ", ".join(names[:2]) + (", …" if len(names) > 2 else "")
+        print(
+            f"wheelgap: note: {source.label} has {len(names)} unpinned {noun} ({listed}), "
+            "so the newest matching release was checked; pin them (uv pip compile, pip-compile) "
+            "to check what you install",
+            file=sys.stderr,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -721,13 +867,18 @@ def main(argv: list[str] | None = None) -> int:
         pyproject = find_pyproject(args.inputs)
         config = load_config(pyproject) if pyproject else {}
         quiet = args.quiet if args.quiet is not None else config.get("quiet", False)
+        # offline = true is a project default, so --online on the command line wins over it.
+        offline = args.offline or (config.get("offline", False) and not args.online)
+        offline_how = "--offline" if args.offline else "offline = true in [tool.wheelgap]"
         # Quiet only changes the text output, so it can't clash with --explain when printing JSON or Markdown.
         if quiet and args.explain and not (args.json or args.markdown):
             parser.error("--explain cannot be used with quiet mode (--quiet or quiet = true; --no-quiet turns it off)")
+        docker_musl = False
         if args.dockerfile:
             # The image beats pyproject.toml; flags still win.
             image = read_dockerfile(Path(args.dockerfile))
-            if image.platform.startswith("musl-") and args.target:
+            docker_musl = image.platform.startswith("musl-")
+            if docker_musl and args.target:
                 args.target = [musl_docker_names(item) for item in args.target]
             config.update(python=[image.python], targets=[image.platform])
             config.update({k: v for k, v in (("glibc", image.glibc), ("musl", image.musl)) if v})
@@ -754,6 +905,12 @@ def main(argv: list[str] | None = None) -> int:
             args.ios or config.get("ios", DEFAULT_IOS),
             args.android_api or config.get("android-api", DEFAULT_ANDROID_API),
         )
+        ignore_how = "--ignore" if args.ignore else "ignore in [tool.wheelgap]"
+        ignores = [
+            entry
+            for value in args.ignore or config.get("ignore", [])
+            for entry in split_ignore_value(value, ignore_how, docker_musl)
+        ]
         index_url = args.index_url if args.index_url is not None else config.get("index-url")
         if index_url is not None:
             _, auth = split_credentials(index_url)
@@ -788,13 +945,13 @@ def main(argv: list[str] | None = None) -> int:
                 # Configured extras/groups apply to uv.lock inputs only; on the command line they need one.
                 strict=bool(from_cli or args.only_group),
             )
-        if args.offline:
-            require_offline(sources)
+        if offline:
+            require_offline(sources, offline_how, simple_index=index_url)
         fail_on = args.fail_on or config.get("fail-on", "source")
         pyodide_lock = None
         if args.pyodide_lock:
-            if args.offline:
-                refuse_pyodide_url(args.pyodide_lock)
+            if offline:
+                refuse_pyodide_url(args.pyodide_lock, offline_how)
             pyodide_lock = load_pyodide_lock(args.pyodide_lock)
             check_targets(pyodide_lock, targets)  # asked for explicitly, so a mismatch is an error
         elif (lock_spec := config.get("pyodide-lock")) and any(PLATFORMS[t.platform][0] == "pyodide" for t in targets):
@@ -802,8 +959,8 @@ def main(argv: list[str] | None = None) -> int:
             # affects `wheelgap -t linux` in the same project. A relative path is relative to pyproject.toml.
             if pyproject and not lock_spec.lower().startswith(("http://", "https://")):
                 lock_spec = str(pyproject.parent / lock_spec)
-            if args.offline:
-                refuse_pyodide_url(lock_spec)
+            if offline:
+                refuse_pyodide_url(lock_spec, offline_how)
             pyodide_lock = load_pyodide_lock(lock_spec)
             check_targets(pyodide_lock, targets)  # pyodide targets but none for this lock's Python: say so
     except (TargetError, SourceError, DockerfileError, PyodideLockError, OSError) as e:
@@ -812,6 +969,9 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # malformed TOML and friends
         print(f"wheelgap: error: {type(e).__name__}: {e}", file=sys.stderr)
         return input_error_json(e) if args.json else 2
+
+    if not quiet:
+        note_unpinned_requirements(sources)
 
     needed_by_source = [selected_packages(source, targets) for source in sources]
     packages = [package for needed in needed_by_source for package in needed]
@@ -825,7 +985,11 @@ def main(argv: list[str] | None = None) -> int:
                     f"workspace members outside it aren't checked: {', '.join(unchecked)}",
                     file=sys.stderr,
                 )
-    other_index = fill_all(packages, refresh=args.online, python=single_python(targets), simple_index=index_url)
+    # --online asks the index again but saves the answer, so a plain run afterwards doesn't go back to an older one.
+    cached = {"read_cache": not (args.no_cache or args.online), "write_cache": not args.no_cache}
+    other_index = fill_all(
+        packages, refresh=args.online, python=single_python(targets), simple_index=index_url, **cached
+    )
     if args.online and other_index and not quiet:
         print(
             f"wheelgap: note: --online looks up PyPI packages only; kept the locked files of {other_index} "
@@ -834,11 +998,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     for s, needed in zip(sources, needed_by_source, strict=True):
         if outside := pythons_outside_lock(s, targets):
-            if args.offline:  # no re-check, so every locked package may lack wheels for those Pythons
+            if offline:  # no re-check, so every locked package may lack wheels for those Pythons
                 print(
                     f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it may be missing "
-                    f"wheels for Python {', '.join(outside)}; with --offline its packages weren't re-checked on the "
-                    "index, so they may show false gaps for those Pythons",
+                    f"wheels for Python {', '.join(outside)}; with {offline_how} its packages weren't re-checked "
+                    "on the index, so they may show false gaps for those Pythons",
                     file=sys.stderr,
                 )
                 continue
@@ -848,7 +1012,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not other:
                     continue
             else:
-                other, failed = recheck_lock(needed, simple_index=index_url)
+                other, failed = recheck_lock(needed, simple_index=index_url, **cached)
             note = (
                 f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it may be missing "
                 f"wheels for Python {', '.join(outside)}; looked its PyPI packages up on the index too"
@@ -864,23 +1028,54 @@ def main(argv: list[str] | None = None) -> int:
     if pyodide_lock:
         apply_bundled(rows, targets, pyodide_lock)
     rows.sort(key=lambda r: r.package.key)
-    ignore_names = args.ignore or config.get("ignore", [])
-    raw_ignore = [name.strip() for item in ignore_names for name in item.split(",") if name.strip()]
-    ignore = {canonicalize_name(name) for name in raw_ignore}
-    if raw_ignore and not quiet:
+    ignore = {canonicalize_name(name) for _, name, platforms in ignores if platforms is None}
+    checked = {t.platform for t in targets}
+    ignore_on: dict[str, set[str]] = {}  # NAME:TARGET, for packages not also ignored everywhere
+    for _, name, platforms in ignores:
+        if platforms is not None and canonicalize_name(name) not in ignore:
+            ignore_on.setdefault(canonicalize_name(name), set()).update(checked.intersection(platforms))
+    ignore_on = {key: platforms for key, platforms in ignore_on.items() if platforms}
+    if ignores and not quiet:
         known_keys = {p.key for s in sources for p in s.packages}  # every package read, selected or not
-        unmatched = list(dict.fromkeys(name for name in raw_ignore if canonicalize_name(name) not in known_keys))
+        unmatched = list(dict.fromkeys(item for item, name, _ in ignores if canonicalize_name(name) not in known_keys))
         if unmatched:
             print(f"wheelgap: note: --ignore matches no package: {', '.join(unmatched)}", file=sys.stderr)
+        # A real target that this run doesn't check (e.g. a config ignore for another image): harmless, but say so.
+        unchecked = list(
+            dict.fromkeys(
+                item
+                for item, name, platforms in ignores
+                if platforms is not None and canonicalize_name(name) in known_keys and checked.isdisjoint(platforms)
+            )
+        )
+        if unchecked:
+            print(f"wheelgap: note: --ignore matches no checked target: {', '.join(unchecked)}", file=sys.stderr)
     # One entry per package, named as its first input writes it (PyYAML, not pyyaml).
-    first_names = {r.package.key: r.package.name for r in reversed(rows) if r.package.key in ignore}
-    ignored = sorted(first_names.values(), key=str.lower)
+    first_names = {r.package.key: r.package.name for r in reversed(rows) if r.package.key in ignore | ignore_on.keys()}
+    plat_order = list(dict.fromkeys(t.platform for t in targets))
+    ignored = sorted(
+        (
+            (name, None if key in ignore else [p for p in plat_order if p in ignore_on[key]])
+            for key, name in first_names.items()
+        ),
+        key=lambda entry: entry[0].lower(),
+    )
     rows = [r for r in rows if r.package.key not in ignore]
+    for r in rows:
+        if r.package.key in ignore_on:
+            r.ignored = frozenset(t for t in targets if t.platform in ignore_on[r.package.key])
     gaps = [r for r in rows if not r.ok]
     source_labels = [s.label for s in sources]
     # With --fail-on missing, source builds are accepted; missing and unknown packages still fail.
     failing = gaps if fail_on == "source" else [r for r in gaps if r.fails_install]
     code = 0 if args.exit_zero or not failing else 1
+
+    if args.junit is not None:  # an empty PATH (an unset CI variable) is an error, not "no report"
+        try:
+            write_junit(args.junit, rows, targets, fail_on)
+        except OSError as e:
+            print(f"wheelgap: error: {e}", file=sys.stderr)
+            return input_error_json(e) if args.json else 2
 
     if args.json:
         print(report_json(rows, targets, source_labels, skipped, ignored, args.explain, pyodide_lock))
@@ -901,7 +1096,15 @@ def main(argv: list[str] | None = None) -> int:
             print(gap_summary(gaps, len(rows), style))
             print("gaps: " + ", ".join(r.package.name for r in gaps))
         if ignored:
-            print(style.dim("ignored: " + ", ".join(ignored)))
+            print(style.dim("ignored: " + ignored_list(ignored)))
+        if pyodide_lock:  # a bundled build of another version passes, but quiet mode mustn't hide that (#75)
+            differs = [
+                r
+                for r in rows
+                if Status.BUNDLED in r.results.values() and bundled_version_differs(r.package, pyodide_lock)
+            ]
+            if differs:
+                print(style.dim(bundled_line(differs, pyodide_lock)))
         for r in rows:
             if r.package.error:  # say why a package is "unknown", even in quiet mode
                 print(f"wheelgap: could not check {r.package.name}: {r.package.error}", file=sys.stderr)
@@ -917,10 +1120,9 @@ def main(argv: list[str] | None = None) -> int:
         for ln in render_table(shown, targets, style):
             print(ln)
         print()
-        hidden = len(rows) - len(shown)
+        hidden = [] if args.all else [r for r in rows if r.ok]
         if hidden:
-            noun = "package" if hidden == 1 else "packages"
-            print(style.dim(f"{hidden} {noun} with wheels for every target hidden (--all to show)"))
+            print(style.dim(f"{hidden_line(hidden)} (--all to show)"))
         if args.explain and gaps:
             if hidden:
                 print()
@@ -936,7 +1138,7 @@ def main(argv: list[str] | None = None) -> int:
         print(style.dim(f"skipped {len(skipped)} non-index package{'s' * (len(skipped) != 1)}: {names}"))
 
     if ignored:
-        print(style.dim("ignored: " + ", ".join(ignored)))
+        print(style.dim("ignored: " + ignored_list(ignored)))
 
     errors = [r for r in rows if r.package.error]
     for r in errors:
@@ -945,7 +1147,8 @@ def main(argv: list[str] | None = None) -> int:
     n_t = len(targets)
     if not gaps:
         what = "The 1 package has" if len(rows) == 1 else f"All {len(rows)} packages have"
-        print(style.green(f"✓ {what} a wheel for {'every one of ' if n_t > 1 else ''}{n_t} target{'s' * (n_t > 1)}."))
+        every = f"{'every one of ' if n_t > 1 else ''}{n_t} target{'s' * (n_t > 1)}{apart_from_ignored(rows)}"
+        print(style.green(f"✓ {what} a wheel for {every}."))
         return 0
 
     for line in target_lines(gaps, targets, style):

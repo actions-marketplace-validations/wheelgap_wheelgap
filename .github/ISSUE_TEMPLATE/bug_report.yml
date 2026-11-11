@@ -29,12 +29,24 @@ body:
       description: For example, "numpy 2.3.4 has a musllinux_1_2_aarch64 wheel on PyPI, so it should be ✓".
     validations:
       required: true
+  - type: textarea
+    id: pip
+    attributes:
+      label: What pip says (optional, but it settles it)
+      description: |
+        The same package and target checked with pip, e.g. `pip download --no-deps --only-binary=:all: --index-url https://pypi.org/simple -d /tmp/wg-check --platform musllinux_1_2_aarch64 --platform musllinux_1_1_aarch64 --python-version 3.14 --implementation cp --abi cp314t numpy==2.3.4`. Paste the command and its output. [AGENTS.md](https://github.com/wheelgap/wheelgap/blob/main/AGENTS.md#no-issue-fits-find-a-real-bug) has the full list of `--platform` tags to pass for each target.
+      render: text
+  - type: textarea
+    id: found-by
+    attributes:
+      label: How did you find it?
+      description: For example "my Docker build failed", or "checking a real lockfile with Claude Code, following AGENTS.md".
   - type: input
     id: version
     attributes:
       label: wheelgap version
-      description: Output of `wheelgap -V`.
-      placeholder: wheelgap 0.2.0
+      description: Output of `wheelgap --version`.
+      placeholder: "wheelgap 0.8.0 (packaging 26.3, CPython 3.13.1)"
     validations:
       required: true
   - type: input
