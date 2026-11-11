@@ -1,7 +1,9 @@
 import io
 import json
+import os
 import threading
 from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import pytest
 
@@ -90,7 +92,7 @@ def test_batches_reply_with_a_list():
 def test_tools_list_has_valid_schemas():
     (_, reply) = run(init(), {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     tools = {t["name"]: t for t in reply["result"]["tools"]}
-    assert set(tools) == {"check_package", "check_lockfile", "check_dockerfile", "list_targets"}
+    assert set(tools) == {"check_package", "check_lockfile", "check_dockerfile", "diff_lockfiles", "list_targets"}
     for tool in tools.values():
         assert tool["inputSchema"]["type"] == "object"
         assert tool["annotations"]["readOnlyHint"] is True
@@ -723,3 +725,264 @@ def test_check_dockerfile_errors_carry_no_cli_advice_where_none_applies(tmp_path
     (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(tmp_path / "Dockerfile"), path=str(tmp_path)))
     text = reply["result"]["content"][0]["text"]
     assert reply["result"]["isError"] is True and "check_lockfile" not in text
+
+
+def init_with_roots() -> dict:
+    message = init()
+    message["params"]["capabilities"] = {"roots": {"listChanged": True}}
+    return message
+
+
+INITIALIZED = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+
+
+def roots_answer(*paths, msg_id: str = "wheelgap-roots-1") -> dict:
+    return {"jsonrpc": "2.0", "id": msg_id, "result": {"roots": [{"uri": p.as_uri(), "name": p.name} for p in paths]}}
+
+
+def test_check_lockfile_accepts_a_file_uri(fake_pypi, fixtures, tmp_path):
+    project = tmp_path / "my app"  # a space, so the URI is percent-encoded
+    project.mkdir()
+    (project / "uv.lock").write_bytes((fixtures / "uvproj" / "uv.lock").read_bytes())
+    uri = (project / "uv.lock").as_uri()
+    assert "%20" in uri
+    (_, reply) = run(init(), call("check_lockfile", path=uri, python="3.13", targets=["linux-x86_64"]))
+    assert reply["result"]["isError"] is False
+    data = reply["result"]["structuredContent"]
+    assert data["path"] == str((project / "uv.lock").resolve())
+    assert {g["name"] for g in data["gaps"]} == {"nativeext", "puresdist"}
+
+
+def test_check_dockerfile_accepts_file_uris(fake_pypi, tmp_path, fixtures):
+    dockerfile = dockerfile_project(tmp_path, fixtures, "FROM python:3.13-alpine\n")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=dockerfile.as_uri(), path=tmp_path.as_uri()))
+    assert reply["result"]["structuredContent"]["targets"] == ["3.13 musl-x86_64"]
+
+
+@pytest.mark.parametrize("uri", ["https://example.com/uv.lock", "ftp://example.com/uv.lock"])
+def test_other_uris_are_tool_errors(fake_pypi, uri):
+    (_, reply) = run(init(), call("check_lockfile", path=uri))
+    assert reply["result"]["isError"] is True
+    assert "only file:// URIs" in reply["result"]["content"][0]["text"]
+    assert not fake_pypi
+
+
+def test_a_file_uri_for_another_host_is_unc_on_windows_only(fake_pypi):
+    uri = "file://otherhost/srv/app/uv.lock"
+    if os.name == "nt":  # a UNC path; not opened here, so the test doesn't wait on the network
+        assert mcp._file_uri_path(uri) == mcp.Path(r"\\otherhost\srv\app\uv.lock")
+        return
+    assert mcp._file_uri_path(uri) is None
+    (_, reply) = run(init(), call("check_lockfile", path=uri))
+    assert reply["result"]["isError"] is True
+    assert "only file:// URIs" in reply["result"]["content"][0]["text"]
+    assert not fake_pypi
+
+
+def test_file_uri_to_path_handles_localhost_and_windows_drives(monkeypatch):
+    assert mcp._file_uri_path("file://localhost/srv/app/uv.lock") == mcp.Path("/srv/app/uv.lock")
+    assert mcp._file_uri_path("FILE:///srv/a%20b") == mcp.Path("/srv/a b")
+    assert mcp._file_uri_path("https://example.com/x") is None
+    # On Windows, url2pathname turns /C:/... into C:\...; here, check the drive is passed to it intact.
+    seen = []
+    monkeypatch.setattr(mcp.urllib.request, "url2pathname", lambda p: seen.append(p) or p)
+    mcp._file_uri_path("file:///C:/Users/me/app/uv.lock")
+    assert seen == ["/C:/Users/me/app/uv.lock"]
+
+
+def test_relative_path_resolves_against_the_client_roots(fake_pypi, fixtures, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # the server's working directory has no uvproj
+    other = tmp_path / "other"
+    other.mkdir()
+    replies = run(
+        init_with_roots(),
+        INITIALIZED,
+        roots_answer(other, fixtures),  # the first root that contains the path wins
+        call("check_lockfile", path="uvproj/uv.lock", python="3.13", targets=["linux-x86_64"]),
+    )
+    (_, request, reply) = replies
+    assert request == {"jsonrpc": "2.0", "id": "wheelgap-roots-1", "method": "roots/list"}
+    assert reply["id"] == 1 and reply["result"]["isError"] is False
+    assert reply["result"]["structuredContent"]["path"] == str((fixtures / "uvproj" / "uv.lock").resolve())
+
+
+def test_roots_list_changed_asks_again(fake_pypi, fixtures, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    replies = run(
+        init_with_roots(),
+        INITIALIZED,
+        roots_answer(tmp_path),
+        {"jsonrpc": "2.0", "method": "notifications/roots/list_changed"},
+        roots_answer(fixtures, msg_id="wheelgap-roots-2"),
+        call("check_lockfile", path="uvproj", python="3.13", targets=["linux-x86_64"]),
+    )
+    assert [r.get("method") for r in replies] == [None, "roots/list", "roots/list", None]
+    assert replies[2]["id"] == "wheelgap-roots-2"
+    assert replies[3]["result"]["isError"] is False
+
+
+def test_no_roots_request_without_the_capability(fake_pypi, fixtures, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (_, reply) = run(init(), INITIALIZED, call("check_lockfile", path="uvproj"))
+    assert "roots/list" not in json.dumps(reply)
+    assert reply["result"]["isError"] is True and "no such file or directory" in reply["result"]["content"][0]["text"]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"jsonrpc": "2.0", "id": "wheelgap-roots-1", "error": {"code": -32601, "message": "no roots"}},
+        {"jsonrpc": "2.0", "id": "wheelgap-roots-1", "result": {"roots": "nope"}},
+        {"jsonrpc": "2.0", "id": "wheelgap-roots-1", "result": {"roots": [{"uri": "https://example.com/"}, 3]}},
+    ],
+)
+def test_a_bad_roots_answer_means_the_working_directory(fake_pypi, fixtures, monkeypatch, answer):
+    monkeypatch.chdir(fixtures)
+    (_, _, reply) = run(init_with_roots(), INITIALIZED, answer, call("check_lockfile", path="uvproj", python="3.13"))
+    assert reply["result"]["isError"] is False
+    assert reply["result"]["structuredContent"]["path"] == str((fixtures / "uvproj").resolve())
+
+
+def test_relative_path_in_no_root_falls_back_to_the_working_directory(fake_pypi, fixtures, tmp_path, monkeypatch):
+    monkeypatch.chdir(fixtures)
+    (_, _, reply) = run(
+        init_with_roots(), INITIALIZED, roots_answer(tmp_path), call("check_lockfile", path="uvproj", python="3.13")
+    )
+    assert reply["result"]["structuredContent"]["path"] == str((fixtures / "uvproj").resolve())
+
+
+def test_an_error_response_with_no_id_leaves_the_roots_alone(fake_pypi, fixtures, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    replies = run(
+        init_with_roots(),
+        INITIALIZED,
+        roots_answer(fixtures),
+        {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}},  # not an answer to us
+        call("check_lockfile", path="uvproj", python="3.13", targets=["linux-x86_64"]),
+    )
+    assert replies[-1]["result"]["isError"] is False
+
+
+def lockfile_pair(tmp_path, old: str, new: str) -> tuple[str, str]:
+    """Two small uv.lock files, the root project depending on the given [[package]] entries."""
+    head = 'version = 1\nrevision = 3\nrequires-python = ">=3.12"\n\n'
+    paths = []
+    for side, packages in (("old", old), ("new", new)):
+        names = [line.split('"')[1] for line in packages.splitlines() if line.startswith("name = ")]
+        root = '[[package]]\nname = "demo"\nversion = "0.1.0"\nsource = { virtual = "." }\ndependencies = [\n'
+        root += "".join(f'    {{ name = "{n}" }},\n' for n in names) + "]\n\n"
+        (tmp_path / side).mkdir()
+        path = tmp_path / side / "uv.lock"
+        path.write_text(head + root + packages, encoding="utf-8")
+        paths.append(str(path))
+    return paths[0], paths[1]
+
+
+def uv_package(name: str, version: str, kind: str = "wheel") -> str:
+    """A uv.lock [[package]] entry that records one wheel or one sdist, so no lookup is needed."""
+    url = f"https://files.pythonhosted.org/packages/aa/{name}-{version}"
+    if kind == "wheel":
+        files = f'wheels = [\n    {{ url = "{url}-py3-none-any.whl", hash = "sha256:00", size = 1 }},\n]\n'
+    else:
+        files = f'sdist = {{ url = "{url}.tar.gz", hash = "sha256:00", size = 1 }}\n'
+    return (
+        f'[[package]]\nname = "{name}"\nversion = "{version}"\nsource = {{ registry = "https://pypi.org/simple" }}\n'
+        + files
+        + "\n"
+    )
+
+
+def test_diff_lockfiles_reports_a_wheel_lost_to_source(fake_pypi, tmp_path):
+    old, new = lockfile_pair(
+        tmp_path,
+        uv_package("ranged", "1.5") + uv_package("purewheel", "3.1"),
+        uv_package("ranged", "1.9", "sdist") + uv_package("purewheel", "3.1") + uv_package("nowheels", "0.9", "sdist"),
+    )
+    (_, reply) = run(init(), call("diff_lockfiles", old=old, new=new, python="3.13", targets=["linux-x86_64"]))
+    assert reply["result"]["isError"] is False
+    data = reply["result"]["structuredContent"]
+    assert data["ok"] is False
+    assert data["worse"] == [
+        {
+            "name": "ranged",
+            "old_versions": ["1.5"],
+            "new_versions": ["1.9"],
+            "targets": {"linux-x86_64": {"old_status": "wheel", "new_status": "source"}},
+        }
+    ]
+    assert data["new"] == [{"name": "nowheels", "versions": ["0.9"], "targets": {"linux-x86_64": {"status": "source"}}}]
+    assert data["summary"] == {"worse": 1, "new": 1}
+    assert data["paths"] == {"old": old, "new": new}
+    assert "version" not in data
+
+
+def test_diff_lockfiles_matches_wheelgap_diff_json(fake_pypi, tmp_path, capsys):
+    from wheelgap import diff
+
+    old, new = lockfile_pair(tmp_path, uv_package("ranged", "1.5"), uv_package("ranged", "1.9", "sdist"))
+    argv = [old, new, "-p", "3.13", "-t", "linux-x86_64", "-t", "win-amd64", "--json"]
+    assert diff.main(argv) == 1
+    expected = json.loads(capsys.readouterr().out)
+    (_, reply) = run(
+        init(), call("diff_lockfiles", old=old, new=new, python="3.13", targets=["linux-x86_64", "win-amd64"])
+    )
+    data = reply["result"]["structuredContent"]
+    assert data["worse"]
+    for key in ("targets", "worse", "new", "unchecked", "summary"):
+        assert data[key] == expected[key]
+
+
+def test_diff_lockfiles_identical_files_are_ok(fake_pypi, tmp_path):
+    text = uv_package("ranged", "1.9", "sdist") + uv_package("purewheel", "3.1")
+    old, new = lockfile_pair(tmp_path, text, text)
+    (_, reply) = run(init(), call("diff_lockfiles", old=old, new=new, python="3.13", targets=["linux-x86_64"]))
+    data = reply["result"]["structuredContent"]
+    assert data["ok"] is True
+    assert data["worse"] == [] and data["new"] == [] and data["summary"] == {"worse": 0, "new": 0}
+
+
+def test_diff_lockfiles_looks_requirements_up(fake_pypi, tmp_path):
+    # Requirements files record no files, so every package is looked up on the index.
+    (tmp_path / "old.txt").write_text("ranged==1.5\n", encoding="utf-8")
+    (tmp_path / "new.txt").write_text("ranged==1.9\n", encoding="utf-8")
+    arguments = {"old": str(tmp_path / "old.txt"), "new": str(tmp_path / "new.txt"), "python": "3.13"}
+    (_, reply) = run(init(), call("diff_lockfiles", **arguments, targets=["linux-x86_64"]))
+    assert [w["name"] for w in reply["result"]["structuredContent"]["worse"]] == ["ranged"]
+    assert fake_pypi
+
+
+def test_diff_lockfiles_malformed_lockfile_is_a_tool_error(fake_pypi, tmp_path):
+    old, new = lockfile_pair(tmp_path, uv_package("purewheel", "3.1"), uv_package("purewheel", "3.1"))
+    Path(new).write_text("[[package\n", encoding="utf-8")
+    (_, reply) = run(init(), call("diff_lockfiles", old=old, new=new, python="3.13", targets=["linux-x86_64"]))
+    text = reply["result"]["content"][0]["text"]
+    assert reply["result"]["isError"] is True and "internal error" not in text
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"old": "/no/such/uv.lock"}, "no such file or directory"),
+        ({"new": "/no/such/uv.lock"}, "no such file or directory"),
+        ({"old": None}, "'old' is required"),
+        ({"offline": True}, "unknown argument(s): offline"),  # wheelgap diff has no offline mode
+        ({"old": "{tmp}/old.lock"}, "don't know how to read"),  # the saved copy needs its real name
+        ({"targets": ["linux-aarch46"]}, "linux-aarch46"),
+        ({"python": "three"}, "can't read Python version"),
+        ({"glibc": "2.28"}, "unknown argument(s): glibc"),
+        ({"old": "{tmp}/notes.md"}, "don't know how to read"),
+        ({"old": "{tmp}/empty"}, "no lockfile found"),
+    ],
+)
+def test_diff_lockfiles_errors(fake_pypi, tmp_path, arguments, message):
+    old, new = lockfile_pair(tmp_path, uv_package("purewheel", "3.1"), uv_package("purewheel", "3.1"))
+    (tmp_path / "notes.md").write_text("hi\n", encoding="utf-8")
+    (tmp_path / "old.lock").write_text(Path(old).read_text(encoding="utf-8"), encoding="utf-8")
+    (tmp_path / "empty").mkdir()
+    merged = {"old": old, "new": new} | {
+        k: v.format(tmp=tmp_path) if isinstance(v, str) else v for k, v in arguments.items()
+    }
+    (_, reply) = run(init(), call("diff_lockfiles", **{k: v for k, v in merged.items() if v is not None}))
+    assert reply["result"]["isError"] is True
+    assert message in reply["result"]["content"][0]["text"]
+    assert not fake_pypi

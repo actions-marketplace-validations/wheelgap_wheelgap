@@ -38,7 +38,7 @@ uv run --group dev pytest
 | `pyodide.py` | `--pyodide-lock`: packages Pyodide ships itself |
 | `scan.py` | `python -m wheelgap.scan`: the data behind the [coverage tracker](https://wheelgap.github.io/tracker/) |
 | `diff.py` | `python -m wheelgap.diff OLD NEW`: packages that got worse between two lockfiles, and new packages with gaps |
-| `mcp.py` | `wheelgap-mcp` / `python -m wheelgap.mcp`: an MCP server over stdio (stdlib JSON-RPC, no MCP SDK) with `check_package`, `check_lockfile`, `check_dockerfile` and `list_targets` tools |
+| `mcp.py` | `wheelgap-mcp` / `python -m wheelgap.mcp`: an MCP server over stdio (stdlib JSON-RPC, no MCP SDK) with `check_package`, `check_lockfile`, `check_dockerfile`, `diff_lockfiles` and `list_targets` tools |
 
 ## Tests
 
