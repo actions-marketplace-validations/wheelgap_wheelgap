@@ -68,10 +68,18 @@ class Package:
     # `files` are only some of the release's files (pixi.lock records the one it picked per platform), so the
     # package is looked up on its index anyway, and skipped as a private index if it can't be.
     partial_files: bool = False
+    # A range resolved for several Python major.minors. Each value owns only that Python's eligible files.
+    # Identical resolutions share a Package, so reports can keep one row for them.
+    resolutions: dict[str, Package] = field(default_factory=dict)
 
     @property
     def key(self) -> str:
         return canonicalize_name(self.name)
+
+    @property
+    def variants(self) -> list[Package]:
+        """The input package and its resolved variants, retaining their source provenance."""
+        return list({id(p): p for p in (self, *self.resolutions.values())}.values())
 
 
 # PEP 508's package name. pip and uv can't install anything else, and the CLI prints names at the start of lines,

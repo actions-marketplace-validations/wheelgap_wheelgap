@@ -24,6 +24,7 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import replace
 from functools import partial
 from typing import IO
 from urllib.parse import quote, unquote, urlparse, urlsplit, urlunsplit
@@ -580,7 +581,10 @@ def _group_by_version(data: object, key: str) -> dict[Version, list[dict]]:
     return grouped
 
 
-def fill_simple(pkg: Package, base: str, auth: str | None, python: str | None = None) -> Package:
+def fill_simple(
+    pkg: Package, base: str, auth: str | None, python: str | None = None, pythons: tuple[str, ...] = ()
+) -> Package:
+    pkg.resolutions = {}  # a refresh must not retain answers from the previous response
     try:
         data = fetch_simple(f"{base}/{quote(pkg.key)}/", auth)
     except urllib.error.HTTPError as e:
@@ -592,6 +596,10 @@ def fill_simple(pkg: Package, base: str, auth: str | None, python: str | None = 
     except Exception as e:  # never put str(e) here: it can contain the URL
         pkg.error = f"lookup failed ({type(e).__name__})"
         return pkg
+    return _resolve_pythons(pkg, pythons, lambda p, py: _fill_simple_data(p, data, py), python)
+
+
+def _fill_simple_data(pkg: Package, data: dict, python: str | None) -> Package:
     try:
         grouped = _group_by_version(data, pkg.key)
         if pkg.version:  # pinned: that release's files; yanked ones are kept but marked (PEP 592)
@@ -688,7 +696,28 @@ def _not_found(base: str, name: str, version: str | None) -> str:
     return "not on index"
 
 
-def fill(pkg: Package, python: str | None = None, read_cache: bool = False, write_cache: bool = False) -> Package:
+def _resolve_pythons(
+    pkg: Package, pythons: tuple[str, ...], resolve: Callable[[Package, str | None], Package], python: str | None
+) -> Package:
+    """Share one index response, never files, between a range's per-Python resolutions."""
+    versions = tuple(dict.fromkeys(pythons))
+    if not pkg.version and pkg.spec and len(versions) > 1:
+        for py in versions:
+            resolved = resolve(replace(pkg, resolutions={}), py)
+            # Equal versions can still have different eligible files. Coalesce only identical answers.
+            pkg.resolutions[py] = next((p for p in pkg.resolutions.values() if p == resolved), resolved)
+        return pkg
+    return resolve(pkg, versions[0] if versions else python)
+
+
+def fill(
+    pkg: Package,
+    python: str | None = None,
+    read_cache: bool = False,
+    write_cache: bool = False,
+    pythons: tuple[str, ...] = (),
+) -> Package:
+    pkg.resolutions = {}
     base = index_url()
     name = quote(pkg.key)
     pinned = bool(pkg.version)
@@ -704,6 +733,15 @@ def fill(pkg: Package, python: str | None = None, read_cache: bool = False, writ
     except Exception as e:  # network trouble shouldn't kill the whole report
         pkg.error = f"lookup failed ({type(e).__name__})"
         return pkg
+    _resolve_pythons(pkg, pythons, lambda p, py: _fill_json_data(p, data, py, base), python)
+    # Only a fresh, valid pinned response is cached; a range is resolved anew on every run.
+    if key and write_cache and cached is None and not pkg.error and isinstance(data.get("urls"), list):
+        cache.save_files(*key, _files(data["urls"]))
+    return pkg
+
+
+def _fill_json_data(pkg: Package, data: dict, python: str | None, base: str) -> Package:
+    pinned = bool(pkg.version)
     try:
         if not isinstance(data, dict):
             raise ValueError("not an object")
@@ -729,10 +767,6 @@ def fill(pkg: Package, python: str | None = None, read_cache: bool = False, writ
             names = [u["filename"] for u in urls if not u.get("yanked")]
         pkg.files = names
         pkg.found_on_pypi = base == DEFAULT_INDEX
-        # Only a fresh answer that parsed and listed its files: a body with no "urls" ({}) reads as no files,
-        # and caching that would turn a bad response into a day of false "missing" answers.
-        if key and write_cache and cached is None and isinstance(data.get("urls"), list):
-            cache.save_files(*key, urls)
     except (ValueError, TypeError, KeyError, AttributeError):
         pkg.error = "unexpected response from the index"
     return pkg
@@ -832,21 +866,23 @@ def fill_all(
     simple_index: str | None = None,
     read_cache: bool = False,
     write_cache: bool = False,
+    pythons: tuple[str, ...] = (),
 ) -> int:
     """Look packages up on PyPI. A package the lock says came from another index is never looked up: PyPI doesn't
     know it. With refresh (--online) it keeps its locked files; with no files (an old poetry.lock, a Pipfile.lock)
     it is skipped as a private index, unless WHEELGAP_INDEX_URL is that same index (see may_look_up). A package with
     partial_files (pixi.lock) is always looked up, and skipped as a private index where it can't be.
-    `python` limits range resolution to releases supporting that interpreter.
+    `python` limits range resolution to releases supporting that interpreter; `pythons` resolves separately
+    for each major.minor and stores the answers in Package.resolutions when several versions are requested.
     With `simple_index` (--index-url), lookups go to that PEP 691 simple index instead of PyPI's JSON API.
     `read_cache` and `write_cache` read pinned JSON API lookups from, and save them to, the on-disk cache (see
     cache.py); simple-index lookups never use it.
     Inside reporting_progress, it reports to that callback as lookups finish.
     Returns how many kept their locked files for that reason."""
-    fn = partial(fill, python=python, read_cache=read_cache, write_cache=write_cache)
+    fn = partial(fill, python=python, read_cache=read_cache, write_cache=write_cache, pythons=pythons)
     if simple_index is not None:
         base, auth = split_credentials(simple_index)  # validate first: a bad URL fails before any lookup
-        fn = partial(fill_simple, base=base, auth=auth, python=python)
+        fn = partial(fill_simple, base=base, auth=auth, python=python, pythons=pythons)
     for p in packages:
         if (p.files is None or p.partial_files) and not p.skip and not may_look_up(p.registry, simple_index):
             p.skip = "private index"  # the name is internal; a namesake on PyPI is another package
@@ -855,7 +891,10 @@ def fill_all(
     todo = [
         p
         for p in packages
-        if not p.skip and not p.error and id(p) not in kept and (refresh or p.files is None or p.partial_files)
+        if not p.skip
+        and not p.error
+        and id(p) not in kept
+        and (refresh or (p.files is None and not p.resolutions) or p.partial_files)
     ]
     report = _progress.get()
     if todo:

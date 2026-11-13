@@ -404,12 +404,12 @@ def test_online_selection_preserves_private_index_and_python_context(fixtures, t
     (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
     calls = []
 
-    def fill(package, python=None, read_cache=False, write_cache=False):
-        calls.append((package.name, python))
+    def fill(package, python=None, read_cache=False, write_cache=False, pythons=()):
+        calls.append((package.name, pythons))
 
     monkeypatch.setattr(pypi, "fill", fill)
     assert main([str(tmp_path), "--online", "--no-dev", "--json", "-t", "linux", "-p", "3.13"]) == 0
-    assert set(calls) == {("library", "3.13"), ("librarybase", "3.13"), ("one", "3.13")}
+    assert set(calls) == {("library", ("3.13",)), ("librarybase", ("3.13",)), ("one", ("3.13",))}
     report = capsys.readouterr()
     assert "kept the locked files of 1 package from other indexes" in report.err
     assert "common" in {p["name"] for p in json.loads(report.out)["packages"]}

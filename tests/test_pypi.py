@@ -5,6 +5,7 @@ import urllib.error
 import urllib.request
 
 import pytest
+from conftest import FAKE_INDEX
 
 import wheelgap
 from wheelgap import Status, pypi
@@ -21,9 +22,7 @@ def test_range_requires_python(fake_pypi, python, expected):
     assert fake_pypi == ["https://pypi.org/pypi/pythonranged/json"]
 
 
-@pytest.mark.parametrize(
-    "python,expected", [("3.9", "1.0"), ("3.13", "2.0"), ("3.13,3.13t", "2.0"), ("3.9,3.13", "2.0")]
-)
+@pytest.mark.parametrize("python,expected", [("3.9", "1.0"), ("3.13", "2.0"), ("3.13,3.13t", "2.0")])
 def test_range_requires_python_cli(fake_pypi, capsys, tmp_path, monkeypatch, python, expected):
     monkeypatch.chdir(tmp_path)
     assert main(["pythonranged>=1,<3", "-p", python, "-t", "linux,windows", "--json"]) == 0
@@ -34,7 +33,7 @@ def test_range_requires_python_cli(fake_pypi, capsys, tmp_path, monkeypatch, pyt
     assert set(package["results"].values()) == {"wheel"}
 
 
-@pytest.mark.parametrize("python,expected", [("3.9", "1.0"), ("3.13", "2.0"), ("3.9,3.13", "2.0")])
+@pytest.mark.parametrize("python,expected", [("3.9", "1.0"), ("3.13", "2.0")])
 def test_range_requires_python_lockfile_api(fake_pypi, tmp_path, python, expected):
     path = tmp_path / "requirements.txt"
     path.write_text("pythonranged>=1,<3\n", encoding="utf-8")
@@ -42,6 +41,238 @@ def test_range_requires_python_lockfile_api(fake_pypi, tmp_path, python, expecte
     (result,) = wheelgap.check_lockfile(path, targets)
     assert result.version == expected and result.ok
     assert fake_pypi == ["https://pypi.org/pypi/pythonranged/json"]
+
+
+@pytest.mark.parametrize("simple", [False, True])
+@pytest.mark.parametrize("python", ["3.9,3.13,3.13t", "3.13t,3.13,3.9"])
+def test_range_multiple_pythons_cli(fake_pypi, fake_simple, capsys, tmp_path, monkeypatch, simple, python):
+    monkeypatch.chdir(tmp_path)
+    args = ["--index-url", "https://private.example/simple"] if simple else []
+    assert main(["pythonranged>=1,<3", "-p", python, "-t", "linux,windows", "--json", *args]) == 0
+    rows = json.loads(capsys.readouterr().out)["packages"]
+    assert len(rows) == 2
+    assert {row["version"] for row in rows} == {"1.0", "2.0"}
+    for row in rows:
+        assert row["error"] is None
+        for target, status in row["results"].items():
+            chosen = "1.0" if target.startswith("3.9 ") else "2.0"
+            assert status == ("wheel" if row["version"] == chosen else "n/a")
+    assert len(fake_simple.calls if simple else fake_pypi) == 1
+
+
+def test_range_multiple_pythons_lockfile_api(fake_pypi, tmp_path):
+    path = tmp_path / "requirements.txt"
+    path.write_text("pythonranged>=1,<3; sys_platform == 'linux'\n", encoding="utf-8")
+    targets = wheelgap.make_targets(python="3.9,3.13", platforms="linux,windows")
+    results = wheelgap.check_lockfile(path, targets)
+    assert len(results) == 2
+    for result in results:
+        assert result.ok
+        assert result.files == (f"pythonranged-{result.version}-py3-none-any.whl",)
+        for target, status in result.statuses.items():
+            chosen = "1.0" if target.minor == 9 else "2.0"
+            expected = (
+                Status.WHEEL if target.platform == "linux-x86_64" and result.version == chosen else Status.NOT_NEEDED
+            )
+            assert status is expected
+        assert result.to_dict()["version"] == result.version
+    assert fake_pypi == ["https://pypi.org/pypi/pythonranged/json"]
+
+
+@pytest.mark.parametrize("simple", [False, True])
+def test_range_multiple_pythons_failure_is_scoped(fake_pypi, fake_simple, capsys, tmp_path, monkeypatch, simple):
+    monkeypatch.chdir(tmp_path)
+    args = ["--index-url", "https://private.example/simple"] if simple else []
+    assert main(["pythonranged>=2", "-p", "3.9,3.13", "-t", "linux", "--json", *args]) == 1
+    rows = json.loads(capsys.readouterr().out)["packages"]
+    failed = next(row for row in rows if row["error"])
+    passed = next(row for row in rows if not row["error"])
+    assert failed["error"] == "no release matches >=2 for Python 3.9"
+    assert failed["version"] is None
+    assert failed["results"] == {"3.9 linux-x86_64": "unknown", "3.13 linux-x86_64": "n/a"}
+    assert passed["version"] == "2.0"
+    assert passed["results"] == {"3.9 linux-x86_64": "n/a", "3.13 linux-x86_64": "wheel"}
+
+
+def test_range_multiple_pythons_coalesces_identical_resolutions(fake_pypi, capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert main(["pythonranged>=1", "-p", "3.11,3.13", "-t", "linux", "--json"]) == 0
+    (row,) = json.loads(capsys.readouterr().out)["packages"]
+    assert row["version"] == "2.0" and set(row["results"].values()) == {"wheel"}
+    assert len(fake_pypi) == 1
+
+
+@pytest.mark.parametrize("simple", [False, True])
+@pytest.mark.parametrize("yanked", [False, True])
+def test_range_multiple_pythons_keep_eligible_files_separate(
+    fake_pypi, fake_simple, capsys, tmp_path, monkeypatch, simple, yanked
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setitem(
+        FAKE_INDEX,
+        "mixed",
+        {
+            "1.0": ["mixed-1.0-py3-none-any.whl"],
+            "2.0": [
+                {"filename": "mixed-2.0-py3-none-any.whl", "requires_python": ">=3.10"},
+                {"filename": "mixed-2.0.tar.gz", "requires_python": ">=3.8", "yanked": yanked},
+            ],
+        },
+    )
+    args = ["--index-url", "https://private.example/simple"] if simple else []
+    assert main(["mixed>=1", "-p", "3.9,3.13", "-t", "linux", "--json", "--explain", *args]) == (0 if yanked else 1)
+    older, newer = json.loads(capsys.readouterr().out)["packages"]
+    assert older["version"] == ("1.0" if yanked else "2.0")
+    assert newer["version"] == "2.0"
+    assert older["results"] == {"3.9 linux-x86_64": "wheel" if yanked else "source", "3.13 linux-x86_64": "n/a"}
+    assert newer["results"] == {"3.9 linux-x86_64": "n/a", "3.13 linux-x86_64": "wheel"}
+    if not yanked:
+        assert older["rejected"] == {"3.9 linux-x86_64": []}  # the ineligible wheel must not leak into --explain
+    assert len(fake_simple.calls if simple else fake_pypi) == 1
+
+
+def test_range_multiple_pythons_api_checks_selected_release_and_abi(fake_pypi, tmp_path, monkeypatch):
+    monkeypatch.setitem(
+        FAKE_INDEX,
+        "native",
+        {
+            "1.0": [{"filename": "native-1.0-py3-none-any.whl", "requires_python": "<3.10"}],
+            "2.0": [
+                {"filename": "native-2.0-cp313-cp313-win_amd64.whl", "requires_python": ">=3.10"},
+                {"filename": "native-2.0.tar.gz", "requires_python": ">=3.10"},
+            ],
+        },
+    )
+    path = tmp_path / "requirements.txt"
+    path.write_text("native>=1\n", encoding="utf-8")
+    targets = wheelgap.make_targets(python="3.9,3.13,3.13t", platforms="linux,windows")
+    older, newer = wheelgap.check_lockfile(path, targets)
+    assert older.version == "1.0" and older.ok
+    assert newer.version == "2.0" and not newer.ok
+    assert newer.files == ("native-2.0-cp313-cp313-win_amd64.whl", "native-2.0.tar.gz")
+    for target in targets:
+        if target.minor == 9:
+            assert newer.statuses[target] is Status.NOT_NEEDED
+        elif target.python == "3.13" and target.platform == "win-amd64":
+            assert newer.statuses[target] is Status.WHEEL
+        else:
+            assert newer.statuses[target] is Status.SOURCE
+            assert [file for file, _ in newer.rejected[target]] == [newer.files[0]]
+            assert "native-1.0" not in newer.reasons[target]
+    assert len(fake_pypi) == 1
+
+
+@pytest.mark.parametrize("markdown", [False, True])
+def test_range_multiple_pythons_text_versions(fake_pypi, capsys, tmp_path, monkeypatch, markdown):
+    monkeypatch.chdir(tmp_path)
+    args = ["--markdown"] if markdown else ["--color", "never"]
+    assert main(["pythonranged>=1", "-p", "3.9,3.13", "-t", "linux", "--all", *args]) == 0
+    lines = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith(("pythonranged", "| pythonranged"))
+    ]
+    assert len(lines) == 2
+    assert "1.0" in lines[0] and "2.0" in lines[1]
+
+
+def test_range_multiple_pythons_marker_excludes_incompatible_python(fake_pypi, tmp_path):
+    path = tmp_path / "requirements.txt"
+    path.write_text("pythonranged>=2; python_version >= '3.10'\n", encoding="utf-8")
+    targets = wheelgap.make_targets(python="3.9,3.13", platforms="linux")
+    (result,) = wheelgap.check_lockfile(path, targets)
+    assert result.version == "2.0" and result.ok and result.error is None
+    assert list(result.statuses.values()) == [Status.NOT_NEEDED, Status.WHEEL]
+
+
+@pytest.mark.parametrize("requirement", ["pythonranged", "pythonranged==2.0"])
+def test_range_multiple_pythons_keeps_names_and_pins(fake_pypi, capsys, tmp_path, monkeypatch, requirement):
+    monkeypatch.chdir(tmp_path)
+    assert main([requirement, "-p", "3.9,3.13", "-t", "linux", "--json"]) == 0
+    (row,) = json.loads(capsys.readouterr().out)["packages"]
+    assert row["version"] == "2.0" and set(row["results"].values()) == {"wheel"}
+    assert len(fake_pypi) == 1
+
+
+def test_range_multiple_pythons_pyproject(fake_pypi, capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "pyproject.toml"
+    path.write_text('[project]\nname = "demo"\ndependencies = ["pythonranged>=1"]\n', encoding="utf-8")
+    assert main([str(path), "-p", "3.9,3.13", "-t", "linux", "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)["packages"]
+    assert [row["version"] for row in rows] == ["1.0", "2.0"]
+
+
+@pytest.mark.parametrize("simple", [False, True])
+def test_range_multiple_pythons_refresh(fake_pypi, fake_simple, simple):
+    pkg = Package("pythonranged", None, spec=">=1")
+    options = {"simple_index": "https://private.example/simple"} if simple else {}
+    pypi.fill_all([pkg], pythons=("3.9", "3.13"), **options)
+    assert {py: p.version for py, p in pkg.resolutions.items()} == {"3.9": "1.0", "3.13": "2.0"}
+    pypi.fill_all([pkg], pythons=("3.9", "3.13"), **options)
+    assert len(fake_simple.calls if simple else fake_pypi) == 1
+    pypi.fill_all([pkg], refresh=True, pythons=("3.9", "3.13"), **options)
+    assert {py: p.version for py, p in pkg.resolutions.items()} == {"3.9": "1.0", "3.13": "2.0"}
+    assert len(fake_simple.calls if simple else fake_pypi) == 2
+
+
+@pytest.mark.parametrize("simple", [False, True])
+def test_range_multiple_pythons_failed_refresh_discards_old_answers(fake_pypi, fake_simple, monkeypatch, simple):
+    from wheelgap.check import check
+    from wheelgap.sources import Source
+
+    pkg = Package("pythonranged", None, spec=">=1")
+    options = {"simple_index": "https://private.example/simple"} if simple else {}
+    pypi.fill_all([pkg], pythons=("3.9", "3.13"), **options)
+    assert pkg.resolutions
+
+    def unavailable(*args):
+        raise TimeoutError
+
+    monkeypatch.setattr(pypi, "fetch_simple" if simple else "fetch_json", unavailable)
+    pypi.fill_all([pkg], refresh=True, pythons=("3.9", "3.13"), **options)
+    targets = wheelgap.make_targets(python="3.9,3.13", platforms="linux")
+    (row,) = check([Source("test", packages=[pkg], kind="requirements")], targets)
+    assert row.package.error == "lookup failed (TimeoutError)"
+    assert set(row.results.values()) == {Status.UNKNOWN}
+
+
+@pytest.mark.parametrize("simple", [False, True])
+def test_range_multiple_pythons_explanation_provenance(
+    fake_pypi, fake_simple, fake_files, tracker, capsys, tmp_path, monkeypatch, simple
+):
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "requirements.txt"
+    path.write_text("# dependency\nranged>=1,<2\n", encoding="utf-8")
+    args = ["--index-url", "https://private.example/simple"] if simple else []
+    assert (
+        main(
+            [
+                str(path),
+                "-p",
+                "3.9,3.13",
+                "-t",
+                "linux",
+                "--json",
+                "--explain",
+                "--notes",
+                "--conda-forge",
+                "--build-info",
+                "--github-annotations",
+                *args,
+            ]
+        )
+        == 1
+    )
+    output = capsys.readouterr()
+    (row,) = json.loads(output.out)["packages"]
+    assert row["version"] == "1.9" and set(row["results"].values()) == {"source"}
+    assert "file=requirements.txt,line=2" in output.err
+    if simple:
+        assert not fake_pypi and not tracker.calls and not fake_files.calls
+    else:
+        assert "https://pypi.org/pypi/ranged/1.9/json" in fake_pypi
+        assert "https://api.anaconda.org/package/conda-forge/ranged" in fake_pypi
+        assert len(tracker.calls) == 1
+        assert fake_files.calls == ["https://files.example/ranged-1.9.tar.gz"]
 
 
 @pytest.mark.parametrize("requires_python", [None, "", "not a specifier", 42])

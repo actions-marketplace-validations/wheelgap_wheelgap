@@ -641,7 +641,7 @@ def applies(pkg: Package, target: Target) -> bool:
 
 
 def check(sources: list[Source], targets: list[Target]) -> list[Row]:
-    rows = []
+    rows: list[Row] = []
     for source in sources:
         paths: dict[Target, dict[int, list[str]]] = {target: {} for target in targets}
         installed = (
@@ -655,15 +655,22 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
         for i, pkg in enumerate(source.packages):
             if pkg.skip:
                 continue
-            files = None if pkg.error else pkg.files
-            wheels = wheel_tags(files) if files is not None else []
-            row = Row(pkg)
+            resolved_rows: dict[int, Row] = {}
+            parsed: dict[int, list[frozenset[Tag]]] = {}
             for t in targets:
+                resolved = pkg.resolutions.get(f"{t.major}.{t.minor}", pkg)
+                if id(resolved) not in resolved_rows:
+                    resolved_rows[id(resolved)] = Row(resolved, dict.fromkeys(targets, Status.NOT_NEEDED))
+                    parsed[id(resolved)] = wheel_tags(resolved.files) if resolved.files is not None else []
+                row = resolved_rows[id(resolved)]
+                files = None if resolved.error else resolved.files
                 needed = i in installed[t] if installed is not None else applies(pkg, t)
-                row.results[t] = status_for(files, t, wheels, pkg.yanked) if needed else Status.NOT_NEEDED
+                row.results[t] = (
+                    status_for(files, t, parsed[id(resolved)], resolved.yanked) if needed else Status.NOT_NEEDED
+                )
                 if needed and installed is not None:
                     row.via[t] = (
                         paths[t][i] if source.uv_selection is not None else dependency_path(source, installed[t], i)
                     )
-            rows.append(row)
+            rows.extend(resolved_rows.values())
     return rows

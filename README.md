@@ -51,6 +51,9 @@ wheelgap -p 3.14t -t all
 # Several Pythons at once, Linux on both architectures
 wheelgap uv.lock -p 3.12,3.13,3.14 -t linux-x86_64,linux-aarch64
 
+# Resolve a version range separately for each Python
+wheelgap "numpy>=1.26,<3" -p 3.9,3.13 -t linux
+
 # Check the PyPI packages of a pixi project's `test` environment (after 0.9.0)
 wheelgap pixi.lock --environment test -p 3.13 -t linux-x86_64,macos-arm64
 
@@ -84,7 +87,7 @@ Each cell in the table is one of:
 | `✓` | a compatible wheel exists, so the install is fast |
 | `● source` | no wheel, only an sdist, so it compiles at install time (needs a compiler, headers, time) |
 | `✗ missing` | no wheel and no sdist, so the install fails |
-| `–` | not installed on this target (environment markers exclude it) |
+| `–` | not installed on this target (environment markers exclude it, or the target selects another resolution) |
 | `✓ bundled` | no wheel on PyPI, but Pyodide ships its own build (with `--pyodide-lock`) |
 
 **Exit codes:** `0` no gaps, `1` gaps found, `2` bad input. `--fail-on missing` accepts source builds, `--ignore NAME` accepts a known gap, and `--exit-zero` never fails on gaps.
@@ -97,6 +100,10 @@ import json
 data = json.load(open("wheelgap.json"))
 key = next(t["label"] for t in data["targets"] if t["python"] == "3.13" and t["platform"] == "linux-x86_64")
 ```
+
+Version ranges select the newest matching release whose `Requires-Python` permits each target Python. Different
+resolutions appear in separate rows, including in JSON, with `n/a` for targets using another resolution. See
+[version ranges](https://wheelgap.github.io/wheelgap/how-it-works/#version-ranges) for details.
 
 After 0.9.0, `--explain` can also show the coverage tracker's notes (`--notes`), what a source build needs (`--build-info`) and conda-forge builds that fit (`--conda-forge`). These are opt-in, since they send package names elsewhere ([which names](https://wheelgap.github.io/wheelgap/how-it-works/#pypi-origin)).
 
@@ -208,7 +215,6 @@ wheelgap is growing into **caniuse for Python wheels**: an open map of which pac
 Next up for the CLI, each with a first step written up and no PR yet:
 
 - "nearest version with a wheel" hints ([#20](https://github.com/wheelgap/wheelgap/issues/20))
-- version ranges: picking the newest release that supports each target's Python ([#84](https://github.com/wheelgap/wheelgap/issues/84))
 
 The [roadmap](https://github.com/wheelgap/wheelgap/labels/roadmap) and [help wanted](https://github.com/wheelgap/wheelgap/labels/help%20wanted) labels have more.
 

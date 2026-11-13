@@ -18,11 +18,17 @@ sdist means the install fails (`missing`). Where wheelgap can't be sure, it says
 ## Version ranges
 
 Version ranges such as `numpy>=1.26,<2` use the newest matching release with a non-yanked file whose
-`Requires-Python` permits the selected Python. This applies when every target uses the same Python major/minor version
-(including a mix of regular and free-threaded builds). Missing or invalid `Requires-Python` metadata is treated as
-unrestricted. Runs checking several Python versions still choose the newest release matching the range without
-filtering by Python; per-Python resolution remains planned in [#84](https://github.com/wheelgap/wheelgap/issues/84).
-Exact pins and bare package names keep their existing behavior.
+`Requires-Python` permits the selected Python. With several `-p` versions, each Python major/minor selects its own
+release from one index response. Regular and free-threaded builds of the same Python share release selection, but
+each still checks its own wheel tags. Missing or invalid `Requires-Python` metadata is treated as unrestricted.
+Exact pins and bare package names keep their existing behavior. This applies to both the PyPI JSON API and
+`--index-url` simple indexes.
+
+Distinct resolutions appear as separate rows in text, Markdown and JSON, each with its selected version and only
+that Python's eligible files. Targets using another resolution show `–` (`n/a` in JSON). Identical resolutions share
+a row; the same version can appear twice if its eligible files differ by Python. A Python with no matching release
+gets `unknown` with its own error, while other Pythons still show their results. The Python `check_lockfile()` API
+uses the same representation with separate `Result` objects.
 
 ## Environment markers
 

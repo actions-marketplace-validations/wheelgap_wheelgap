@@ -38,7 +38,7 @@
         },
         "packages": {
             "type": "array",
-            "description": "One entry per package that is installed on at least one target.",
+            "description": "One entry per package that is installed on at least one target. A range that resolves to different releases for different Pythons has one entry per release, with n/a for the targets using the other.",
             "items": {"$ref": "#/$defs/package"}
         },
         "skipped": {

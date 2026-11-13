@@ -229,7 +229,7 @@ class Locator:
     """Where each package of the checked sources is written, read lazily and once per source."""
 
     def __init__(self, sources: list[Source]):
-        self.sources = {id(p): s for s in sources for p in s.packages}
+        self.sources = {id(p): s for s in sources for original in s.packages for p in original.variants}
         self.found: dict[int, dict] = {}
 
     def locate(self, package: Package) -> Location | None:

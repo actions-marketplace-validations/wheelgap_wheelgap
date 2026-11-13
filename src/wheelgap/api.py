@@ -243,6 +243,8 @@ def check_lockfile(
     Environment markers and the uv.lock dependency graph are respected, as in the CLI. A uv.lock whose
     requires-python leaves out a target's Python may be missing wheels for it, so its PyPI packages are also
     looked up on the index (keeping the lock's files if a lookup fails).
+    Requirements ranges resolve separately for each target Python major/minor. Distinct resolutions return
+    separate Results with their own version and eligible files; targets using another resolution are NOT_NEEDED.
     With offline=True, only locked files are used: inputs needing an index lookup raise SourceError, and the
     other-Python recheck is skipped. Locked files may therefore omit wheels for those Python versions.
     online=True and offline=True cannot be combined.
@@ -282,7 +284,7 @@ def _check_lockfile(
         raise SourceError(f"{lockfile}: environment applies to pixi.lock only")
     if offline:
         require_offline([source], "offline=True", undo="set offline=False")
-    fill_all(source.packages, refresh=online, python=single_python(targets))
+    fill_all(source.packages, refresh=online, pythons=tuple(dict.fromkeys(f"{t.major}.{t.minor}" for t in targets)))
     if not online and not offline and pythons_outside_lock(source, targets):
         recheck_lock(source.packages)
     rows: list[Row] = [r for r in check([source], targets) if r.needed]

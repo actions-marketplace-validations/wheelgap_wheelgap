@@ -247,8 +247,9 @@ wheelgap pyproject.toml --all-extras
 ```
 
 Each requirement is read like a line of a requirements file, so ranges and bare names use the newest matching release
-and markers are respected. With several `-p` versions, that release isn't filtered by `Requires-Python`
-([#84](https://github.com/wheelgap/wheelgap/issues/84)), so ranges and bare names can show false gaps. Only direct
+and markers are respected. A range picks the newest release whose `Requires-Python` allows each `-p` version, so with
+several it can pick a different release per Python ([how it works](how-it-works.md)). A bare name always checks the
+latest release, even for a `-p` version that can't install it, so it can show false gaps. Only direct
 dependencies are checked: their own dependencies aren't, and wheelgap always prints a note saying so. Use a lockfile
 for the full picture.
 

@@ -78,7 +78,6 @@ from .targets import (
     resolve_distro,
     resolve_platform,
     resolve_platforms,
-    single_python,
 )
 
 EXAMPLES = """\
@@ -1173,7 +1172,7 @@ def conda_forge_hints(
             f"({other}), so no package names leave it",
             file=sys.stderr,
         )
-    source_of = {id(p): s for s in sources for p in s.packages}
+    source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
     asked, private = [], []
     for r in gaps:
         if r.package.version and condaforge.wanted(gap_targets(r, targets)):
@@ -1501,7 +1500,12 @@ def _main(argv: list[str]) -> int:
     # --online asks the index again but saves the answer, so a plain run afterwards doesn't go back to an older one.
     cached = {"read_cache": not (args.no_cache or args.online), "write_cache": not args.no_cache}
     other_index = fill_all(
-        packages, refresh=args.online, python=single_python(targets), simple_index=index_url, **cached
+        packages,
+        refresh=args.online,
+        pythons=tuple(dict.fromkeys(f"{t.major}.{t.minor}" for t in targets)),
+        simple_index=index_url,
+        read_cache=cached["read_cache"],
+        write_cache=cached["write_cache"],
     )
     if args.online and other_index and not quiet:
         print(
@@ -1588,7 +1592,7 @@ def _main(argv: list[str]) -> int:
     elsewhere = origin.other_index(index_url)
     index_how = "--index-url" if args.index_url is not None else "index-url in [tool.wheelgap]"
     notes_off = offline_how if offline else (index_how if elsewhere == "--index-url" else elsewhere)
-    source_of = {id(p): s for s in sources for p in s.packages}
+    source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
     if args.explain and notes_asked and notes_off and not quiet:
         print(
             f"wheelgap: note: the tracker's notes are off with {notes_off}, so no package names leave for "
@@ -1637,7 +1641,7 @@ def _main(argv: list[str]) -> int:
         # What each explained `source` release needs to build, from its sdist (only for packages positively from
         # PyPI: see build.where). Nothing here changes the exit code, and a release whose sdist gives no answer just
         # gets no line.
-        source_of = {id(p): s for s in sources for p in s.packages}
+        source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
         wanted = [(r.package, source_of[id(r.package)]) for r in gaps if source_targets(r, targets)]
         build_info, stopped = lookup_all(wanted, simple_index=index_url, **cached)
         if stopped is not None and not quiet:
