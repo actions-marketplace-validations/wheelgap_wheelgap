@@ -327,6 +327,12 @@ def test_build_targets_bad_glibc():
         build_targets(["3.13"], [], glibc="new")
 
 
+@pytest.mark.parametrize("pythons", [[], [""], [","], ["  ", " , "]])
+def test_build_targets_empty_python(pythons):
+    with pytest.raises(TargetError, match=r"no Python version given \(-p is empty\)"):
+        build_targets(pythons, ["linux"])
+
+
 def test_pyodide_tags_per_python():
     (t313,) = build_targets(["3.13"], ["pyodide"])
     assert accepts(t313, "x-1-cp313-cp313-pyodide_2025_0_wasm32.whl")

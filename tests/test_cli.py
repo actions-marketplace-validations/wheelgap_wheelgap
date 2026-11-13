@@ -823,6 +823,43 @@ def test_python_version_file_with_nothing_usable_uses_running_python(capsys, fix
     assert [t["python"] for t in json.loads(out)["targets"]] == [cli.running_python()]
 
 
+@pytest.mark.parametrize("flag", ["", ","])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_empty_python_flag_is_an_error(capsys, fixtures, flag, as_json):
+    args = [str(fixtures / "uvproj"), "-p", flag, "-t", "linux-x86_64"]
+    if as_json:
+        args.append("--json")
+    code, out, err = run(capsys, *args)
+    assert code == 2
+    assert "wheelgap: error: no Python version given (-p is empty)" in err
+    if as_json:
+        assert json.loads(out)["error"] == {
+            "message": "no Python version given (-p is empty)",
+            "type": "TargetError",
+        }
+    else:
+        assert not out
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_empty_python_in_config_is_an_error(capsys, fixtures, tmp_path, as_json):
+    project = project_with_lock(tmp_path, fixtures)
+    (project / "pyproject.toml").write_text('[tool.wheelgap]\npython = [""]\n', encoding="utf-8")
+    args = [str(project), "-t", "linux-x86_64"]
+    if as_json:
+        args.append("--json")
+    code, out, err = run(capsys, *args)
+    assert code == 2
+    assert "wheelgap: error: no Python version given (-p is empty)" in err
+    if as_json:
+        assert json.loads(out)["error"] == {
+            "message": "no Python version given (-p is empty)",
+            "type": "TargetError",
+        }
+    else:
+        assert not out
+
+
 def test_text_summary_lists_only_targets_with_gaps(capsys, fixtures):
     code, out, _ = run(
         capsys,

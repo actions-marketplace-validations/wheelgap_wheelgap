@@ -493,6 +493,8 @@ def build_targets(
     plats = resolve_platforms(platforms) or list(DEFAULT_PLATFORMS)
 
     pys = list(dict.fromkeys(parse_python(p) for item in pythons for p in item.split(",") if p.strip()))
+    if not pys:
+        raise TargetError("no Python version given (-p is empty)")
     versions = dict(
         glibc=parse_version_pair(glibc, "glibc"),
         musl=parse_version_pair(musl, "musl"),
