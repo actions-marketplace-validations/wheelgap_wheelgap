@@ -11,6 +11,7 @@ import sys
 import sysconfig
 import tomllib
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import packaging
@@ -18,11 +19,15 @@ from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 
-from . import __version__, cache
+from . import __version__, cache, condaforge, origin
+from . import notes as tracker
 from .api import running_python
-from .check import CELL, Row, Status, check, explain, has_sdist, marker_holds, reachable
+from .build import BuildInfo, describe, lookup_all, requires_for, shown
+from .check import CELL, EXPLAIN_LIMIT, Row, Status, check, explain, explain_lines, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
+from .github import github_annotations
 from .junit import write_junit
+from .logsafe import guarded_output, write_command
 from .offline import require_offline, undo_offline
 from .pyodide import (
     PyodideLock,
@@ -44,6 +49,9 @@ from .sources import (
     select_uv_dependencies,
     uv_selected_roots,
 )
+from .suggest_targets import render_text as render_suggestions
+from .suggest_targets import suggest
+from .suggest_targets import to_json as suggestions_json
 from .targets import (
     ALIASES,
     DEFAULT_ANDROID_API,
@@ -63,13 +71,13 @@ from .targets import (
     Target,
     TargetError,
     build_targets,
+    next_python_note,
     parse_api_level,
     parse_ios_version,
     parse_version_pair,
     resolve_distro,
     resolve_platform,
     resolve_platforms,
-    single_python,
 )
 
 EXAMPLES = """\
@@ -77,6 +85,7 @@ examples:
   wheelgap                                 check the lockfile in the current directory
   wheelgap uv.lock -t musl-aarch64         will my Alpine ARM image build from source?
   wheelgap -p 3.14t -t all                 is my stack ready for free-threaded 3.14?
+  wheelgap -p 3.14 -p next                 what blocks the move to the newest Python?
   wheelgap psycopg2 uvloop -t win-amd64    check packages without a lockfile
   wheelgap requirements.txt --json         machine-readable output for CI
   wheelgap -t alpine-arm64 --explain       show which wheels were rejected, and why
@@ -120,7 +129,7 @@ def make_parser() -> argparse.ArgumentParser:
         nargs="*",
         metavar="INPUT",
         help=(
-            "uv.lock, pylock.toml, poetry.lock, Pipfile.lock, requirements.txt, "
+            "uv.lock, pylock.toml, poetry.lock, Pipfile.lock, pixi.lock, requirements.txt, "
             "pyproject.toml (direct dependencies), a directory, or package specs (default: .)"
         ),
     )
@@ -130,7 +139,8 @@ def make_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="VER",
-        help=f"target Python, e.g. 3.13 or 3.14t (repeatable; default: .python-version, else {running_python()})",
+        help="target Python, e.g. 3.13, 3.14t, or next / next-t for the newest CPython wheelgap knows "
+        f"(repeatable; default: .python-version, else {running_python()})",
     )
     p.add_argument(
         "-t",
@@ -172,13 +182,27 @@ def make_parser() -> argparse.ArgumentParser:
         "--extra",
         action="append",
         metavar="NAME",
-        help="include a uv project extra, or a pyproject.toml optional-dependencies group (repeatable)",
+        help="include a uv or Poetry project extra, or a pyproject.toml optional-dependencies group (repeatable)",
     )
-    p.add_argument("--all-extras", action="store_true", help="include every uv project extra (or pyproject.toml extra)")
-    p.add_argument("--group", action="append", metavar="NAME", help="include a uv dependency group (repeatable)")
-    p.add_argument("--no-dev", action="store_true", help="exclude the default uv dev group")
     p.add_argument(
-        "--only-group", action="append", metavar="NAME", help="check only a uv dependency group (repeatable)"
+        "--all-extras", action="store_true", help="include every uv or Poetry project extra (or pyproject.toml extra)"
+    )
+    p.add_argument(
+        "--group",
+        action="append",
+        metavar="NAME",
+        help="include a dependency group (uv.lock, Poetry 2.x poetry.lock, pdm.lock; repeatable)",
+    )
+    p.add_argument(
+        "--no-dev", action="store_true", help="exclude the dev group (uv.lock, Poetry 2.x poetry.lock, pdm.lock)"
+    )
+    p.add_argument(
+        "--only-group", action="append", metavar="NAME", help="check only the named dependency groups (repeatable)"
+    )
+    p.add_argument(
+        "--environment",
+        metavar="NAME",
+        help="the pixi.lock environment to check (default: default)",
     )
     p.add_argument(
         "--online", action="store_true", help="re-check lockfile packages against PyPI instead of trusting the lockfile"
@@ -196,6 +220,26 @@ def make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
     p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
+    p.add_argument(
+        "--build-info",
+        action="store_true",
+        help="with --explain, read the sdist of each package that builds from source to say what the build needs "
+        "(downloads them from PyPI; also build-info = true)",
+    )
+    p.add_argument(
+        "--conda-forge",
+        action="store_true",
+        help="with --explain, also say when conda-forge has a package of the same name with builds for a gap's "
+        "platform (sends the names of PyPI packages with gaps to anaconda.org)",
+    )
+    p.add_argument(
+        "--notes",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="with --explain, also show the coverage tracker's notes for packages with gaps, which sends the names of "
+        "those from PyPI to wheelgap.github.io (never with --offline, --index-url or a WHEELGAP_INDEX_URL mirror; "
+        "--no-notes overrides notes = true)",
+    )
     p.add_argument(
         "-q",
         "--quiet",
@@ -222,7 +266,20 @@ def make_parser() -> argparse.ArgumentParser:
         help="ignore known package gaps (repeatable, comma-separated), on every target or only on TARGET "
         "(e.g. psycopg2:musl-x86_64); list ignored names in the report",
     )
+    p.add_argument(
+        "--advisory",
+        action="append",
+        default=[],
+        metavar="TARGET",
+        help="report gaps on TARGET (anything -t takes; repeatable, comma-separated) without letting them fail "
+        "the run; TARGET must be a checked target, and a group like all means the checked ones among its members",
+    )
     p.add_argument("--exit-zero", action="store_true", help="exit 0 even when gaps are found")
+    p.add_argument(
+        "--github-annotations",
+        action="store_true",
+        help="also mark each gap on its lockfile line in GitHub Actions (to stderr with --json or --markdown)",
+    )
     p.add_argument(
         "--fail-on",
         choices=FAIL_ON,
@@ -237,13 +294,22 @@ def make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     p.add_argument("--list-targets", action="store_true", help="list platforms, aliases and compatibility limits")
+    p.add_argument(
+        "--suggest-targets",
+        nargs="?",
+        const=".",
+        metavar="DIR",
+        help="suggest targets and Pythons from DIR's GitHub Actions workflows and Dockerfiles (default: .), "
+        "with a [tool.wheelgap] snippet; checks nothing",
+    )
     p.add_argument("-V", "--version", action="version", version=version_string())
     return p
 
 
 FAIL_ON = ("source", "missing")
-LIST_KEYS = ("python", "targets", "ignore", "extras", "groups")
+LIST_KEYS = ("python", "targets", "ignore", "extras", "groups", "advisory")
 STR_KEYS = ("glibc", "musl", "macos", "ios", "android-api", "fail-on", "distro", "pyodide-lock", "index-url")
+BOOL_KEYS = ("quiet", "offline", "notes", "build-info")
 
 
 def project_dir(inputs: list[str]) -> Path:
@@ -312,7 +378,7 @@ def load_config(path: Path) -> dict:
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be {example}")
             if key == "fail-on" and value not in FAIL_ON:
                 raise SourceError(f"{path}: [tool.wheelgap] fail-on must be one of: {', '.join(FAIL_ON)}")
-        elif key in ("quiet", "offline"):
+        elif key in BOOL_KEYS:
             if not isinstance(value, bool):
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be a boolean")
         else:
@@ -346,7 +412,8 @@ def load_uv_targets(path: Path, pythons: list[str]) -> list[str]:
         # e.g. a mobile-only project, or `wheelgap requests` run in a project folder: don't fail the run
         print(
             f"wheelgap: note: {path} [tool.uv] required-environments matches none of the native targets "
-            f"for Python {', '.join(pythons)}, so the default targets are checked; select targets with -t",
+            f"for Python {', '.join(dict.fromkeys(t.python for t in targets))}, so the default targets are checked; "
+            "select targets with -t",
             file=sys.stderr,
         )
     return platforms
@@ -417,9 +484,74 @@ def hidden_line(hidden: list[Row]) -> str:
     return " and ".join(parts) + " hidden"
 
 
-def render_table(rows: list[Row], targets: list[Target], style: Style) -> list[str]:
+GAP_STATUSES = (Status.SOURCE, Status.MISSING, Status.UNKNOWN)
+
+
+def heading(target: Target, multi_py: bool, advisory: frozenset[Target]) -> str:
+    """A target's column heading: its label, marked when --advisory makes its gaps not fail the run."""
+    label = target.label(multi_py)
+    return f"{label} (advisory)" if target in advisory else label
+
+
+def required_statuses(row: Row, advisory: frozenset[Target]) -> list[Status]:
+    """The results that can fail the run: every target's except ignored (NAME:TARGET) and advisory ones."""
+    return [s for t, s in row.results.items() if t not in row.ignored and t not in advisory]
+
+
+def advisory_line(rows: list[Row], targets: list[Target], advisory: frozenset[Target]) -> str:
+    """'4 gaps in 2 packages on advisory targets win-arm64, 3.14t linux-x86_64 don't fail the run.', or ''.
+
+    It counts cells (a package with gaps on two advisory targets has two), so it names the packages too: the gap
+    summary above it counts packages.
+    """
     multi_py = len({t.python for t in targets}) > 1
-    headers = ["package", "version"] + [t.label(multi_py) for t in targets]
+    cells = [
+        (r, t) for r in rows for t in targets if t in advisory and t not in r.ignored and r.results[t] in GAP_STATUSES
+    ]
+    if not cells:
+        return ""
+    labels = [t.label(multi_py) for t in targets if any(t is cell_target for _, cell_target in cells)]
+    n, packages = len(cells), len({id(r) for r, _ in cells})
+    return (
+        f"{n} gap{'s' * (n != 1)} in {packages} package{'s' * (packages != 1)} on advisory "
+        f"target{'s' * (len(labels) != 1)} {', '.join(labels)} {'do' if n != 1 else 'does'}n't fail the run."
+    )
+
+
+# -t names that stand for several platforms (see resolve_platforms): as --advisory values they mean the checked ones.
+PLATFORM_GROUPS = ("all", "everything", "mobile")
+
+
+def resolve_advisory(values: list[str], how: str, docker_musl: bool, checked: list[str]) -> tuple[list[str], list[str]]:
+    """The checked platforms --advisory (or advisory = [...]) names, and the entries that name none of them.
+
+    A single target (a name, an alias, a Docker name) must be checked itself. A group such as all stands for the
+    checked targets among its members, so `-t linux-x86_64,win-arm64 --advisory all` marks both; it names none
+    only when no member is checked.
+    """
+    platforms: list[str] = []
+    unchecked: list[str] = []
+    for value in values:
+        for entry in (part.strip() for part in value.split(",")):
+            if not entry:
+                continue
+            try:
+                members = resolve_platforms([musl_docker_names(entry) if docker_musl else entry])
+            except TargetError as e:
+                raise TargetError(f"{how}: {e}") from None
+            hits = [p for p in members if p in checked]
+            if hits and (entry.lower() in PLATFORM_GROUPS or len(hits) == len(members)):
+                platforms += hits
+            else:
+                unchecked.append(entry)
+    return list(dict.fromkeys(platforms)), unchecked
+
+
+def render_table(
+    rows: list[Row], targets: list[Target], style: Style, advisory: frozenset[Target] = frozenset()
+) -> list[str]:
+    multi_py = len({t.python for t in targets}) > 1
+    headers = ["package", "version"] + [heading(t, multi_py, advisory) for t in targets]
     body = []
     for r in rows:
         cells = [r.package.name, r.package.version or "?"]
@@ -443,18 +575,66 @@ def render_table(rows: list[Row], targets: list[Target], style: Style) -> list[s
     return out
 
 
-EXPLAIN_LIMIT = 8
-
-
 def gap_targets(row: Row, targets: list[Target]) -> list[Target]:
     return [t for t in targets if row.results[t] in (Status.SOURCE, Status.MISSING) and t not in row.ignored]
 
 
-def render_explain(rows: list[Row], targets: list[Target], style: Style) -> list[str]:
+RowNotes = dict[int, list[tuple[tracker.Note, list[Target]]]]
+"""The tracker's notes that apply to a row's gaps, keyed by id(row), each with the gap targets it covers."""
+
+
+def notes_eligible(row: Row, targets: list[Target], source_of: dict[int, Source]) -> bool:
+    """Whether --notes would look this row's package up: it has a gap, and it's positively a PyPI package
+    (tracker.may_send). `source_of` maps id() of each package to the input it was read from."""
+    source = source_of.get(id(row.package))
+    return source is not None and bool(gap_targets(row, targets)) and tracker.may_send(row.package, source)
+
+
+def tracker_notes(
+    rows: list[Row], targets: list[Target], source_of: dict[int, Source], read_cache: bool, write_cache: bool
+) -> tuple[RowNotes, str | None]:
+    """--explain --notes: the coverage tracker's notes for each row with a gap, and why the lookups were cut short,
+    if they were (see tracker.lookup).
+
+    Only names positively from PyPI are looked up (notes_eligible). A note is kept for the gap targets on its
+    platforms (and its Pythons, if it lists any: Note.covers), and only when it's about the checked release
+    (Note.applies_to): the tracker checked its latest release, which may not be yours.
+    """
+    eligible = [r for r in rows if notes_eligible(r, targets, source_of)]
+    found, cut = tracker.lookup([r.package.key for r in eligible], read_cache, write_cache)
+    out: RowNotes = {}
+    for r in eligible:
+        if r.package.key not in found:
+            continue
+        gaps = gap_targets(r, targets)
+        matched = [(note, [t for t in gaps if note.covers(t)]) for note in found[r.package.key]]
+        if kept := [(note, ts) for note, ts in matched if ts and note.applies_to(r.package.version)]:
+            out[id(r)] = kept
+    return out, cut
+
+
+def source_targets(row: Row, targets: list[Target]) -> list[Target]:
+    """The targets where --explain explains a `source` cell of this row (a gap that isn't ignored)."""
+    return [t for t in gap_targets(row, targets) if row.results[t] == Status.SOURCE]
+
+
+def render_explain(
+    rows: list[Row],
+    targets: list[Target],
+    style: Style,
+    conda_forge: dict[int, condaforge.Hint] | None = None,
+    notes: RowNotes | None = None,
+    build_info: dict[int, BuildInfo] | None = None,
+) -> list[str]:
+    """`conda_forge`: --conda-forge hints and `build_info`: --build-info answers, by id() of the row's package.
+    `notes`: --notes, by id() of the row."""
     multi_py = len({t.python for t in targets}) > 1
     out = []
     for r in rows:
         files = r.package.files or []
+        info = (build_info or {}).get(id(r.package))
+        sources = source_targets(r, targets)
+        needs = describe(info, sources) if info and sources else None
         for t in gap_targets(r, targets):
             cell, color = CELL[r.results[t]]
             head = f"{r.package.name} {r.package.version or '?'} on {t.label(multi_py)}:"
@@ -462,16 +642,23 @@ def render_explain(rows: list[Row], targets: list[Target], style: Style) -> list
             path = r.via.get(t, [])
             if len(path) >= 2:  # a lone name says nothing about why the package is there
                 out.append(f"  via: {' → '.join(path)}")
-            rejected = explain(files, t)
-            if not rejected:
-                out.append(style.dim("  no wheels published for this version"))
-            width = max((len(f) for f, _ in rejected[:EXPLAIN_LIMIT]), default=0)
-            for f, reason in rejected[:EXPLAIN_LIMIT]:
-                out.append(f"  {f.ljust(width)}  {style.dim(reason)}")
-            if len(rejected) > EXPLAIN_LIMIT:
-                out.append(style.dim(f"  … and {len(rejected) - EXPLAIN_LIMIT} more (--json lists them all)"))
-            if not t.builds_sdists and has_sdist(files):
-                out.append(style.dim(f"  there is an sdist, but {t.platform} can't build packages from source"))
+            if needs and r.results[t] == Status.SOURCE:  # once per release, under its first source cell
+                out.append(f"  build needs: {needs}")
+                needs = None
+            lines = explain_lines(files, t, yanked=r.package.yanked, limit=EXPLAIN_LIMIT, dim=style.dim, align=True)
+            out += [f"  {line}" for line in lines]
+            out.append("")
+        if conda_forge and (h := conda_forge.get(id(r.package))):
+            out += [condaforge.hint_text(r.package, h, multi_py), ""]
+        for note, ts in (notes or {}).get(id(r), []):
+            # Printed as is: a note is one line of plain text (tracker.parse). It can't hold a GitHub Actions workflow
+            # command either: tracker.parse drops a note with "##[" or a word starting with "::", and the text never
+            # starts a line, since it follows "  - " (the runner only reads "::" at the start of a line).
+            platforms = ", ".join(dict.fromkeys(t.platform for t in ts))
+            head = f"{r.package.name} {r.package.version or '?'}: note from the wheelgap tracker for {platforms}"
+            out.append(f"{style.bold(head)} {style.dim(f'({note.kind}, checked {note.updated})')}")
+            out.append(f"  - {note.text}")
+            out += [f"    {link}" for link in note.links]
             out.append("")
     return out
 
@@ -489,6 +676,66 @@ def bundled_line(rows: list[Row], lock: PyodideLock) -> str:
     return f"{len(rows)} {noun} from Pyodide {lock.pyodide_version}'s own builds: " + ", ".join(map(one, rows))
 
 
+_OK = (Status.WHEEL, Status.NOT_NEEDED, Status.BUNDLED)
+
+
+@dataclass(frozen=True)
+class Blocking:
+    """What blocks the move to the newer of two checked Pythons (see blocking_newer_python)."""
+
+    older: str
+    newer: str
+    names: list[str]  # packages with a gap on the newer Python only
+    unchecked: int  # other packages that couldn't be checked on the newer Python, so may block it too
+
+
+def blocking_newer_python(rows: list[Row], targets: list[Target]) -> Blocking | None:
+    """With exactly two Pythons checked, one newer: the packages that block the upgrade.
+
+    It's decided per package name, over every row (input or forked version) of it: a package blocks the upgrade
+    when, on some platform, the newer Python has a gap (source or missing) and every result for the older Python is
+    a wheel, n/a or bundled. Gaps the older Python has too and ignored targets don't count. A package that is unknown
+    on the newer Python isn't listed, but is counted in `unchecked`, since it may block the upgrade too.
+    """
+    by_python: dict[str, dict[str, Target]] = {}
+    for t in targets:
+        by_python.setdefault(t.python, {})[t.platform] = t
+    if len(by_python) != 2:
+        return None
+    older, newer = sorted(by_python.values(), key=lambda ts: next((t.major, t.minor) for t in ts.values()))
+    old, new = next(iter(older.values())), next(iter(newer.values()))
+    if (old.major, old.minor) == (new.major, new.minor):  # 3.14 and 3.14t: neither is newer
+        return None
+    by_name: dict[str, list[Row]] = {}
+    for r in rows:
+        by_name.setdefault(r.package.key, []).append(r)
+    names, unchecked = [], 0
+    for group in by_name.values():
+
+        def results(t: Target, group: list[Row] = group) -> list[Status]:
+            return [r.results[t] for r in group if t not in r.ignored]
+
+        if any(
+            any(s in (Status.SOURCE, Status.MISSING) for s in results(t)) and all(s in _OK for s in results(older[p]))
+            for p, t in newer.items()
+        ):
+            names.append(group[0].package.name)
+        elif any(Status.UNKNOWN in results(t) for t in newer.values()):
+            unchecked += 1
+    return Blocking(old.python, new.python, names, unchecked)
+
+
+def blocking_line(blocking: Blocking) -> str:
+    """'blocking 3.15: numpy, pydantic-core' (see blocking_newer_python)."""
+    n = blocking.unchecked
+    unchecked = f"{n} package{'s' * (n != 1)} couldn't be checked" if n else ""
+    if blocking.names:
+        return f"blocking {blocking.newer}: {', '.join(blocking.names)}" + (f" ({unchecked})" if n else "")
+    if n:
+        return f"blocking {blocking.newer}: none known ({unchecked})"
+    return f"blocking {blocking.newer}: none (every gap on {blocking.newer} is on {blocking.older} too)"
+
+
 def report_json(
     rows: list[Row],
     targets: list[Target],
@@ -497,9 +744,14 @@ def report_json(
     ignored: list[tuple[str, list[str] | None]],
     explained: bool,
     pyodide_lock: PyodideLock | None = None,
+    advisory: frozenset[Target] = frozenset(),
+    conda_forge: dict[int, condaforge.Hint] | None = None,
+    notes: RowNotes | None = None,
+    build_info: dict[int, BuildInfo] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
+    blocking = blocking_newer_python(rows, targets)
 
     def package(r: Row) -> dict:
         out: dict[str, object] = {
@@ -513,28 +765,45 @@ def report_json(
             out["bundled_version_differs"] = bundled_version_differs(r.package, pyodide_lock)
         if explained:
             out["rejected"] = {
-                t.label(multi_py): [{"file": f, "reason": why} for f, why in explain(r.package.files or [], t)]
+                t.label(multi_py): [
+                    {"file": f, "reason": why} for f, why in explain(r.package.files or [], t, r.package.yanked)
+                ]
                 for t in gap_targets(r, targets)
             }
             # Same targets as `rejected`, minus any without a path (inputs with no dependency graph).
             out["via"] = {t.label(multi_py): r.via[t] for t in gap_targets(r, targets) if t in r.via}
+            if conda_forge and (h := conda_forge.get(id(r.package))):
+                out["conda_forge"] = {
+                    "name": h.name,
+                    "version": h.version,
+                    "builds": {t.label(multi_py): subdirs for t, subdirs in h.builds.items()},
+                }
+            # The tracker's notes for this package's gaps, each with the gap targets it covers.
+            out["notes"] = [
+                {**note.as_json(), "targets": [t.label(multi_py) for t in ts]}
+                for note, ts in (notes or {}).get(id(r), [])
+            ]
+            if build_info is not None:  # --build-info: what the sdist requires, on the targets that build it
+                info, sources = build_info.get(id(r.package)), source_targets(r, targets)
+                out["build_requires"] = [shown(q) for q in requires_for(info, sources)] if info and sources else None
         return out
 
-    return json.dumps(
-        {
-            "version": __version__,
-            "sources": sources,
-            "targets": [{"label": t.label(multi_py), "python": t.python, "platform": t.platform} for t in targets],
-            "packages": [package(r) for r in rows],
-            "skipped": [{"name": p.name, "reason": p.skip} for p in skipped],
-            "ignored": [name for name, platforms in ignored if platforms is None],
-            "ignored_targets": [
-                {"name": name, "platforms": platforms} for name, platforms in ignored if platforms is not None
-            ],
-            "summary": {"packages": len(rows), "with_gaps": len(gaps), "per_target": target_counts(gaps, targets)},
-        },
-        indent=2,
-    )
+    report: dict[str, object] = {
+        "version": __version__,
+        "sources": sources,
+        "targets": [{"label": t.label(multi_py), "python": t.python, "platform": t.platform} for t in targets],
+        "packages": [package(r) for r in rows],
+        "skipped": [{"name": p.name, "reason": p.skip} for p in skipped],
+        "ignored": [name for name, platforms in ignored if platforms is None],
+        "ignored_targets": [
+            {"name": name, "platforms": platforms} for name, platforms in ignored if platforms is not None
+        ],
+        "advisory": [t.label(multi_py) for t in targets if t in advisory],
+        "summary": {"packages": len(rows), "with_gaps": len(gaps), "per_target": target_counts(gaps, targets)},
+    }
+    if blocking is not None:
+        report["blocking_newer_python"] = blocking.names
+    return json.dumps(report, indent=2)
 
 
 def libc_versions(args: argparse.Namespace, config: dict) -> tuple[str, str]:
@@ -665,10 +934,22 @@ def target_counts_text(counts: dict[str, int], style: Style) -> str:
     return ", ".join(parts)
 
 
-def target_lines(gaps: list[Row], targets: list[Target], style: Style) -> list[str]:
+def shown_target_lines(
+    gaps: list[Row], targets: list[Target], style: Style, advisory: frozenset[Target]
+) -> list[tuple[str, str]]:
+    """shown_target_counts as (heading, counts text) pairs, with advisory targets marked as in the table."""
+    multi_py = len({t.python for t in targets}) > 1
+    headings = {t.label(multi_py): heading(t, multi_py, advisory) for t in targets}
     per_target = shown_target_counts(gaps, targets)
-    width = max(map(len, per_target), default=0)
-    return [f"{label:<{width}}  {target_counts_text(counts, style)}" for label, counts in per_target.items()]
+    return [(headings[label], target_counts_text(counts, style)) for label, counts in per_target.items()]
+
+
+def target_lines(
+    gaps: list[Row], targets: list[Target], style: Style, advisory: frozenset[Target] = frozenset()
+) -> list[str]:
+    lines = shown_target_lines(gaps, targets, style, advisory)
+    width = max((len(head) for head, _ in lines), default=0)
+    return [f"{head:<{width}}  {text}" for head, text in lines]
 
 
 _MD_SPECIAL = re.compile(r"([\\`*_\[\]<>#|~&])")
@@ -697,6 +978,10 @@ def render_markdown(
     args: argparse.Namespace,
     pyodide_lock: PyodideLock | None,
     source_allowed: bool = False,
+    advisory: frozenset[Target] = frozenset(),
+    conda_forge: dict[int, condaforge.Hint] | None = None,
+    notes: RowNotes | None = None,
+    build_info: dict[int, BuildInfo] | None = None,
 ) -> list[str]:
     """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment)."""
     plain = Style(False)
@@ -718,7 +1003,7 @@ def render_markdown(
     shown = rows if args.all else gaps
     if shown:
         multi_py = len({t.python for t in targets}) > 1
-        headers = ["package", "version"] + [t.label(multi_py) for t in targets]
+        headers = ["package", "version"] + [heading(t, multi_py, advisory) for t in targets]
         out.append("| " + " | ".join(_md(h) for h in headers) + " |")
         out.append("| " + " | ".join("---" for _ in headers) + " |")
         for r in shown:
@@ -730,18 +1015,22 @@ def render_markdown(
             out += [f"{hidden_line(hidden)} (`--all` to show).", ""]
 
     if gaps:
-        per_target = shown_target_counts(gaps, targets)
+        per_target = shown_target_lines(gaps, targets, plain, advisory)
         if per_target:
-            out += [f"- {_md(label)}: {target_counts_text(counts, plain)}" for label, counts in per_target.items()]
+            out += [f"- {_md(head)}: {text}" for head, text in per_target]
             out.append("")
         out += [gap_summary(gaps, len(rows), plain), ""]
+        if blocking := blocking_newer_python(rows, targets):
+            out += [_md(blocking_line(blocking)), ""]
+        if line := advisory_line(rows, targets, advisory):
+            out += [_md(line), ""]
         if source_allowed:
             out += ["Source builds are allowed (fail-on missing), so this run passes.", ""]
     bundled = [r for r in rows if Status.BUNDLED in r.results.values()]
     if bundled and pyodide_lock:
         out += [_md(bundled_line(bundled, pyodide_lock)), ""]
     if skipped:
-        names = ", ".join(f"{_code(p.name)} ({p.skip})" for p in skipped)
+        names = skipped_list(skipped, _code)
         out += [f"Skipped {len(skipped)} non-index package{'s' * (len(skipped) != 1)}: {names}", ""]
     if ignored:
         out += [f"Ignored: {ignored_list(ignored, _code)}", ""]
@@ -749,10 +1038,25 @@ def render_markdown(
         if r.package.error:
             out += [f"Could not check {_md(r.package.name)}: {_code(r.package.error)}", ""]
     if args.explain and gaps:
-        # Fenced, so wheel filenames and reasons need no escaping.
-        lines = render_explain(gaps, targets, plain)
-        out += ["<details><summary>Why (rejected wheels)</summary>", "", "```", *lines, "```", "", "</details>", ""]
+        # Fenced, so wheel filenames, reasons and the tracker's notes need no escaping: inside a code block, Markdown
+        # and HTML are shown as text. The fence is longer than any run of backticks in it, so nothing can close it.
+        lines = render_explain(gaps, targets, plain, conda_forge, notes, build_info)
+        fence = "`" * max([3, *(len(run) + 1 for line in lines for run in re.findall(r"`+", line))])
+        out += ["<details><summary>Why (rejected wheels)</summary>", "", fence, *lines, fence, "", "</details>", ""]
     return out
+
+
+# A pixi environment often has 100+ conda packages: past this many, text and Markdown count them (--json lists them).
+CONDA_LISTED = 5
+
+
+def skipped_list(skipped: list[Package], name: Callable[[str], str] = str) -> str:
+    """Each skipped package and why, with more than CONDA_LISTED conda packages counted rather than listed."""
+    conda = sum(1 for p in skipped if p.skip == "conda")
+    items = [f"{name(p.name)} ({p.skip})" for p in skipped if p.skip != "conda" or conda <= CONDA_LISTED]
+    if conda > CONDA_LISTED:
+        items.append(f"{conda} conda packages (not on PyPI)")
+    return ", ".join(items)
 
 
 def ignored_list(ignored: list[tuple[str, list[str] | None]], name: Callable[[str], str] = str) -> str:
@@ -852,6 +1156,53 @@ def note_unpinned_requirements(sources: list[Source]) -> None:
         )
 
 
+def _names(names: list[str]) -> str:
+    return ", ".join(names[:3]) + (", …" if len(names) > 3 else "")
+
+
+def conda_forge_hints(
+    gaps: list[Row], targets: list[Target], sources: list[Source], index_url: str | None, quiet: bool, cached: dict
+) -> dict[int, condaforge.Hint]:
+    """--conda-forge: look the gap packages up on anaconda.org and return their hints, by id() of the package. Only
+    names that are positively PyPI's are sent; notes on stderr say which packages weren't looked up, and why."""
+    other = origin.other_index(index_url)
+    if other is not None and not quiet:
+        print(
+            "wheelgap: note: --conda-forge looks nothing up when packages come from another index "
+            f"({other}), so no package names leave it",
+            file=sys.stderr,
+        )
+    source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
+    asked, private = [], []
+    for r in gaps:
+        if r.package.version and condaforge.wanted(gap_targets(r, targets)):
+            if origin.known_pypi(r.package, source_of[id(r.package)], simple_index=index_url):
+                asked.append(r)
+            else:
+                private.append(r.package.name)
+    if private and other is None and not quiet:
+        private = list(dict.fromkeys(private))
+        print(
+            f"wheelgap: note: --conda-forge didn't look up {len(private)} package{'s' * (len(private) != 1)} "
+            f"whose index isn't known to be PyPI ({_names(private)}), so their names stay private",
+            file=sys.stderr,
+        )
+    lookups = condaforge.look_up_all([(r.package.key, r.package.version or "") for r in asked], **cached)
+    if lookups.unchecked and not quiet:
+        n = len(lookups.unchecked)
+        which = _names([f"{name} ({why})" for name, why in lookups.unchecked.items()])
+        print(
+            f"wheelgap: note: --conda-forge couldn't check {n} package{'s' * (n != 1)}: {which}; "
+            "no hint doesn't mean conda-forge has no build",
+            file=sys.stderr,
+        )
+    hints = {}
+    for r in asked:
+        if h := condaforge.hint(r.package, gap_targets(r, targets), lookups.found):
+            hints[id(r.package)] = h
+    return hints
+
+
 def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         # Don't crash printing ✓ to a non-UTF-8 pipe (e.g. Windows cp1252).
@@ -865,6 +1216,20 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 reconfigure(errors="replace")
     argv = sys.argv[1:] if argv is None else argv
+    # `wheelgap mcp`: the MCP server (as `wheelgap-mcp`), so MCP registries can start it from the `wheelgap` package
+    # (`uvx wheelgap@VERSION mcp`). Unlike diff, a file or folder named mcp here doesn't make it an input: the MCP
+    # client picks the working directory, often a project with an mcp/ folder. `wheelgap ./mcp` checks such a folder,
+    # and `wheelgap mcp==1.0` the PyPI package. Its stdout is the protocol, not a log, so it isn't guarded.
+    if argv[:1] == ["mcp"]:
+        from .mcp import main as mcp_main
+
+        return mcp_main(argv[1:], prog="wheelgap mcp")
+    # Lockfile text must never run as a GitHub Actions workflow command in a CI log (see logsafe).
+    with guarded_output():
+        return _main(argv)
+
+
+def _main(argv: list[str]) -> int:
     # `wheelgap diff OLD NEW`: a subcommand only when "diff" comes first and isn't a file or folder here, so
     # `wheelgap ./diff` still checks a folder named diff (and `wheelgap diff==1.0` the PyPI package).
     if argv[:1] == ["diff"]:
@@ -884,6 +1249,37 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--list-targets has no Markdown form (use --json)")
     if args.offline and args.online:
         parser.error("--offline and --online can't be used together")
+    if args.suggest_targets is not None:
+        if args.markdown:
+            parser.error("--suggest-targets has no Markdown form (use --json)")
+        if args.inputs:
+            parser.error("--suggest-targets takes the project folder as its value: --suggest-targets DIR")
+        given = [
+            flag
+            for flag, value in (
+                ("-p", args.python),
+                ("-t", args.target),
+                ("--dockerfile", args.dockerfile),
+                ("--list-targets", args.list_targets),
+            )
+            if value
+        ]
+        if given:
+            parser.error(f"--suggest-targets only suggests, so it can't be used with {', '.join(given)}")
+        try:
+            found = suggest(Path(args.suggest_targets))
+        except OSError as e:
+            print(f"wheelgap: error: {e}", file=sys.stderr)
+            return input_error_json(e) if args.json else 2
+        if args.json:
+            print(json.dumps(suggestions_json(found), indent=2))
+        else:
+            print("\n".join(render_suggestions(found)))
+        return 0
+    if args.conda_forge and not args.explain:
+        parser.error("--conda-forge only adds to --explain; pass --explain too")
+    if args.notes and not args.explain:
+        parser.error("--notes only adds to --explain; pass --explain too")
     try:
         if args.clear_cache:
             folder, count = cache.clear()
@@ -935,12 +1331,40 @@ def main(argv: list[str] | None = None) -> int:
             args.ios or config.get("ios", DEFAULT_IOS),
             args.android_api or config.get("android-api", DEFAULT_ANDROID_API),
         )
+        if not quiet and (resolved := next_python_note(pythons)):
+            print(f"wheelgap: note: {resolved}", file=sys.stderr)
         ignore_how = "--ignore" if args.ignore else "ignore in [tool.wheelgap]"
         ignores = [
             entry
             for value in args.ignore or config.get("ignore", [])
             for entry in split_ignore_value(value, ignore_how, docker_musl)
         ]
+        # Like --ignore, --advisory replaces the configured list (and --advisory "" clears it).
+        advisory_how = "--advisory" if args.advisory else "advisory in [tool.wheelgap]"
+        checked_platforms = list(dict.fromkeys(t.platform for t in targets))
+        advisory_platforms, unchecked_advisory = resolve_advisory(
+            args.advisory or config.get("advisory", []), advisory_how, docker_musl, checked_platforms
+        )
+        if unchecked_advisory:
+            if args.advisory:  # asked for on this run, so not checking it is a mistake
+                raise TargetError(
+                    f"--advisory {', '.join(unchecked_advisory)}: matches no checked target "
+                    f"(this run checks {', '.join(checked_platforms)}); add it to -t as well"
+                )
+            if not quiet:  # a project default for runs that check other targets (-t, --dockerfile): say so
+                print(
+                    f"wheelgap: note: advisory in [tool.wheelgap] names targets this run doesn't check: "
+                    f"{', '.join(unchecked_advisory)}",
+                    file=sys.stderr,
+                )
+        advisory = frozenset(t for t in targets if t.platform in advisory_platforms)
+        if advisory and len(advisory) == len(targets) and not quiet:
+            # Then nothing can fail the run, not even a failed lookup (unknown) during an index outage.
+            print(
+                f"wheelgap: note: every checked target is advisory ({advisory_how}), so this run won't fail, "
+                "not even when a lookup fails",
+                file=sys.stderr,
+            )
         index_url = args.index_url if args.index_url is not None else config.get("index-url")
         if index_url is not None:
             _, auth = split_credentials(index_url)
@@ -951,7 +1375,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
         else:
             check_index_url()  # WHEELGAP_INDEX_URL only matters for the JSON API
-        sources = load_inputs(args.inputs or ["."])
+        sources = load_inputs(args.inputs or ["."], args.environment)
+        for source in sources:
+            if source.passed_over is not None and not quiet:
+                print(
+                    f"wheelgap: note: {source.path} was checked; {source.passed_over} is in the same folder too "
+                    "(pass it, or --environment, to check it instead)",
+                    file=sys.stderr,
+                )
         extra_names = args.extra if args.extra is not None else config.get("extras")
         group_names = args.group if args.group is not None else config.get("groups")
         if args.only_group:
@@ -963,7 +1394,7 @@ def main(argv: list[str] | None = None) -> int:
             group_names = [name for name in group_names if canonicalize_name(name) != "dev"]
         from_cli = args.extra is not None or args.group is not None or args.all_extras or args.no_dev
         # pyproject.toml inputs take --extra / --all-extras for [project] optional-dependencies. Configured
-        # extras stay uv.lock-only, and [dependency-groups] isn't read.
+        # extras don't apply to them, and [dependency-groups] isn't read.
         pyproject_sources = [s for s in sources if s.pyproject_extras is not None]
         lock_sources = [s for s in sources if s.pyproject_extras is None]
         if pyproject_sources:
@@ -986,14 +1417,20 @@ def main(argv: list[str] | None = None) -> int:
                     no_dev=args.no_dev,
                     only_groups=frozenset(canonicalize_name(name) for name in args.only_group or []),
                 ),
-                # Configured extras apply to uv.lock inputs only, configured groups to uv.lock, Poetry 2.x
-                # poetry.lock and pdm.lock inputs; on the command line they need one of those.
+                # Configured extras apply to uv.lock and Poetry 2.x poetry.lock inputs, configured groups to those
+                # and pdm.lock inputs; on the command line they need one of those.
                 strict=bool(from_cli or args.only_group),
                 configured_extras=args.extra is None and extra_names is not None,
-                poetry=bool(from_cli or args.only_group) or group_names is not None,
+                poetry=bool(from_cli or args.only_group) or group_names is not None or extra_names is not None,
+                pdm=bool(from_cli or args.only_group) or group_names is not None,
             )
         if offline:
             require_offline(sources, offline_how, simple_index=index_url)
+            if args.conda_forge:
+                raise SourceError(
+                    f"{offline_how}: --conda-forge would look packages up on anaconda.org; "
+                    f"drop --conda-forge, or {undo_offline(offline_how)}"
+                )
         fail_on = args.fail_on or config.get("fail-on", "source")
         pyodide_lock = None
         if args.pyodide_lock:
@@ -1019,6 +1456,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if not quiet:
         note_unpinned_requirements(sources)
+        for source in sources:
+            if source.poetry_extras_unsure is not None:
+                print(f"wheelgap: note: {source.label}: {source.poetry_extras_unsure}", file=sys.stderr)
     for source in sources:
         if source.pyproject_extras is not None:  # always: this answer differs from a lockfile's
             print(
@@ -1060,7 +1500,12 @@ def main(argv: list[str] | None = None) -> int:
     # --online asks the index again but saves the answer, so a plain run afterwards doesn't go back to an older one.
     cached = {"read_cache": not (args.no_cache or args.online), "write_cache": not args.no_cache}
     other_index = fill_all(
-        packages, refresh=args.online, python=single_python(targets), simple_index=index_url, **cached
+        packages,
+        refresh=args.online,
+        pythons=tuple(dict.fromkeys(f"{t.major}.{t.minor}" for t in targets)),
+        simple_index=index_url,
+        read_cache=cached["read_cache"],
+        write_cache=cached["write_cache"],
     )
     if args.online and other_index and not quiet:
         print(
@@ -1140,26 +1585,116 @@ def main(argv: list[str] | None = None) -> int:
             r.ignored = frozenset(t for t in targets if t.platform in ignore_on[r.package.key])
     gaps = [r for r in rows if not r.ok]
     source_labels = [s.label for s in sources]
-    # With --fail-on missing, source builds are accepted; missing and unknown packages still fail.
-    failing = gaps if fail_on == "source" else [r for r in gaps if r.fails_install]
+    row_notes: RowNotes = {}
+    # Opt-in, since it sends package names to wheelgap.github.io: --explain on a lockfile makes no requests by default.
+    # Never offline, nor when packages come from another index (--index-url, a WHEELGAP_INDEX_URL mirror).
+    notes_asked = args.notes if args.notes is not None else config.get("notes")
+    elsewhere = origin.other_index(index_url)
+    index_how = "--index-url" if args.index_url is not None else "index-url in [tool.wheelgap]"
+    notes_off = offline_how if offline else (index_how if elsewhere == "--index-url" else elsewhere)
+    source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
+    if args.explain and notes_asked and notes_off and not quiet:
+        print(
+            f"wheelgap: note: the tracker's notes are off with {notes_off}, so no package names leave for "
+            "wheelgap.github.io",
+            file=sys.stderr,
+        )
+    elif args.explain and gaps and not notes_off:
+        if notes_asked:
+            row_notes, cut = tracker_notes(gaps, targets, source_of, **cached)
+            if cut and not quiet:
+                why = (
+                    "wheelgap.github.io didn't answer in time"
+                    if cut == tracker.TIMED_OUT
+                    else "couldn't reach wheelgap.github.io"
+                )
+                print(
+                    Style(use_color(args.color)).dim(
+                        f"wheelgap: note: {why}, so some of the tracker's notes may be missing"
+                    ),
+                    file=sys.stderr,
+                )
+        elif notes_asked is None and not quiet and any(notes_eligible(r, targets, source_of) for r in gaps):
+            print(
+                Style(use_color(args.color)).dim(
+                    "wheelgap: add --notes to show the tracker's notes for these packages "
+                    "(sends their names to wheelgap.github.io)"
+                ),
+                file=sys.stderr,
+            )
+    conda_forge = conda_forge_hints(gaps, targets, sources, index_url, quiet, cached) if args.conda_forge else {}
+    # With --fail-on missing, source builds are accepted; missing and unknown packages still fail. Gaps on
+    # --advisory targets never fail the run.
+    fail_statuses = GAP_STATUSES if fail_on == "source" else (Status.MISSING, Status.UNKNOWN)
+    failing = [r for r in gaps if any(s in fail_statuses for s in required_statuses(r, advisory))]
     code = 0 if args.exit_zero or not failing else 1
+    # The run passes only because --fail-on missing accepts a source build on a required target.
+    source_allowed = not failing and any(Status.SOURCE in required_statuses(r, advisory) for r in gaps)
+
+    build_info: dict[int, BuildInfo] | None = None  # None: not asked for
+    off_by = origin.other_index(index_url) or origin.index_env()  # no package counts as PyPI's for sure
+    if args.explain and (args.build_info or config.get("build-info", False)) and not offline and off_by:
+        if not quiet:
+            note = f"wheelgap: note: --build-info is off: packages may come from another index ({off_by})"
+            print(Style(use_color(args.color)).dim(note), file=sys.stderr)
+    elif args.explain and (args.build_info or config.get("build-info", False)) and not offline:
+        # What each explained `source` release needs to build, from its sdist (only for packages positively from
+        # PyPI: see build.where). Nothing here changes the exit code, and a release whose sdist gives no answer just
+        # gets no line.
+        source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
+        wanted = [(r.package, source_of[id(r.package)]) for r in gaps if source_targets(r, targets)]
+        build_info, stopped = lookup_all(wanted, simple_index=index_url, **cached)
+        if stopped is not None and not quiet:
+            print(Style(use_color(args.color)).dim(f"wheelgap: note: {stopped}"), file=sys.stderr)
 
     if args.junit is not None:  # an empty PATH (an unset CI variable) is an error, not "no report"
         try:
-            write_junit(args.junit, rows, targets, fail_on)
+            write_junit(args.junit, rows, targets, fail_on, advisory)
         except OSError as e:
             print(f"wheelgap: error: {e}", file=sys.stderr)
             return input_error_json(e) if args.json else 2
 
+    if args.github_annotations:
+        # Workflow commands work on stdout and stderr alike; stderr keeps --json and --markdown output clean.
+        # These are wheelgap's own (escaped in github.workflow_command), so they go past the logsafe guard.
+        for command in github_annotations(rows, targets, sources, failing, advisory):
+            write_command(command, sys.stderr if args.json or args.markdown else sys.stdout)
+
     if args.json:
-        print(report_json(rows, targets, source_labels, skipped, ignored, args.explain, pyodide_lock))
+        print(
+            report_json(
+                rows,
+                targets,
+                source_labels,
+                skipped,
+                ignored,
+                args.explain,
+                pyodide_lock,
+                advisory,
+                conda_forge,
+                row_notes,
+                build_info,
+            )
+        )
         return code
 
     if args.markdown:
-        source_allowed = bool(gaps) and not failing  # judged on --fail-on alone, not --exit-zero
         print(
             "\n".join(
-                render_markdown(rows, targets, source_labels, skipped, ignored, args, pyodide_lock, source_allowed)
+                render_markdown(
+                    rows,
+                    targets,
+                    source_labels,
+                    skipped,
+                    ignored,
+                    args,
+                    pyodide_lock,
+                    source_allowed,
+                    advisory,
+                    conda_forge,
+                    row_notes,
+                    build_info,
+                )
             )
         )
         return code
@@ -1169,6 +1704,10 @@ def main(argv: list[str] | None = None) -> int:
         if gaps:
             print(gap_summary(gaps, len(rows), style))
             print("gaps: " + ", ".join(r.package.name for r in gaps))
+            if blocking := blocking_newer_python(rows, targets):
+                print(blocking_line(blocking))
+            if line := advisory_line(rows, targets, advisory):
+                print(style.dim(line))
         if ignored:
             print(style.dim("ignored: " + ignored_list(ignored)))
         if pyodide_lock:  # a bundled build of another version passes, but quiet mode mustn't hide that (#75)
@@ -1191,7 +1730,7 @@ def main(argv: list[str] | None = None) -> int:
 
     shown = rows if args.all else gaps
     if shown:
-        for ln in render_table(shown, targets, style):
+        for ln in render_table(shown, targets, style, advisory):
             print(ln)
         print()
         hidden = [] if args.all else [r for r in rows if r.ok]
@@ -1200,7 +1739,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.explain and gaps:
             if hidden:
                 print()
-            for ln in render_explain(gaps, targets, style):
+            for ln in render_explain(gaps, targets, style, conda_forge, row_notes, build_info):
                 print(ln)
 
     bundled = [r for r in rows if Status.BUNDLED in r.results.values()]
@@ -1208,7 +1747,7 @@ def main(argv: list[str] | None = None) -> int:
         print(style.dim(bundled_line(bundled, pyodide_lock)))
 
     if skipped:
-        names = ", ".join(f"{p.name} ({p.skip})" for p in skipped)
+        names = skipped_list(skipped)
         print(style.dim(f"skipped {len(skipped)} non-index package{'s' * (len(skipped) != 1)}: {names}"))
 
     if ignored:
@@ -1225,12 +1764,16 @@ def main(argv: list[str] | None = None) -> int:
         print(style.green(f"✓ {what} a wheel for {every}."))
         return 0
 
-    for line in target_lines(gaps, targets, style):
+    for line in target_lines(gaps, targets, style, advisory):
         print(line)
     print(gap_summary(gaps, len(rows), style))
+    if blocking := blocking_newer_python(rows, targets):
+        print(blocking_line(blocking))
+    if line := advisory_line(rows, targets, advisory):
+        print(style.dim(line))
     if not args.explain:
         print(style.dim("Run with --explain to see which wheels were rejected and why."))
-    if gaps and not failing and not args.exit_zero:
+    if source_allowed and not args.exit_zero:
         print(style.dim("Source builds are allowed (--fail-on missing), so this run passes."))
     return code
 

@@ -13,6 +13,10 @@ from wheelgap.check import Status
 from wheelgap.cli import main
 from wheelgap.targets import ALIASES, DEFAULT_PLATFORMS, PLATFORMS
 
+NOTES_HINT = (
+    "wheelgap: add --notes to show the tracker's notes for these packages (sends their names to wheelgap.github.io)\n"
+)
+
 
 def run(capsys, *argv):
     code = main(list(argv))
@@ -151,6 +155,16 @@ def test_uv_required_environments_matching_no_target_falls_back_to_defaults(
     assert code == 0
     assert "matches none of the native targets" in err and "default targets" in err
     assert [t["platform"] for t in json.loads(out)["targets"]] == DEFAULT_PLATFORMS
+
+
+def test_uv_required_environments_note_names_the_resolved_python(capsys, tmp_path, monkeypatch, fake_pypi):
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.uv]\nrequired-environments = [\"sys_platform == 'android'\"]\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    code, _, err = run(capsys, "purewheel==3.1", "-p", "3.14,next", "--json")
+    assert code == 0
+    assert "native targets for Python 3.14, 3.15, so the default targets" in err
 
 
 @pytest.mark.parametrize("setting", ["", "required-environments = []", "environments = [\"sys_platform == 'linux'\"]"])
@@ -340,6 +354,16 @@ def test_quiet_with_no_gaps_is_silent(capsys, fixtures):
 def test_quiet_preserves_json_and_exit_status(capsys, fixtures):
     args = (str(fixtures / "armgap"), "-p", "3.13", "-t", "musl-aarch64", "--json")
     assert run(capsys, *args, "--quiet") == run(capsys, *args)
+
+
+def test_uv_lock_dependency_edge_of_the_wrong_type_exits_2(capsys, tmp_path):
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n\n[[package]]\nname = "a"\nversion = "1.0"\ndependencies = [{ name = "b", marker = 5 }]\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and not out
+    assert "package a has a dependency 'b' with a `marker` that isn't a string" in err
 
 
 def test_quiet_preserves_list_targets_output(capsys):
@@ -799,6 +823,43 @@ def test_python_version_file_with_nothing_usable_uses_running_python(capsys, fix
     assert [t["python"] for t in json.loads(out)["targets"]] == [cli.running_python()]
 
 
+@pytest.mark.parametrize("flag", ["", ","])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_empty_python_flag_is_an_error(capsys, fixtures, flag, as_json):
+    args = [str(fixtures / "uvproj"), "-p", flag, "-t", "linux-x86_64"]
+    if as_json:
+        args.append("--json")
+    code, out, err = run(capsys, *args)
+    assert code == 2
+    assert "wheelgap: error: no Python version given (-p is empty)" in err
+    if as_json:
+        assert json.loads(out)["error"] == {
+            "message": "no Python version given (-p is empty)",
+            "type": "TargetError",
+        }
+    else:
+        assert not out
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_empty_python_in_config_is_an_error(capsys, fixtures, tmp_path, as_json):
+    project = project_with_lock(tmp_path, fixtures)
+    (project / "pyproject.toml").write_text('[tool.wheelgap]\npython = [""]\n', encoding="utf-8")
+    args = [str(project), "-t", "linux-x86_64"]
+    if as_json:
+        args.append("--json")
+    code, out, err = run(capsys, *args)
+    assert code == 2
+    assert "wheelgap: error: no Python version given (-p is empty)" in err
+    if as_json:
+        assert json.loads(out)["error"] == {
+            "message": "no Python version given (-p is empty)",
+            "type": "TargetError",
+        }
+    else:
+        assert not out
+
+
 def test_text_summary_lists_only_targets_with_gaps(capsys, fixtures):
     code, out, _ = run(
         capsys,
@@ -876,6 +937,139 @@ def test_markdown_summary_per_target(capsys, fixtures):
     assert code == 1
     assert "have gaps:" in out
     assert not any(line.startswith("- ") for line in out.splitlines())
+
+
+UPGRADE = ("newpylag==1.0", "nowheels==0.9", "purewheel==3.1", "-t", "linux-x86_64,win-amd64", "--color", "never")
+NEXT_NOTE = "wheelgap: note: next is Python 3.15, the newest CPython this wheelgap version knows\n"
+
+
+def test_python_next_names_what_blocks_the_upgrade(capsys, fake_pypi):
+    # newpylag has a 3.14 wheel on Linux but not a 3.15 one; nowheels builds from source on both, so it doesn't block.
+    code, out, err = run(capsys, *UPGRADE, "-p", "3.14", "-p", "next")
+    assert code == 1
+    assert err == NEXT_NOTE
+    assert "Python 3.14, 3.15" in out
+    lines = out.splitlines()
+    summary = lines.index("2 of 3 packages have gaps: 2 will build from source.")
+    assert lines[summary + 1] == "blocking 3.15: newpylag"
+    # The order of -p doesn't matter, and next-t blocks the same way.
+    code, out, err = run(capsys, *UPGRADE, "-p", "next-t,3.14")
+    assert "blocking 3.15t: newpylag" in out.splitlines()
+    assert err == NEXT_NOTE.replace("next is Python 3.15", "next-t is Python 3.15t")
+
+    code, out, err = run(capsys, *UPGRADE, "-p", "3.14", "-p", "next", "--json")
+    assert code == 1
+    assert err == NEXT_NOTE
+    data = json.loads(out)
+    _assert_matches_output_schema(data)
+    assert data["blocking_newer_python"] == ["newpylag"]
+    assert {t["python"] for t in data["targets"]} == {"3.14", "3.15"}
+
+    code, out, _ = run(capsys, *UPGRADE, "-p", "3.14", "-p", "next", "--markdown")
+    assert "blocking 3.15: newpylag" in out.splitlines()
+
+    code, out, err = run(capsys, *UPGRADE, "-p", "3.14", "-p", "next", "-q")
+    assert out.splitlines()[-1] == "blocking 3.15: newpylag"
+    assert not err  # -q drops the note too
+
+
+def test_blocking_newer_python_only_counts_new_gaps(capsys, fake_pypi):
+    # Ignoring newpylag on Linux leaves only nowheels, which has gaps on 3.14 too.
+    code, out, _ = run(capsys, *UPGRADE, "-p", "3.14,3.15", "--ignore", "newpylag:linux-x86_64")
+    assert "blocking 3.15: none (every gap on 3.15 is on 3.14 too)" in out.splitlines()
+    code, out, _ = run(capsys, *UPGRADE, "-p", "3.14,3.15", "--ignore", "newpylag:linux-x86_64", "--json")
+    assert json.loads(out)["blocking_newer_python"] == []
+    # Nothing is printed when there are no gaps at all.
+    code, out, _ = run(capsys, "purewheel==3.1", "-p", "3.14", "-p", "3.15", "--color", "never")
+    assert code == 0 and "blocking" not in out
+
+
+def _blocking(capsys, tmp_path, requirements, *args):
+    """The blocking line of the text report and blocking_newer_python of --json, for a requirements file."""
+    path = tmp_path / "requirements.txt"
+    path.write_text(requirements, encoding="utf-8")
+    argv = [str(path), "-p", "3.14,next", "-t", "linux-x86_64", "--color", "never", *args]
+    _, out, _ = run(capsys, *argv)
+    line = next((ln for ln in out.splitlines() if ln.startswith("blocking ")), None)
+    _, out, _ = run(capsys, *argv, "--json")
+    data = json.loads(out)
+    _assert_matches_output_schema(data)
+    return line, data["blocking_newer_python"]
+
+
+@pytest.mark.parametrize(
+    "requirements,line,names",
+    [
+        # Unknown on the newer Python only, or on both: not listed, and "none" would be untrue.
+        (
+            'does-not-exist==1.0; python_version >= "3.15"\nnowheels==0.9\n',
+            "blocking 3.15: none known (1 package couldn't be checked)",
+            [],
+        ),
+        ("does-not-exist==1.0\nnowheels==0.9\n", "blocking 3.15: none known (1 package couldn't be checked)", []),
+        (
+            "does-not-exist==1.0\nnewpylag==1.0\n",
+            "blocking 3.15: newpylag (1 package couldn't be checked)",
+            ["newpylag"],
+        ),
+        # n/a on the older Python counts as fine there, so a source build on the newer one blocks it.
+        ('nowheels==0.9; python_version >= "3.15"\n', "blocking 3.15: nowheels", ["nowheels"]),
+        # missing (a wheel for 3.14, no sdist) blocks, like source.
+        ("cp314only==1.0\n", "blocking 3.15: cp314only", ["cp314only"]),
+        # Forked versions: 3.14 builds forked from source too, so it doesn't block 3.15.
+        (
+            'forked==0.9; python_version < "3.15"\nforked==1.0; python_version >= "3.15"\n',
+            "blocking 3.15: none (every gap on 3.15 is on 3.14 too)",
+            [],
+        ),
+    ],
+)
+def test_blocking_newer_python_cases(capsys, fake_pypi, tmp_path, requirements, line, names):
+    assert _blocking(capsys, tmp_path, requirements) == (line, names)
+
+
+def test_blocking_newer_python_names_a_package_once(capsys, fake_pypi, tmp_path):
+    for folder in ("a", "b"):
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / "requirements.txt").write_text("newpylag==1.0\n", encoding="utf-8")
+    argv = [str(tmp_path / "a" / "requirements.txt"), str(tmp_path / "b" / "requirements.txt"), "-p", "3.14,3.15"]
+    _, out, _ = run(capsys, *argv, "-t", "linux-x86_64", "--color", "never")
+    assert "blocking 3.15: newpylag" in out.splitlines()
+    _, out, _ = run(capsys, *argv, "-t", "linux-x86_64", "--json")
+    assert json.loads(out)["blocking_newer_python"] == ["newpylag"]
+
+
+def test_blocking_newer_python_bundled_on_the_older_python(capsys, fake_pypi, fixtures):
+    # Pyodide 0.29 (Python 3.13) bundles fastlib; there's no 3.14 Pyodide wheel, and Pyodide can't build the sdist.
+    args = ("fastlib==2.0.0", "-p", "3.13,3.14", "-t", "pyodide", "--pyodide-lock", str(fixtures / "pyodide-lock.json"))
+    _, out, _ = run(capsys, *args, "--json")
+    data = json.loads(out)
+    assert data["packages"][0]["results"] == {"3.13 pyodide": "bundled", "3.14 pyodide": "missing"}
+    assert data["blocking_newer_python"] == ["fastlib"]
+
+
+@pytest.mark.parametrize("pythons", [["3.15"], ["3.15", "3.15t"], ["3.13", "3.14", "3.15"]])
+def test_no_blocking_summary_without_exactly_two_pythons_one_newer(capsys, fake_pypi, pythons):
+    args = [arg for p in pythons for arg in ("-p", p)]
+    code, out, _ = run(capsys, *UPGRADE, *args)
+    assert code == 1 and "blocking" not in out
+    code, out, _ = run(capsys, *UPGRADE, *args, "--json")
+    data = json.loads(out)
+    _assert_matches_output_schema(data)
+    assert "blocking_newer_python" not in data
+    code, out, _ = run(capsys, *UPGRADE, *args, "--markdown")
+    assert "blocking" not in out
+
+
+def test_python_next_in_pyproject(capsys, fake_pypi, tmp_path):
+    (tmp_path / "requirements.txt").write_text("newpylag==1.0\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.wheelgap]\npython = ["3.14", "next"]\ntargets = ["linux-x86_64"]\n', encoding="utf-8"
+    )
+    code, out, err = run(capsys, str(tmp_path / "requirements.txt"), "--color", "never")
+    assert code == 1
+    assert err == NEXT_NOTE
+    assert "blocking 3.15: newpylag" in out.splitlines()
 
 
 def test_gap_summary_counts_each_package_once():
@@ -1416,7 +1610,7 @@ def test_ignore_on_one_target_text(capsys, fixtures, target):
 def test_ignore_on_one_target_keeps_other_targets(capsys, fixtures):
     args = (str(fixtures / "armgap"), *ARMGAP_TWO, "--color", "never", "--explain")
     code, out, err = run(capsys, *args, "--ignore", "newglibc:musl-aarch64")
-    assert code == 1 and not err
+    assert code == 1 and err == NOTES_HINT  # the only stderr line: --notes would look armlib up
     assert "ignored: newglibc (musl-aarch64)" in out
     # Per-target counts leave the ignored cell out; newglibc still counts on linux-aarch64.
     assert "linux-aarch64  1 missing\n" in out
@@ -1439,7 +1633,7 @@ def test_ignore_on_one_target_keeps_other_targets(capsys, fixtures):
 def test_ignore_on_one_target_json(capsys, fixtures):
     args = (str(fixtures / "armgap"), *ARMGAP_TWO, "--json", "--explain")
     code, out, err = run(capsys, *args, "--ignore", "armlib:musl-aarch64,newglibc:linux-aarch64")
-    assert code == 1 and not err
+    assert code == 1 and err == NOTES_HINT
     data = json.loads(out)
     _assert_matches_output_schema(data)
     assert data["ignored"] == []  # still whole-package names only
@@ -1943,6 +2137,7 @@ def _assert_matches_output_schema(data):
         assert set(item["platforms"]) <= {t["platform"] for t in data["targets"]}
         ignored_on[item["name"]] = {t["label"] for t in data["targets"] if t["platform"] in item["platforms"]}
     assert len(labels) == len(set(labels))
+    assert set(data.get("advisory", [])) <= set(labels)
     for pkg in data["packages"]:
         assert {"name", "version", "error", "results"} <= set(pkg)
         assert set(pkg) <= {
@@ -1952,8 +2147,11 @@ def _assert_matches_output_schema(data):
             "results",
             "rejected",
             "via",
+            "build_requires",
+            "notes",
             "bundled",
             "bundled_version_differs",
+            "conda_forge",
         }
         assert isinstance(pkg["name"], str) and pkg["name"]
         assert pkg["version"] is None or isinstance(pkg["version"], str)
@@ -1973,6 +2171,14 @@ def _assert_matches_output_schema(data):
             for label, path in pkg["via"].items():
                 assert label in labels
                 assert isinstance(path, list) and all(isinstance(s, str) for s in path)
+        if "build_requires" in pkg:
+            reqs = pkg["build_requires"]
+            assert reqs is None or (isinstance(reqs, list) and all(isinstance(r, str) for r in reqs))
+        if "conda_forge" in pkg:  # a hint for some of the targets in rejected, never an empty one
+            assert pkg["conda_forge"]["builds"] and set(pkg["conda_forge"]["builds"]) <= set(pkg["rejected"])
+            assert all(pkg["conda_forge"]["builds"].values())
+        for note in pkg.get("notes", []):
+            assert set(note["targets"]) <= set(pkg.get("rejected", {})), "notes cover gap targets only"
     for item in data["skipped"]:
         assert set(item) == {"name", "reason"}
         assert isinstance(item["name"], str) and isinstance(item["reason"], str)
@@ -2014,6 +2220,8 @@ def test_json_output_matches_schema(capsys, fixtures):
         [str(fixtures / "uvproj"), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--json", "--ignore", "winonly"],
         [str(fixtures / "armgap"), "-p", "3.13,3.14", "-t", "linux-aarch64,musl-aarch64", "--json", "--explain"]
         + ["--ignore", "armlib:musl-aarch64,newglibc:linux-aarch64"],
+        [str(fixtures / "armgap"), "-p", "3.13,3.14", "-t", "linux-aarch64,musl-aarch64", "--json"]
+        + ["--advisory", "musl-aarch64"],
     ]
     for args in cases:
         code, out, err = run(capsys, *args)
@@ -2022,10 +2230,30 @@ def test_json_output_matches_schema(capsys, fixtures):
         assert "error" not in data, data
         _assert_matches_output_schema(data)
         if "--explain" in args:
-            assert all("rejected" in pkg and "via" in pkg for pkg in data["packages"])
+            assert all("rejected" in pkg and "via" in pkg and "notes" in pkg for pkg in data["packages"])
+        else:
+            assert all("notes" not in pkg for pkg in data["packages"])
+        assert not any("build_requires" in pkg for pkg in data["packages"])  # only with --build-info
         if "winonly" in args:
             assert "winonly" in data["ignored"]
             assert all(pkg["name"] != "winonly" for pkg in data["packages"])
+
+
+def test_json_build_info_matches_schema(capsys, tmp_path, fake_pypi, fake_files):
+    import io
+    import tarfile
+
+    pyproject = b'[build-system]\nrequires = ["maturin>=1"]\n'
+    with tarfile.open(tmp_path / "s.tar.gz", "w:gz") as tar:
+        info = tarfile.TarInfo("nowheels-0.9/pyproject.toml")
+        info.size = len(pyproject)
+        tar.addfile(info, io.BytesIO(pyproject))
+    fake_files.files["nowheels-0.9.tar.gz"] = (tmp_path / "s.tar.gz").read_bytes()
+    args = ["nowheels==0.9", "fastlib==2.0.0", "-p", "3.13", "-t", "linux-x86_64", "--all", "--json", "--explain"]
+    code, out, _ = run(capsys, *args, "--build-info")
+    data = json.loads(out)
+    _assert_matches_output_schema(data)
+    assert {p["name"]: p["build_requires"] for p in data["packages"]} == {"fastlib": None, "nowheels": ["maturin>=1"]}
 
 
 def test_json_output_with_pyodide_lock_matches_schema(capsys, fixtures, fake_pypi):
@@ -2283,3 +2511,666 @@ def test_directory_without_lockfile_suggests_pyproject(capsys, fake_pypi, tmp_pa
     assert code == 2
     assert "no lockfile found" in err
     assert f"wheelgap {tmp_path / 'pyproject.toml'}" in err
+
+
+# --github-annotations
+
+
+def annotation_lines(text):
+    return [line for line in text.splitlines() if line.startswith("::")]
+
+
+def test_github_annotations_uv_lock(capsys, fake_pypi, fixtures, monkeypatch):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(fixtures))
+    code, out, _ = run(
+        capsys, str(fixtures / "uvproj"), "-p", "3.13", "-t", "linux-x86_64,win-arm64", "--github-annotations"
+    )
+    assert code == 1
+    lines = out.splitlines()
+    assert lines[:4] == [  # before the normal output
+        "::error file=uvproj/uv.lock,line=23,title=fastlib 2.0.0%3A builds from source::"
+        "fastlib 2.0.0 builds from source on win-arm64.",
+        "::error file=uvproj/uv.lock,line=37,title=nativeext 0.3%3A builds from source::"
+        "nativeext 0.3 builds from source on linux-x86_64, win-arm64.",
+        "::error file=uvproj/uv.lock,line=43,title=puresdist 1.0%3A builds from source::"
+        "puresdist 1.0 builds from source on linux-x86_64, win-arm64.",
+        "::error file=uvproj/uv.lock,line=58,title=winonly 311%3A can't install::"
+        "winonly 311 can't install on win-arm64.",
+    ]
+    assert lines[4].startswith("wheelgap ")
+    assert len(annotation_lines(out)) == 4
+    # Without the flag, nothing changes.
+    _, plain, _ = run(capsys, str(fixtures / "uvproj"), "-p", "3.13", "-t", "linux-x86_64,win-arm64")
+    assert plain.splitlines() == lines[4:]
+
+
+def test_github_annotations_requirements(capsys, fake_pypi, tmp_path, monkeypatch):
+    (tmp_path / "more").mkdir()
+    (tmp_path / "requirements.txt").write_text(
+        "# pinned, with hashes on the next line\n"
+        "fastlib==2.0.0 \\\n"
+        "    --hash=sha256:00\n"
+        "-r more/extra.txt\n"
+        "nowheels==0.9 ; sys_platform == 'linux'\n"
+        "nowheels==0.9 ; sys_platform == 'win32'\n"
+        "ranged>=1.9,<2  # 1.9 has only an sdist\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "more" / "extra.txt").write_text(
+        "--index-url https://pypi.org/simple\nwinonly==311\nranged==1.9\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    code, out, _ = run(
+        capsys, str(tmp_path / "requirements.txt"), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--github-annotations"
+    )
+    assert code == 1
+    # The first line of a continued requirement; the same name and markers on two lines (ranged) get no line.
+    assert annotation_lines(out) == [
+        "::error file=requirements.txt,line=2,title=fastlib 2.0.0%3A builds from source::"
+        "fastlib 2.0.0 builds from source on win-amd64.",
+        "::error file=requirements.txt,line=5,title=nowheels 0.9%3A builds from source::"
+        "nowheels 0.9 builds from source on linux-x86_64.",
+        "::error file=requirements.txt,line=6,title=nowheels 0.9%3A builds from source::"
+        "nowheels 0.9 builds from source on win-amd64.",
+        *[  # one per line: requirements.txt line 7 and more/extra.txt line 3
+            "::error file=requirements.txt,title=ranged 1.9%3A builds from source::"
+            "ranged 1.9 builds from source on linux-x86_64, win-amd64."
+        ]
+        * 2,
+        "::error file=more/extra.txt,line=2,title=winonly 311%3A can't install::"
+        "winonly 311 can't install on linux-x86_64.",
+    ]
+
+
+@pytest.mark.parametrize(
+    "folder,expected",
+    [
+        ("pdmproj", [("fastlib", 9)]),
+        ("poetryproj", [("fastlib", 4)]),
+        ("pylockproj", [("fastlib", 5)]),
+        ("pipenvproj", [("fastlib", 8)]),  # the package's key in "default"
+    ],
+)
+def test_github_annotations_lockfile_lines(capsys, fake_pypi, fixtures, monkeypatch, folder, expected):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(fixtures / folder))
+    code, out, _ = run(capsys, str(fixtures / folder), "-p", "3.13", "-t", "win-amd64", "--github-annotations")
+    assert code == 1
+    found = []
+    for line in annotation_lines(out):
+        props = dict(item.split("=", 1) for item in line.split("::")[1].removeprefix("error ").split(","))
+        found.append((props["title"].split()[0], int(props["line"])))
+        assert props["file"] in ("pdm.lock", "poetry.lock", "pylock.toml", "Pipfile.lock")
+    assert found == expected
+
+
+def uv_lock(packages: list[tuple[str, str]], extra: str = "") -> str:
+    """A uv.lock whose project depends on each (name, version), all with only an sdist."""
+    deps = "".join(f'    {{ name = "{name}" }},\n' for name, _ in packages)
+    text = (
+        'version = 1\nrequires-python = ">=3.12"\n\n[[package]]\nname = "demo"\nversion = "0.1.0"\n'
+        f'source = {{ editable = "." }}\n{extra}dependencies = [\n{deps}]\n'
+    )
+    for name, version in packages:
+        text += (
+            f'\n[[package]]\nname = "{name}"\nversion = "{version}"\n'
+            'source = { registry = "https://pypi.org/simple" }\n'
+            f'sdist = {{ url = "https://files.example/{name}-{version}.tar.gz", hash = "sha256:00" }}\n'
+        )
+    return text
+
+
+@pytest.mark.parametrize("count", [10, 11, 12])
+@pytest.mark.parametrize("fail_on,level", [("source", "error"), ("missing", "warning")])
+def test_github_annotations_cap(capsys, fake_pypi, tmp_path, monkeypatch, fail_on, level, count):
+    # GitHub shows 10 errors and 10 warnings per step: 10 packages fit, and past that the 10th says how many more.
+    names = [f"pkg{i:02}" for i in range(count)]
+    (tmp_path / "uv.lock").write_text(uv_lock([(name, "1.0") for name in names]), encoding="utf-8")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    code, out, _ = run(
+        capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--github-annotations", "--fail-on", fail_on
+    )
+    assert code == (1 if fail_on == "source" else 0)
+    lines = annotation_lines(out)
+    assert len(lines) == 10
+    shown = 10 if count == 10 else 9
+    assert all(line.startswith(f"::{level} file=uv.lock,line=") for line in lines[:shown])
+    assert [line.split("title=")[1].split("%3A")[0] for line in lines[:shown]] == [f"{n} 1.0" for n in names[:shown]]
+    if count > 10:
+        more = count - 9
+        assert lines[9] == (
+            f"::{level} title=wheelgap%3A {more} more packages with gaps::"
+            f"{more} more packages with gaps; the log lists them all."
+        )
+    if level == "warning":
+        assert lines[0].endswith("Source builds are allowed (fail-on missing), so this doesn't fail the run.")
+
+
+def test_github_annotations_fail_on_missing_mixes_levels(capsys, fake_pypi, fixtures, monkeypatch):
+    # A package that can't install still fails the run, so it stays an error; source builds become warnings.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(fixtures))
+    code, out, _ = run(
+        capsys,
+        str(fixtures / "uvproj"),
+        "-p",
+        "3.13",
+        "-t",
+        "linux-x86_64,win-arm64",
+        "--github-annotations",
+        "--fail-on",
+        "missing",
+    )
+    assert code == 1
+    levels = [(line.split()[0], line.split("title=")[1].split()[0]) for line in annotation_lines(out)]
+    assert levels == [
+        ("::error", "winonly"),
+        ("::warning", "fastlib"),
+        ("::warning", "nativeext"),
+        ("::warning", "puresdist"),
+    ]
+
+
+def test_github_annotations_advisory_targets_are_warnings(capsys, fake_pypi, fixtures, monkeypatch):
+    # A package whose gaps are all on --advisory targets doesn't fail the run, so it's a warning that says why;
+    # advisory targets are marked in every message.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(fixtures))
+    code, out, _ = run(
+        capsys,
+        str(fixtures / "uvproj"),
+        "-p",
+        "3.13",
+        "-t",
+        "linux-x86_64,win-arm64",
+        "--github-annotations",
+        "--advisory",
+        "win-arm64",
+    )
+    assert code == 1
+    lines = annotation_lines(out)
+    levels = [(line.split()[0], line.split("title=")[1].split()[0]) for line in lines]
+    assert levels == [
+        ("::error", "nativeext"),
+        ("::error", "puresdist"),
+        ("::warning", "fastlib"),
+        ("::warning", "winonly"),
+    ]
+    assert lines[0].endswith("builds from source on linux-x86_64, win-arm64 (advisory).")
+    assert lines[3].endswith("can't install on win-arm64 (advisory). Gaps on advisory targets don't fail the run.")
+    assert "fail-on missing" not in out
+
+
+def test_github_annotations_ignore_and_exit_zero(capsys, fake_pypi, fixtures, monkeypatch):
+    # --exit-zero only changes the exit code; ignored packages and targets get no annotation.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(fixtures))
+    code, out, _ = run(
+        capsys,
+        str(fixtures / "uvproj"),
+        "-p",
+        "3.13",
+        "-t",
+        "linux-x86_64,win-arm64",
+        "--github-annotations",
+        "--exit-zero",
+        "--ignore",
+        "nativeext,winonly:win-arm64,fastlib:win-arm64",
+    )
+    assert code == 0
+    assert annotation_lines(out) == [
+        "::error file=uvproj/uv.lock,line=43,title=puresdist 1.0%3A builds from source::"
+        "puresdist 1.0 builds from source on linux-x86_64, win-arm64.",
+    ]
+
+
+@pytest.mark.parametrize("flag", ["--json", "--markdown"])
+def test_github_annotations_keep_json_and_markdown_clean(capsys, fake_pypi, fixtures, monkeypatch, flag):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(fixtures))
+    argv = [str(fixtures / "uvproj"), "-p", "3.13", "-t", "linux-x86_64", flag]
+    code, out, err = run(capsys, *argv, "--github-annotations")
+    assert code == 1
+    assert "::" not in out.split("\n", 1)[0]
+    assert (code, out) == run(capsys, *argv)[:2]  # stdout is exactly what it is without the flag
+    assert [line.split(",")[0] for line in annotation_lines(err)] == ["::error file=uvproj/uv.lock"] * 2
+
+
+def test_github_annotations_without_a_line(capsys, fake_pypi, tmp_path, monkeypatch):
+    # Two entries of one name and version in a uv.lock could be either: the file, but no line.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    (tmp_path / "uv.lock").write_text(uv_lock([("twice", "1.0"), ("twice", "1.0"), ("once", "1.0")]), encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--github-annotations")
+    files = [line.split("title=")[0] for line in annotation_lines(out)]
+    assert files == [
+        "::error file=uv.lock,line=27,",
+        "::error file=uv.lock,",
+        "::error file=uv.lock,",
+    ]  # once, twice x2
+
+    # A [[package]] header inside a string throws the count off, so no line in the file is trusted.
+    trap = 'description = """\n[[package]]\nname = "once"\n"""\n'
+    (tmp_path / "uv.lock").write_text(uv_lock([("once", "1.0")], extra=trap), encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--github-annotations")
+    assert [line.split("title=")[0] for line in annotation_lines(out)] == ["::error file=uv.lock,"]
+
+    # A file outside the workspace can't be shown in the diff, and package names have no file at all.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path / "elsewhere"))
+    _, out, _ = run(capsys, str(tmp_path), "nowheels==0.9", "-p", "3.13", "-t", "linux-x86_64", "--github-annotations")
+    assert annotation_lines(out) == [
+        "::error title=nowheels 0.9%3A builds from source::nowheels 0.9 builds from source on linux-x86_64.",
+        "::error title=once 1.0%3A builds from source::"
+        f"once 1.0 builds from source on linux-x86_64. (in {tmp_path / 'uv.lock'})",
+    ]
+
+
+def test_github_annotations_escaping():
+    from wheelgap.github import workflow_command
+
+    # As @actions/core escapes them: %, CR and LF everywhere, and : and , in properties too.
+    assert workflow_command("warning", "50% done\r\nnext: a, b", "dir,x/a:b.txt", 3, "t%: 1,\n2") == (
+        "::warning file=dir%2Cx/a%3Ab.txt,line=3,title=t%25%3A 1%2C%0A2::50%25 done%0D%0Anext: a, b"
+    )
+    assert workflow_command("error", "plain") == "::error::plain"
+
+
+def test_github_annotations_pipfile_lock_entry_the_parser_kept(capsys, fake_pypi, tmp_path, monkeypatch):
+    # Listed in develop first and in default too: the parser keeps default's entry, so that's the line. A _meta
+    # key with the same name ("hash") isn't a package.
+    (tmp_path / "Pipfile.lock").write_text(
+        '{"_meta": {"hash": {"sha256": "00"}, "sources": [{"name": "pypi", "url": "https://pypi.org/simple"}]},\n'
+        ' "develop": {"nowheels": {"version": "==0.9"}},\n'
+        ' "default": {"purewheel": {"version": "==3.1"},\n'
+        '             "nowheels": {"version": "==0.9", "markers": "os_name == \\"posix\\""}}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    _, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--github-annotations")
+    assert [line.split(",title=")[0] for line in annotation_lines(out)] == ["::error file=Pipfile.lock,line=4"]
+
+
+UV_ROOT = (
+    'version = 1\nrequires-python = ">=3.12"\n\n[[package]]\nname = "demo"\nversion = "0.1.0"\n'
+    'source = { editable = "." }\n'
+)
+
+
+def sdist_block(name, version="1.0", header="[[package]]"):
+    return (
+        f'\n{header}\nname = "{name}"\nversion = "{version}"\nsource = {{ registry = "https://pypi.org/simple" }}\n'
+        f'sdist = {{ url = "https://files.example/{name}-{version}.tar.gz", hash = "sha256:00" }}\n'
+    )
+
+
+def annotate(capsys, tmp_path, *argv, targets="linux-x86_64"):
+    """Run with --github-annotations from tmp_path as the workspace; the annotation lines up to their title."""
+    code, out, _ = run(capsys, *argv, "-p", "3.13", "-t", targets, "--github-annotations")
+    return [line.split("title=")[0] for line in annotation_lines(out)]
+
+
+@pytest.mark.parametrize(
+    "lock",
+    [
+        # A name line inside a multi-line string, before the block's real one.
+        UV_ROOT
+        + 'dependencies = [{ name = "a" }]\n\n[[package]]\nsummary = """\nname = "a"\n"""\n'
+        + sdist_block("a").removeprefix("\n[[package]]\n"),
+        # A [[package]] inside a string, balanced by a real header the scan doesn't read ([["package"]]).
+        UV_ROOT
+        + 'dependencies = [{ name = "a" }]\n'
+        + sdist_block("b")
+        + "notes = '''\n[[package]]\nname = \"a\"\n'''\n"
+        + sdist_block("a", header='[["package"]]'),
+    ],
+)
+def test_github_annotations_multiline_strings_give_no_line(capsys, fake_pypi, tmp_path, monkeypatch, lock):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    assert annotate(capsys, tmp_path, str(tmp_path)) == ["::error file=uv.lock,"]
+
+
+def test_github_annotations_toml_names_are_cross_checked(capsys, fake_pypi, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    # The block's name is a quoted key the scan doesn't read; the wheel table's `name` after it isn't the block's.
+    lock = (
+        UV_ROOT
+        + 'dependencies = [{ name = "a" }]\n\n[[package]]\n"name" = "a"\nversion = "1.0"\n'
+        + 'source = { registry = "https://pypi.org/simple" }\n'
+        + 'sdist = { url = "https://files.example/a-1.0.tar.gz", hash = "sha256:00" }\n\n'
+        + '[[package.wheels]]\nname = "a"\nurl = "https://files.example/a-1.0-py3-none-win_amd64.whl"\n'
+    )
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    assert annotate(capsys, tmp_path, str(tmp_path)) == ["::error file=uv.lock,"]
+
+    # When the scan's names don't match the parsed array, name for name, no line in the file is used.
+    from wheelgap import github
+
+    (tmp_path / "uv.lock").write_text(UV_ROOT + sdist_block("a") + sdist_block("b"), encoding="utf-8")
+    assert github.toml_lines(tmp_path / "uv.lock", "package") == {
+        ("demo", "0.1.0"): [5],
+        ("a", "1.0"): [10],
+        ("b", "1.0"): [16],
+    }
+    real = github.tomllib.loads
+    monkeypatch.setattr(github.tomllib, "loads", lambda text: {"package": real(text)["package"][::-1]})
+    assert github.toml_lines(tmp_path / "uv.lock", "package") == {}
+
+
+def test_github_annotations_versions_of_one_name(capsys, fake_pypi, tmp_path, monkeypatch):
+    # A forked uv.lock with two versions of a name: each on its own line.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    lock = (
+        UV_ROOT
+        + "dependencies = [\n"
+        + '    { name = "a", version = "1.0", source = { registry = "https://pypi.org/simple" }, '
+        + "marker = \"sys_platform == 'linux'\" },\n"
+        + '    { name = "a", version = "2.0", source = { registry = "https://pypi.org/simple" }, '
+        + "marker = \"sys_platform == 'win32'\" },\n]\n"
+        + sdist_block("a", "1.0")
+        + sdist_block("a", "2.0")
+    )
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    assert annotate(capsys, tmp_path, str(tmp_path), targets="linux-x86_64,win-amd64") == [
+        "::error file=uv.lock,line=14,",
+        "::error file=uv.lock,line=20,",
+    ]
+
+
+def test_github_annotations_pdm_lock_first_entry(capsys, fake_pypi, tmp_path, monkeypatch):
+    # PDM writes one entry per extras variant; the parser keeps the first, so that's the line.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    entry = (
+        '\n[[package]]\nname = "a"\nversion = "1.0"\n{extras}groups = ["default"]\n'
+        'files = [{{file = "a-1.0.tar.gz", hash = "sha256:00"}}]\n'
+    )
+    (tmp_path / "pdm.lock").write_text(
+        '[metadata]\ngroups = ["default"]\nstrategy = ["inherit_metadata"]\n'
+        + entry.format(extras="")
+        + entry.format(extras='extras = ["x"]\n'),
+        encoding="utf-8",
+    )
+    assert annotate(capsys, tmp_path, str(tmp_path)) == ["::error file=pdm.lock,line=6,"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"default": {"nowheels": {"version": "==0.9"}, "nowheels": {"version": "==0.9"}}}',  # a duplicate key
+        # "default" twice: json.loads keeps the second, so the nowheels on line 1 isn't the entry the parser read.
+        '{"default": {"nowheels": {"version": "==0.9"}},\n "default": {"purewheel": {"version": "==3.1"}},\n'
+        ' "develop": {"nowheels": {"version": "==0.9"}}}',
+        '{"_meta": {},\r"default": {\n"nowheels": {"version": "==0.9"}}}',  # a CR on its own
+    ],
+)
+def test_github_annotations_pipfile_lock_without_a_line(capsys, fake_pypi, tmp_path, monkeypatch, text):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    (tmp_path / "Pipfile.lock").write_bytes(text.encode())
+    assert annotate(capsys, tmp_path, str(tmp_path)) == ["::error file=Pipfile.lock,"]
+
+
+def test_github_annotations_crlf(capsys, fake_pypi, tmp_path, monkeypatch):
+    # GitHub counts lines as LF does, CRLF included.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    (tmp_path / "uv.lock").write_bytes(uv_lock([("a", "1.0")]).replace("\n", "\r\n").encode())
+    assert annotate(capsys, tmp_path, str(tmp_path)) == ["::error file=uv.lock,line=13,"]
+    (tmp_path / "requirements.txt").write_bytes(
+        b"# a comment\r\npurewheel==3.1\r\nnowheels==0.9 \\\r\n    --hash=sha256:00\r\n"
+    )
+    assert annotate(capsys, tmp_path, str(tmp_path / "requirements.txt")) == ["::error file=requirements.txt,line=3,"]
+
+
+@pytest.mark.parametrize("brk", ["\x0c", "\x85", " "])
+def test_github_annotations_requirements_other_line_breaks(capsys, fake_pypi, tmp_path, monkeypatch, brk):
+    # The parser splits lines on these too (str.splitlines), and GitHub doesn't: no line is safe.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    (tmp_path / "requirements.txt").write_text(f"purewheel==3.1{brk}\nnowheels==0.9\n", encoding="utf-8")
+    assert annotate(capsys, tmp_path, str(tmp_path / "requirements.txt")) == ["::error file=requirements.txt,"]
+
+
+def test_github_annotations_requirements_lines(capsys, fake_pypi, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "requirements.txt"
+    # Options, editables, paths and URLs aren't requirements with a line; an include cycle is read once.
+    req.write_text(
+        "--index-url https://pypi.org/simple\n-e ./editable\n./local\n"
+        "git+https://example.invalid/x.git#egg=gitpkg\nnamed @ https://example.invalid/named-1.0.tar.gz\n"
+        "-r other.txt\nnowheels==0.9\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "other.txt").write_text("-r requirements.txt\npurewheel==3.1\n", encoding="utf-8")
+    assert annotate(capsys, tmp_path, str(req)) == ["::error file=requirements.txt,line=7,"]
+    # A continued requirement is on the first line with something on it.
+    req.write_text("purewheel==3.1\n\\\n\\\nnowheels==0.9\n", encoding="utf-8")
+    assert annotate(capsys, tmp_path, str(req)) == ["::error file=requirements.txt,line=4,"]
+
+
+def test_github_annotations_requirements_cross_check(capsys, fake_pypi, tmp_path, monkeypatch):
+    # The file is read twice; if the scan doesn't find what the parser read (here the file changed in between, so
+    # every line moved down), no line is used.
+    from wheelgap import github
+
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "requirements.txt"
+    req.write_text("nowheels==0.9\n", encoding="utf-8")
+    scan = github.requirement_lines
+
+    def changed(path, seen=None):
+        req.write_text("purewheel==3.1\nnowheels==0.9\n", encoding="utf-8")
+        return scan(path, seen)
+
+    monkeypatch.setattr(github, "requirement_lines", changed)
+    assert annotate(capsys, tmp_path, str(req)) == ["::error file=requirements.txt,"]
+    # An include the scan can't read gives no lines at all.
+    req.write_text("-r gone.txt\n", encoding="utf-8")
+    assert scan(req) is None
+
+
+def test_github_annotations_messages(capsys, fake_pypi, fixtures, tmp_path, monkeypatch):
+    # A file outside the workspace loses its line too; several Pythons label targets with the Python.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    code, out, _ = run(
+        capsys, str(fixtures / "uvproj"), "-p", "3.13", "-p", "3.14", "-t", "linux-aarch64", "--github-annotations"
+    )
+    assert annotation_lines(out)[0] == (
+        "::error title=fastlib 2.0.0%3A builds from source::fastlib 2.0.0 builds from source on "
+        f"3.13 linux-aarch64, 3.14 linux-aarch64. (in {fixtures / 'uvproj' / 'uv.lock'})"
+    )
+    # A lookup error is quoted, and the title names the worst status of several.
+    (tmp_path / "requirements.txt").write_text("nowheels==0.9\nnotreal==1.0\n", encoding="utf-8")
+    code, out, _ = run(
+        capsys, str(tmp_path / "requirements.txt"), "-p", "3.13", "-t", "linux-x86_64,ios-arm64", "--github-annotations"
+    )
+    assert annotation_lines(out) == [
+        "::error file=requirements.txt,line=2,title=notreal 1.0%3A couldn't be checked::"
+        "notreal 1.0 couldn't be checked on linux-x86_64, ios-arm64. Lookup error: not on index.",
+        "::error file=requirements.txt,line=1,title=nowheels 0.9%3A can't install::"
+        "nowheels 0.9 can't install on ios-arm64; builds from source on linux-x86_64.",
+    ]
+
+
+def test_github_annotations_partial_ignore(capsys, fake_pypi, fixtures, monkeypatch):
+    # An ignored target leaves the package's other gaps annotated, without the ignored target.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(fixtures))
+    code, out, _ = run(
+        capsys,
+        str(fixtures / "uvproj"),
+        "-p",
+        "3.13",
+        "-t",
+        "linux-aarch64,win-arm64",
+        "--github-annotations",
+        "--ignore",
+        "fastlib:win-arm64",
+    )
+    assert annotation_lines(out)[0] == (
+        "::error file=uvproj/uv.lock,line=23,title=fastlib 2.0.0%3A builds from source::"
+        "fastlib 2.0.0 builds from source on linux-aarch64."
+    )
+
+
+def test_pixi_lock_json(capsys, fixtures, fake_pypi):
+    code, out, err = run(
+        capsys, str(fixtures / "pixiproj"), "-p", "3.13", "-t", "linux-x86_64,macos-arm64,win-amd64", "--json"
+    )
+    assert code == 1 and not err
+    data = json.loads(out)
+    assert data["sources"] == ["pixi.lock"]
+    packages = {p["name"]: p for p in data["packages"]}
+    assert packages["fastlib"]["results"] == {"linux-x86_64": "wheel", "macos-arm64": "source", "win-amd64": "source"}
+    # Locked for win-64 only, so not installed on the lock's other platforms (with the same Python)
+    assert packages["winonly"]["results"] == {"linux-x86_64": "n/a", "macos-arm64": "n/a", "win-amd64": "wheel"}
+    assert data["skipped"] == [
+        {"name": "internal", "reason": "private index"},
+        {"name": "gitdep", "reason": "git"},
+        {"name": "localpkg", "reason": "conda"},
+        {"name": "openssl", "reason": "conda"},
+        {"name": "python", "reason": "conda"},
+    ]
+    # Every PyPI package is looked up, since the lock records only pixi's pick per platform; the one from another
+    # index never is.
+    assert sorted(fake_pypi) == [
+        "https://pypi.org/pypi/fastlib/2.0.0/json",
+        "https://pypi.org/pypi/purewheel/3.1/json",
+        "https://pypi.org/pypi/winonly/311/json",
+    ]
+
+
+def test_pixi_lock_files_are_looked_up_for_other_targets(capsys, fixtures, tmp_path, fake_pypi):
+    # pixi locked fastlib's sdist (say, for an older glibc), but PyPI also has a wheel the target takes.
+    lock = (fixtures / "pixiproj" / "pixi.lock").read_text(encoding="utf-8")
+    lock = lock.replace(
+        "packages/aa/bb/fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl", "packages/ee/ff/fastlib-2.0.0.tar.gz", 1
+    )
+    (tmp_path / "pixi.lock").write_text(lock, encoding="utf-8")
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    packages = {p["name"]: p for p in json.loads(out)["packages"]}
+    assert packages["fastlib"]["results"] == {"linux-x86_64": "wheel"}
+    assert "https://pypi.org/pypi/fastlib/2.0.0/json" in fake_pypi
+
+
+def test_pixi_lock_failed_lookup_is_unknown(capsys, fixtures, monkeypatch):
+    from wheelgap import pypi
+
+    def down(url, timeout=20.0):
+        raise OSError("no network")
+
+    monkeypatch.setattr(pypi, "fetch_json", down)
+    code, out, _ = run(capsys, str(fixtures / "pixiproj"), "-p", "3.13", "-t", "macos-arm64", "--json")
+    packages = {p["name"]: p for p in json.loads(out)["packages"]}
+    # Not the sdist the lock records for macOS: the release may have a wheel pixi didn't pick.
+    assert packages["fastlib"]["results"] == {"macos-arm64": "unknown"}
+
+
+def test_pixi_lock_environment_option(capsys, fixtures, fake_pypi):
+    code, out, _ = run(
+        capsys, str(fixtures / "pixiproj"), "--environment", "test", "-p", "3.13", "-t", "linux", "--json"
+    )
+    assert [p["name"] for p in json.loads(out)["packages"]] == ["nowheels"]
+    code, out, err = run(capsys, str(fixtures / "pixiproj"), "--environment", "docs", "-p", "3.13")
+    assert code == 2 and not out
+    assert err == (
+        "wheelgap: error: pixi.lock: no environment 'docs' (it has: default, test); pick one with --environment\n"
+    )
+    code, out, err = run(capsys, str(fixtures / "uvproj"), "--environment", "test", "-p", "3.13")
+    assert code == 2 and err == "wheelgap: error: --environment applies to pixi.lock inputs only\n"
+
+
+def test_pixi_lock_offline_needs_the_index(capsys, fixtures, fake_pypi):
+    code, out, err = run(capsys, str(fixtures / "pixiproj"), "--offline", "-p", "3.13")
+    assert code == 2 and not out
+    assert err == (
+        "wheelgap: error: --offline: pixi.lock (it records only the file pixi picked for each platform) needs the "
+        "index for 3 packages (fastlib, purewheel, winonly); use a lockfile that lists each package's files, "
+        "or drop --offline\n"
+    )
+    assert fake_pypi == []
+
+
+MIRROR_PIXI = """\
+version: 7
+platforms:
+- name: linux-64
+environments:
+  default:
+    channels:
+    - url: https://conda.anaconda.org/conda-forge/
+    indexes:
+    - https://pypi.org/simple
+    - https://mirror.example.com/simple
+    packages:
+      linux-64:
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.13.9-hc97d973_101_cp313.conda
+      - pypi: https://mirror.example.com/files/fastlib-2.0.0.tar.gz
+packages:
+- conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.13.9-hc97d973_101_cp313.conda
+- pypi: https://mirror.example.com/files/fastlib-2.0.0.tar.gz
+  name: fastlib
+  version: 2.0.0
+  index: https://mirror.example.com/simple
+"""
+
+
+@pytest.mark.parametrize("online", [False, True])
+def test_pixi_lock_mirror_package_is_looked_up_never_kept(capsys, tmp_path, fake_pypi, monkeypatch, online):
+    # The lock's one file (an sdist) can't answer the target; the mirror the lock names has a wheel for it.
+    (tmp_path / "pixi.lock").write_text(MIRROR_PIXI, encoding="utf-8")
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://mirror.example.com/pypi")
+    args = ["-p", "3.13", "-t", "linux-x86_64", "--json"] + ["--online"] * online
+    code, out, _ = run(capsys, str(tmp_path), *args)
+    assert {p["name"]: p["results"] for p in json.loads(out)["packages"]} == {"fastlib": {"linux-x86_64": "wheel"}}
+    assert fake_pypi == ["https://mirror.example.com/pypi/fastlib/2.0.0/json"]
+    assert code == 0
+
+
+def test_pixi_lock_mirror_package_is_skipped_without_its_index(capsys, tmp_path, fake_pypi):
+    (tmp_path / "pixi.lock").write_text(MIRROR_PIXI, encoding="utf-8")
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--online", "--json")
+    assert json.loads(out)["skipped"] == [
+        {"name": "fastlib", "reason": "private index"},
+        {"name": "python", "reason": "conda"},
+    ]
+    assert fake_pypi == [] and code == 0
+
+
+def test_pixi_lock_next_to_another_lockfile(capsys, fixtures, tmp_path, fake_pypi):
+    (tmp_path / "pixi.lock").write_bytes((fixtures / "pixiproj" / "pixi.lock").read_bytes())
+    (tmp_path / "uv.lock").write_bytes((fixtures / "uvproj" / "uv.lock").read_bytes())
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert json.loads(out)["sources"] == ["uv.lock"]
+    assert err == (
+        f"wheelgap: note: {tmp_path / 'uv.lock'} was checked; {tmp_path / 'pixi.lock'} is in the same folder too "
+        "(pass it, or --environment, to check it instead)\n"
+    )
+    code, out, err = run(
+        capsys, str(tmp_path), "--environment", "default", "-p", "3.13", "-t", "linux-x86_64", "--json"
+    )
+    assert json.loads(out)["sources"] == ["pixi.lock"] and not err
+    code, out, err = run(capsys, str(tmp_path), "-q", "-p", "3.13", "-t", "linux-x86_64")
+    assert not err
+
+
+def test_pixi_lock_empty_environment_is_an_error(capsys, fixtures, fake_pypi):
+    code, out, err = run(capsys, str(fixtures / "pixiproj"), "--environment", "", "-p", "3.13")
+    assert (code, out, err) == (2, "", "wheelgap: error: --environment needs a name\n")
+
+
+def test_pixi_lock_counts_conda_packages_in_text(capsys, tmp_path, fake_pypi):
+    names = ["bzip2", "libffi", "ncurses", "openssl", "readline", "tk"]
+    selectors = [f"      - conda: https://conda.anaconda.org/conda-forge/linux-64/{n}-1.0-h0_0.conda" for n in names]
+    text = MIRROR_PIXI.replace(
+        "      - pypi: https://mirror.example.com/files/fastlib-2.0.0.tar.gz\n", "\n".join(selectors) + "\n"
+    )
+    (tmp_path / "pixi.lock").write_text(text, encoding="utf-8")
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert "skipped 7 non-index packages: 7 conda packages (not on PyPI)" in out
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--markdown")
+    assert "Skipped 7 non-index packages: 7 conda packages (not on PyPI)" in out
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert len(json.loads(out)["skipped"]) == 7  # --json lists each one
+    # Up to five are listed by name, after any others
+    (tmp_path / "pixi.lock").write_text(
+        text.replace(selectors[-1] + "\n", "").replace(selectors[-2] + "\n", ""), encoding="utf-8"
+    )
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert "skipped 5 non-index packages: bzip2 (conda), libffi (conda), ncurses (conda), openssl (conda)," in out
+    # Exactly six are counted; any other skipped package is still named before the count.
+    gitdep = "git+https://github.com/example/gitdep.git#aaaa"
+    six = text.replace(selectors[-1] + "\n", f"      - pypi: {gitdep}\n") + f"- pypi: {gitdep}\n  name: gitdep\n"
+    (tmp_path / "pixi.lock").write_text(six, encoding="utf-8")
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert "skipped 7 non-index packages: gitdep (git), 6 conda packages (not on PyPI)\n" in out

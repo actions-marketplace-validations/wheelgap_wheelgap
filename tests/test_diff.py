@@ -70,6 +70,14 @@ def test_diff_labels_targets_with_python_when_there_are_several(fake_pypi, tmp_p
     ]
 
 
+def test_diff_takes_next(fake_pypi, tmp_path, capsys):
+    old, new = write_pair(tmp_path, "ranged==1.5\n", "ranged==1.9\n")
+    assert main([old, new, "-p", "next", "-t", "linux-x86_64", "--json"]) == 1
+    out, err = capsys.readouterr()
+    assert [t["python"] for t in json.loads(out)["targets"]] == ["3.15"]
+    assert "wheelgap: note: next is Python 3.15, the newest CPython this wheelgap version knows" in err
+
+
 def test_diff_counts_a_package_it_can_no_longer_check_as_worse(fake_pypi, tmp_path, capsys):
     old, new = write_pair(tmp_path, "ranged==1.5\n", "ranged==9.9\n")  # 9.9 isn't on the index
     assert main([old, new, *TARGET]) == 1

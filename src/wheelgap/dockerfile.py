@@ -466,7 +466,12 @@ def _heredoc_rules(syntax: str | None) -> int | None:
 
 
 def _from_lines(text: str) -> list[str]:
-    """The arguments of every FROM instruction in order, with line continuations joined as Docker joins them.
+    """The arguments of every FROM instruction in order, with line continuations joined as Docker joins them."""
+    return [args for _, args in _from_instructions(text)]
+
+
+def _from_instructions(text: str) -> list[tuple[int, str]]:
+    """(line number, arguments) of every FROM instruction in order, the line being where the instruction starts.
 
     Heredoc bodies (`RUN <<EOF` ... `EOF`) are skipped, so a line in one is never read as an instruction.
     Follows Parse in BuildKit's parser.go at commit cedaeca8850a2bb536bbd1db72419f3cf491bdb5: each body starts
@@ -486,11 +491,12 @@ def _from_lines(text: str) -> list[str]:
     rules = _heredoc_rules(syntax)
     esc = re.escape(escape)
     continued = re.compile(rf"(?<!{esc}){esc}[ \t]*$")  # one escape char at the end, not two
-    found = []
+    found: list[tuple[int, str]] = []
     parts: list[str] = []  # an instruction continued onto the next line
+    start = 0  # the line the instruction being read starts on
     heredocs: deque[tuple[str, bool]] = deque()  # (delimiter, strip_tabs) of the bodies still to skip, in order
 
-    def finish(instruction: str, joined: bool) -> None:
+    def finish(instruction: str, joined: bool, line_number: int) -> None:
         # Docker splits the keyword off on ASCII whitespace only, so `FROM<U+00A0>python` isn't a FROM to it.
         words = re.split(r"[ \t\v\f\r]+", instruction, maxsplit=1)
         if words[0].upper() != "FROM" and re.match(r"(?i)FROM\s", words[0]):
@@ -507,7 +513,7 @@ def _from_lines(text: str) -> list[str]:
         if words and words[0].upper() == "FROM":
             if len(words) == 1:
                 raise DockerfileError("FROM with no image")
-            found.append(words[1])
+            found.append((line_number, words[1]))
 
     def heredocs_in(instruction: str) -> deque[tuple[str, bool]]:
         docs = deque(_heredocs(instruction, escape))
@@ -529,7 +535,7 @@ def _from_lines(text: str) -> list[str]:
             )
         return docs
 
-    for line in lines:
+    for number, line in enumerate(lines, 1):
         if heredocs:  # a body line: never an instruction, a comment or a continuation
             name, strip_tabs = heredocs[0]
             if (line.lstrip("\t") if strip_tabs else line) == name:
@@ -542,15 +548,17 @@ def _from_lines(text: str) -> list[str]:
         if not parts and stripped.startswith("#"):
             continue  # a comment never continues, even if it ends in the escape char
         if m := continued.search(line):
+            if not parts:
+                start = number
             parts.append(line[: m.start()])
             continue
         instruction = "".join([*parts, line])  # Docker joins continued lines with nothing in between
         # splitCommand: strings.TrimSpace, https://github.com/moby/buildkit/blob/cedaeca/frontend/dockerfile/parser/split_command.go
-        finish(instruction.strip(_GO_SPACES), joined=bool(parts))
+        finish(instruction.strip(_GO_SPACES), joined=bool(parts), line_number=start if parts else number)
         heredocs = heredocs_in(instruction)
         parts = []
     if parts:  # the file ended mid-continuation: Docker still reads what's there
-        finish("".join(parts).strip(_GO_SPACES), joined=len(parts) > 1)
+        finish("".join(parts).strip(_GO_SPACES), joined=len(parts) > 1, line_number=start)
         heredocs = heredocs_in("".join(parts))
     if heredocs:
         raise DockerfileError(f"unterminated heredoc <<{heredocs[0][0]} (BuildKit rejects it)")
@@ -633,17 +641,24 @@ def final_image(text: str) -> tuple[str, str | None]:
     any chain of stages) to a real image. Like Docker, a stage keeps the platform of the stage it
     builds on: a `--platform` on `FROM base` doesn't change what `base` was built for.
     """
-    stages: dict[str, tuple[str, str | None]] = {}
-    lines = _from_lines(text)
+    image, platform, _ = final_from(text)
+    return image, platform
+
+
+def final_from(text: str) -> tuple[str, str | None, int]:
+    """final_image, plus the line of the FROM instruction that names that image."""
+    stages: dict[str, tuple[str, str | None, int]] = {}
+    lines = _from_instructions(text)
     if not lines:
         raise DockerfileError("no FROM line found")
-    for args in lines[:-1]:
+    for number, args in lines[:-1]:
         image, platform, stage = _split_from(args)
         if (base := stages.get(image)) is not None:  # AS names are lowercased, references aren't
-            image, platform = base
+            image, platform, number = base
         if stage:
-            stages[stage] = (image, platform)
-    image, platform, _ = _split_from(lines[-1])
+            stages[stage] = (image, platform, number)
+    number, args = lines[-1]
+    image, platform, _ = _split_from(args)
     if (base := stages.get(image)) is not None:
         return base
     if stages and not any(c in image for c in ":/@$") and image.lower() not in (*IMAGE_NAMES, "scratch"):
@@ -651,7 +666,7 @@ def final_image(text: str) -> tuple[str, str | None]:
         raise DockerfileError(
             f"FROM {image}: not an earlier stage ({known}) or an official python image, pass -p/-t instead"
         )
-    return image, platform
+    return image, platform, number
 
 
 def parse_image(image: str, platform: str | None = None) -> ImageTarget:

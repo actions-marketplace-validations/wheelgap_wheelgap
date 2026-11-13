@@ -6,11 +6,13 @@ from wheelgap.targets import (
     DEFAULT_PLATFORMS,
     EVERY_NATIVE_PLATFORM,
     NATIVE_PLATFORMS,
+    NEWEST_PYTHON,
     PLATFORMS,
     Target,
     TargetError,
     build_targets,
     manylinux_platforms,
+    next_python_note,
     parse_python,
     resolve_platform,
 )
@@ -61,10 +63,50 @@ def t(platform: str, py: str = "3.13", **kw) -> Target:
 
 @pytest.mark.parametrize(
     "spec,expected",
-    [("3.13", (3, 13, False)), ("3.14t", (3, 14, True)), ("cp314t", (3, 14, True)), ("312", (3, 12, False))],
+    [
+        ("3.13", (3, 13, False)),
+        ("3.14t", (3, 14, True)),
+        ("cp314t", (3, 14, True)),
+        ("312", (3, 12, False)),
+        ("next", (*NEWEST_PYTHON, False)),
+        (" NEXT-T ", (*NEWEST_PYTHON, True)),
+    ],
 )
 def test_parse_python(spec, expected):
     assert parse_python(spec) == expected
+
+
+def test_newest_python_is_the_latest_release():
+    # 3.15 came out in October 2026. Move NEWEST_PYTHON on when the next one does (see AGENTS.md).
+    assert NEWEST_PYTHON == (3, 15)
+
+
+@pytest.mark.parametrize("spec", ["nextt", "next-", "next-3.15", "latest", "next3"])
+def test_parse_python_rejects_other_names(spec):
+    with pytest.raises(TargetError, match="try 3.13, 3.14t or next"):
+        parse_python(spec)
+
+
+def test_next_in_build_targets():
+    targets = build_targets(["3.14,next", "next-t", "3.15"], ["linux"])  # 3.15 and next are the same target
+    assert [t.python for t in targets] == ["3.14", "3.15", "3.15t"]
+    with pytest.raises(TargetError, match="no Pyodide build for Python 3.15"):
+        build_targets(["next"], ["pyodide"])
+
+
+@pytest.mark.parametrize(
+    "pythons,expected",
+    [
+        (["3.14", "next"], "next is Python 3.15, the newest CPython this wheelgap version knows"),
+        (
+            ["next-t,3.14", " Next "],
+            "next-t is Python 3.15t and next is Python 3.15, the newest CPython this wheelgap version knows",
+        ),
+        (["3.14", "3.15t"], None),
+    ],
+)
+def test_next_python_note(pythons, expected):
+    assert next_python_note(pythons) == expected
 
 
 def test_parse_python_rejects_garbage():
@@ -283,6 +325,12 @@ def test_build_targets_accepts_docker_platform_list():
 def test_build_targets_bad_glibc():
     with pytest.raises(TargetError):
         build_targets(["3.13"], [], glibc="new")
+
+
+@pytest.mark.parametrize("pythons", [[], [""], [","], ["  ", " , "]])
+def test_build_targets_empty_python(pythons):
+    with pytest.raises(TargetError, match=r"no Python version given \(-p is empty\)"):
+        build_targets(pythons, ["linux"])
 
 
 def test_pyodide_tags_per_python():

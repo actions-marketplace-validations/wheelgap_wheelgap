@@ -12,7 +12,7 @@ from packaging import tags
 from packaging.tags import Tag
 
 # Shared with Dockerfile image parsing. Versions are the major/minor libc ABI,
-# not the distribution's package revision (see the distro package links in README).
+# not the distribution's package revision (see the distro package links in docs/targets.md).
 DEBIAN_GLIBC = {"bullseye": "2.31", "bookworm": "2.36", "trixie": "2.41"}
 ALPINE_MUSL = "1.2"  # Alpine 3.13 and later; use --musl 1.1 for older releases.
 DISTROS: dict[str, tuple[str, str]] = {
@@ -205,6 +205,12 @@ PYODIDE_PLATFORMS: dict[tuple[int, int], list[str]] = {
     (3, 14): ["pyemscripten_2026_0_wasm32"],
 }
 
+# The newest CPython release wheelgap knows: `-p next` checks it, and `-p next-t` its free-threaded build. Move it on
+# when a new CPython comes out (each October), with PYODIDE_PLATFORMS here and PYODIDE_ABI in pyodide.py once Pyodide
+# has a build for it.
+NEWEST_PYTHON = (3, 15)
+NEXT_PYTHONS = {"next": False, "next-t": True}  # name -> free-threaded
+
 _PY_RE = re.compile(r"^(?:cp|py)?(\d)\.?(\d{1,2})(t?)$", re.ASCII)  # \d is ASCII only: int() would take ٣
 
 
@@ -273,11 +279,25 @@ def resolve_platform(name: str) -> str:
 
 
 def parse_python(spec: str) -> tuple[int, int, bool]:
-    """'3.14' -> (3, 14, False); '3.14t' / 'cp314t' -> (3, 14, True)."""
-    m = _PY_RE.match(spec.strip().lower())
+    """'3.14' -> (3, 14, False); '3.14t' / 'cp314t' -> (3, 14, True); 'next' / 'next-t' -> NEWEST_PYTHON."""
+    name = spec.strip().lower()
+    if name in NEXT_PYTHONS:
+        return NEWEST_PYTHON[0], NEWEST_PYTHON[1], NEXT_PYTHONS[name]
+    m = _PY_RE.match(name)
     if not m:
-        raise TargetError(f"can't parse Python version {spec!r} (try 3.13 or 3.14t)")
+        raise TargetError(f"can't parse Python version {spec!r} (try 3.13, 3.14t or next)")
     return int(m.group(1)), int(m.group(2)), bool(m.group(3))
+
+
+def next_python_note(pythons: Iterable[str]) -> str | None:
+    """'next is Python 3.15, ...' when -p values (comma-separated, like build_targets takes) include next or next-t."""
+    names = dict.fromkeys(p.strip().lower() for item in pythons for p in item.split(","))
+    used = [name for name in names if name in NEXT_PYTHONS]
+    if not used:
+        return None
+    newest = f"{NEWEST_PYTHON[0]}.{NEWEST_PYTHON[1]}"
+    resolved = " and ".join(f"{name} is Python {newest}{'t' * NEXT_PYTHONS[name]}" for name in used)
+    return f"{resolved}, the newest CPython this wheelgap version knows"
 
 
 _VERSION_EXAMPLES = {"glibc": "2.36", "musl": "1.2", "macOS": "14.0", "iOS": "13.0"}
@@ -386,6 +406,11 @@ class Target:
             return list(tags.android_platforms(self.android_api, arch))
         return [arch]
 
+    @cached_property
+    def platform_tag_set(self) -> frozenset[str]:
+        """platform_tags() as a set, worked out once per target: --explain asks for every rejected wheel."""
+        return frozenset(self.platform_tags())
+
     @property
     def unknown_markers(self) -> frozenset[str]:
         """Marker names whose value this target doesn't decide (on top of check.py's _UNKNOWABLE)."""
@@ -468,6 +493,8 @@ def build_targets(
     plats = resolve_platforms(platforms) or list(DEFAULT_PLATFORMS)
 
     pys = list(dict.fromkeys(parse_python(p) for item in pythons for p in item.split(",") if p.strip()))
+    if not pys:
+        raise TargetError("no Python version given (-p is empty)")
     versions = dict(
         glibc=parse_version_pair(glibc, "glibc"),
         musl=parse_version_pair(musl, "musl"),
