@@ -145,4 +145,7 @@ behind the [coverage tracker](https://wheelgap.github.io/tracker/).
 
 Add `--pyodide-lock PATH_OR_URL` once per Pyodide release (each is for one Python) to count the packages Pyodide ships
 itself as `bundled` on that Python's `pyodide` target; the per-target `summary` counts them too, and `pyodide_locks`
-in the JSON lists the locks used. Pyodide targets with no lock get a note on stderr.
+in the JSON lists the locks used. A package with a `bundled` cell also gets `bundled_versions` (the version each of
+those locks ships, by Python), `bundled_version` (that version when they all agree, otherwise `null`) and
+`bundled_version_differs` (whether any differs from the release the scan checked). Pyodide targets with no lock get a
+note on stderr.
