@@ -108,10 +108,12 @@ psycopg2 2.9.10: note from the wheelgap tracker for linux-x86_64 (alternative, c
 - `--notes` needs `--explain`, and `--no-notes` overrides `notes = true` for one run.
 - Only notes for a platform with a gap are shown. A note for `all` platforms covers the nine the tracker scans
   (`linux-x86_64`, `linux-aarch64`, `musl-x86_64`, `musl-aarch64`, `macos-x86_64`, `macos-arm64`, `win-amd64`,
-  `win-arm64` and `pyodide`), not other targets. The tracker checks the latest release, so a note limited to some
-  releases (its `versions`) is shown only when your version is a plain release that matches them.
+  `win-arm64` and `pyodide`), not other targets. A note that lists Pythons (its `python`, such as `["3.13"]` or
+  `["3.14t"]`) is shown only for gaps on those Pythons. The tracker checks the latest release, so a note limited to
+  some releases (its `versions`) is shown only when your version is a plain release that matches them.
 - With `--json --explain`, each package gets a `notes` list (empty without `--notes` or when there are none), each note
-  with the tracker's `platforms`, `kind`, `text`, `links`, `versions` and `updated`, plus the `targets` (labels, like
+  with the tracker's `platforms`, `kind`, `text`, `links`, `versions` and `updated` (and `python`, when the tracker
+  sets it), plus the `targets` (labels, like
   `rejected`'s keys) it covers. `--markdown` puts them in the collapsed section with the rejected wheels, as plain
   text.
 - Notes come from a public repository, so treat their text as plain text, not markup. wheelgap shows only notes in the

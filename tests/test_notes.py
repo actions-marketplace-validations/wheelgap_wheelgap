@@ -92,6 +92,35 @@ def test_all_platforms_note(capsys, tmp_path, tracker):
     ]
 
 
+def test_per_python_note_shown_for_matching_python_and_not_another(capsys, tmp_path, tracker):
+    tracker.add("pkg", note(python=["3.13"]))
+    folder = uv_lock(tmp_path)
+    code, out, err = run(capsys, folder, "-p", "3.13,3.14t", "-t", "linux-x86_64", "--explain", "--notes")
+    assert code == 1 and not err
+    assert f"{HEAD} linux-x86_64 {CHECKED}\n  - {NOTE['text']}\n" in out
+    pkg = explain_json(capsys, folder, "-p", "3.13,3.14t", "-t", "linux-x86_64")["pkg"]
+    assert pkg["notes"] == [{**NOTE, "python": ["3.13"], "targets": ["3.13 linux-x86_64"]}]
+
+    code2, out2, err2 = run(capsys, folder, "-p", "3.14t", "-t", "linux-x86_64", "--explain", "--notes")
+    assert code2 == 1 and not err2 and HEAD not in out2
+    pkg2 = explain_json(capsys, folder, "-p", "3.14t", "-t", "linux-x86_64")["pkg"]
+    assert pkg2["notes"] == []
+
+
+def test_free_threaded_note_is_not_shown_for_the_regular_build(capsys, tmp_path, tracker):
+    tracker.add("pkg", note(python=["3.14t"]))
+    folder = uv_lock(tmp_path)
+    pkg = explain_json(capsys, folder, "-p", "3.14,3.14t", "-t", "linux-x86_64")["pkg"]
+    assert pkg["notes"] == [{**NOTE, "python": ["3.14t"], "targets": ["3.14t linux-x86_64"]}]
+
+
+def test_note_without_python_shown_for_all_pythons(capsys, tmp_path, tracker):
+    tracker.add("pkg", note())
+    folder = uv_lock(tmp_path)
+    pkg = explain_json(capsys, folder, "-p", "3.13,3.14t", "-t", "linux-x86_64")["pkg"]
+    assert pkg["notes"] == [{**NOTE, "targets": ["3.13 linux-x86_64", "3.14t linux-x86_64"]}]
+
+
 @pytest.mark.parametrize(
     "checked,versions,shown",
     [
@@ -275,6 +304,12 @@ def test_failed_lookup_prints_nothing_extra(capsys, tmp_path, tracker, respond):
         {"links": ["https://example.org/a", "https://example.org/a"]},
         {"links": ["https:///no-host"]},
         {"links": ["https://"]},
+        # A bad python field: empty, not a list, a bare string, duplicates, or not matching ^3\.\d+t?$.
+        {"python": []},
+        {"python": "3.13"},
+        {"python": 123},
+        {"python": ["3.13", "3.13"]},
+        {"python": ["py3"]},
         # GitHub Actions workflow commands, legacy (##[ anywhere) and v2 (:: starting a word).
         {"text": "x ##[set-output name=ok;]true"},
         {"text": "##[add-mask]secret"},
@@ -412,6 +447,35 @@ def test_cached_for_a_day(capsys, tmp_path, tracker):
     assert len(tracker.calls) == 2
     run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes", "--no-cache")
     assert len(tracker.calls) == 4
+
+
+def test_note_with_python_survives_cache_round_trip(capsys, tmp_path, tracker):
+    tracker.add("pkg", note(python=["3.13"]))
+    folder = uv_lock(tmp_path)
+    pkg1 = explain_json(capsys, folder, "-p", "3.13", "-t", "linux-x86_64")["pkg"]
+    assert len(tracker.calls) == 1
+    assert pkg1["notes"] == [{**NOTE, "python": ["3.13"], "targets": ["linux-x86_64"]}]
+    pkg2 = explain_json(capsys, folder, "-p", "3.13", "-t", "linux-x86_64")["pkg"]
+    assert len(tracker.calls) == 1
+    assert pkg2["notes"] == [{**NOTE, "python": ["3.13"], "targets": ["linux-x86_64"]}]
+
+
+def test_note_covers_python():
+    from wheelgap.targets import Target
+
+    t313 = Target(3, 13, False, "linux-x86_64")
+    t314t = Target(3, 14, True, "linux-x86_64")
+    t313_mac = Target(3, 13, False, "macos-arm64")
+
+    n_py = notes.Note(("linux-x86_64",), "alternative", "txt", ("https://example.org/",), None, "2026-11-11", ("3.13",))
+    assert n_py.covers(t313)
+    assert not n_py.covers(t314t)
+    assert not n_py.covers(t313_mac)
+
+    n_all = notes.Note(("linux-x86_64",), "alternative", "txt", ("https://example.org/",), None, "2026-11-11", None)
+    assert n_all.covers(t313)
+    assert n_all.covers(t314t)
+    assert not n_all.covers(t313_mac)
 
 
 HINT = "wheelgap: add --notes to show the tracker's notes for these packages (sends their names to wheelgap.github.io)"

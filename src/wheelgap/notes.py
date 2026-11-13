@@ -29,6 +29,7 @@ from packaging.version import InvalidVersion, Version
 
 from . import cache, origin, pypi
 from .sources import Package, Source
+from .targets import Target
 
 TRACKER = "https://wheelgap.github.io/tracker/data/packages"
 SCHEMA = 1  # of the tracker's package files: it goes up if a field changes meaning or goes away
@@ -65,6 +66,8 @@ _NAME = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*", re.ASCII)
 # form, when it has "##[" anywhere. A note with either is dropped, whatever prints it: a word starting with "::" in
 # its text (C++'s std::vector is fine), or "##[" in its text or a link.
 _COMMAND = re.compile(r"(?<![\w:])::")
+_PYTHON = re.compile(r"^3\.\d+t?$", re.ASCII)
+_KEYS = frozenset({"platforms", "kind", "text", "links", "versions", "updated"})
 
 
 @dataclass(frozen=True)
@@ -75,9 +78,12 @@ class Note:
     links: tuple[str, ...]
     versions: str | None  # a version specifier, or None for every release
     updated: str  # YYYY-MM-DD
+    python: tuple[str, ...] | None = None
 
-    def covers(self, platform: str) -> bool:
-        return platform in (PLATFORMS if self.platforms == ("all",) else self.platforms)
+    def covers(self, target: Target) -> bool:
+        if self.python is not None and target.python not in self.python:
+            return False
+        return target.platform in (PLATFORMS if self.platforms == ("all",) else self.platforms)
 
     def applies_to(self, version: str | None) -> bool:
         """Whether the note is about this release. A note limited to some releases is shown only when the version
@@ -95,7 +101,7 @@ class Note:
             return False
 
     def as_json(self) -> dict:
-        return {
+        out: dict[str, object] = {
             "platforms": list(self.platforms),
             "kind": self.kind,
             "text": self.text,
@@ -103,6 +109,9 @@ class Note:
             "versions": self.versions,
             "updated": self.updated,
         }
+        if self.python is not None:
+            out["python"] = list(self.python)
+        return out
 
 
 def _line(value: object) -> bool:
@@ -133,7 +142,7 @@ def _date(value: object) -> bool:
 
 def _note(raw: object) -> Note | None:
     """A published note, or None if it isn't exactly in the format."""
-    if not isinstance(raw, dict) or set(raw) != {"platforms", "kind", "text", "links", "versions", "updated"}:
+    if not isinstance(raw, dict) or set(raw) not in (_KEYS, _KEYS | {"python"}):
         return None
     platforms, kind, text, links, versions = raw["platforms"], raw["kind"], raw["text"], raw["links"], raw["versions"]
     if not isinstance(platforms, list) or not platforms or len(set(map(str, platforms))) != len(platforms):
@@ -152,7 +161,18 @@ def _note(raw: object) -> Note | None:
         isinstance(versions, str) and versions.strip() and all(_CLAUSE.fullmatch(c) for c in versions.split(","))
     ):
         return None
-    return Note(tuple(platforms), kind, text, tuple(links), versions, raw["updated"])
+    py: tuple[str, ...] | None = None
+    if "python" in raw:
+        raw_py = raw["python"]
+        if (
+            not isinstance(raw_py, list)
+            or not raw_py
+            or not all(isinstance(p, str) and _PYTHON.fullmatch(p) for p in raw_py)
+            or len(set(raw_py)) != len(raw_py)
+        ):
+            return None
+        py = tuple(raw_py)
+    return Note(tuple(platforms), kind, text, tuple(links), versions, raw["updated"], py)
 
 
 def parse(data: object, name: str) -> list[Note] | None:
