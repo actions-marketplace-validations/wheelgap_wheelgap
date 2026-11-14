@@ -127,7 +127,8 @@ next to the lock. `--explain` shows the dependency path for these locks.
 **Dependency selection** (Poetry 2.x locks): `--group`, `--only-group` and `--no-dev` work with Poetry's meanings, and
 configured `groups` apply too. `main` and every group not marked `optional = true` in `pyproject.toml` count;
 `--group` adds a group (like `poetry install --with`), `--no-dev` leaves out `dev`, and `--only-group` checks only the
-named groups (`main` only if named). A package counts if any of its groups is selected, with the markers of those
+named groups (`main` only if named). As with `poetry install --without dev`, `--no-dev` is an error when neither the
+lock nor its `pyproject.toml` has a `dev` group. A package counts if any of its groups is selected, with the markers of those
 groups. A command-line selection on a Poetry 1.x lock (no per-package groups) is an error; a configured selection
 leaves a 1.x lock unfiltered.
 

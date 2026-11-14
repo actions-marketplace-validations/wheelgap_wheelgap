@@ -473,6 +473,8 @@ def _select_poetry(source: Source, selection: UvSelection) -> None:
         pep735 = data.get("dependency-groups")
         known.update(canonicalize_name(name) for name in (pep735 if isinstance(pep735, dict) else {}))
         declared = data.get("tool", {}).get("poetry", {})
+        if isinstance(declared.get("dev-dependencies"), dict):
+            known.add("dev")  # the old [tool.poetry.dev-dependencies] table declares `dev`, even when it's empty
         for name, group in (declared.get("group") or {}).items():
             known.add(canonicalize_name(name))
             if isinstance(group, dict) and group.get("optional") is True:
@@ -487,6 +489,11 @@ def _select_poetry(source: Source, selection: UvSelection) -> None:
     unknown = (selection.groups | selection.only_groups) - known
     if unknown:
         raise SourceError(f"{source.label}: unknown groups: {', '.join(sorted(unknown))}")
+    if selection.no_dev and "dev" not in known:
+        # Like `poetry install --without dev` on a project with no dev group (Poetry 2.5.1).
+        # Without pyproject.toml an empty dev group can't be seen (the lock only lists groups that have packages).
+        unseen = "" if pyproject is not None and pyproject.is_file() else "; no pyproject.toml beside it to declare one"
+        raise SourceError(f"{source.label}: Group(s) not found: dev (via --no-dev){unseen}")
     if selection.only_groups:
         chosen = set(selection.only_groups | selection.groups)
     else:
