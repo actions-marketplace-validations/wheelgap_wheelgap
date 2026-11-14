@@ -542,6 +542,62 @@ def test_poetry_lock_unknown_group_is_an_error(poetry_groups, capsys, fake_pypi)
     assert "unknown groups: nosuch" in capsys.readouterr().err
 
 
+POETRY_NO_DEV_LOCK = """\
+[[package]]
+name = "app-dep"
+version = "1.0"
+groups = ["main"]
+files = [{file = "app_dep-1.0-py3-none-any.whl", hash = "sha256:00"}]
+
+[metadata]
+lock-version = "2.1"
+"""
+
+
+@pytest.mark.parametrize(
+    ("pyproject", "argv"),
+    [
+        (None, ["--no-dev"]),
+        ("[tool.poetry.group.docs.dependencies]\n", ["--no-dev"]),
+        ("[tool.poetry.group.docs.dependencies]\n", ["--no-dev", "--group", "docs"]),
+        ("[tool.poetry.group.docs.dependencies]\n", ["--no-dev", "--only-group", "main"]),
+        ('[tool.wheelgap]\ngroups = ["docs"]\n\n[tool.poetry.group.docs.dependencies]\n', ["--no-dev"]),
+    ],
+)
+def test_poetry_lock_no_dev_without_a_dev_group_is_an_error(tmp_path, capsys, fake_pypi, pyproject, argv):
+    # Like `poetry install --without dev` (Poetry 2.5.1): "Group(s) not found: dev (via --without)".
+    (tmp_path / "poetry.lock").write_text(POETRY_NO_DEV_LOCK, encoding="utf-8")
+    if pyproject is not None:
+        (tmp_path / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    assert main([str(tmp_path), *argv]) == 2
+    err = capsys.readouterr().err
+    assert "Group(s) not found: dev (via --no-dev)" in err
+    assert ("no pyproject.toml beside it to declare one" in err) == (pyproject is None)
+    assert main([str(tmp_path), *argv[1:], "-t", "linux-x86_64", "-p", "3.13"]) == 0  # fine without --no-dev
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    "pyproject",
+    [
+        "[tool.poetry.dev-dependencies]\n",  # Poetry 2.5.1 accepts --without dev for each of these empty dev groups
+        "[tool.poetry.group.dev.dependencies]\n",
+        "[dependency-groups]\ndev = []\n",
+    ],
+)
+def test_poetry_lock_no_dev_with_an_empty_declared_dev_group(tmp_path, capsys, fake_pypi, pyproject):
+    (tmp_path / "poetry.lock").write_text(POETRY_NO_DEV_LOCK, encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    code, names = _poetry_names(capsys, [str(tmp_path), "--no-dev"])
+    assert code == 0 and names == {"app-dep"}
+
+
+def test_poetry_lock_no_dev_with_a_dev_group_in_the_lock_only(poetry_groups, capsys, fake_pypi):
+    (poetry_groups / "pyproject.toml").unlink()  # the lock's own groups still say there's a dev group
+    code, names = _poetry_names(capsys, [str(poetry_groups), "--no-dev"])
+    assert code == 1 and names == {"app-dep", "docstool"}  # without pyproject.toml, docs isn't known to be optional
+
+
 def test_poetry_lock_unknown_extra_is_an_error(poetry_groups, capsys, fake_pypi):
     # Like `poetry install --extras api`: "Extra [api] is not specified." This lock has no [extras] table.
     assert main([str(poetry_groups), "--extra", "api"]) == 2
@@ -947,12 +1003,19 @@ LEGACY = '[tool.poetry]\npackage-mode = false\n\n[tool.poetry.dependencies]\npyt
     [
         # 1. No pyproject.toml beside the lock: nothing shows how the extras are declared. Poetry 2.2.1 installs
         # requests and certifi on macOS, from `requests; sys_platform == 'darwin'` plus s3 = ["requests"].
-        (LOST_MARKER_LOCK, None, ["--no-dev"], "3.13", {"requests", "certifi"}, "no pyproject.toml beside it"),
+        (
+            LOST_MARKER_LOCK,
+            None,
+            ["--only-group", "main"],
+            "3.13",
+            {"requests", "certifi"},
+            "no pyproject.toml beside it",
+        ),
         (
             LOST_MARKER_LOCK,
             '[project]\nname = "x"\nversion = "0"\ndependencies = ["requests; sys_platform == \'darwin\'"]\n\n'
             '[project.optional-dependencies]\ns3 = ["requests"]\n',
-            ["--no-dev"],
+            ["--only-group", "main"],
             "3.13",
             {"requests", "certifi"},
             "requests in an extra",
@@ -961,7 +1024,7 @@ LEGACY = '[tool.poetry]\npackage-mode = false\n\n[tool.poetry.dependencies]\npyt
         (
             LEGACY_EXTRAS_LOCK,
             LEGACY + 'six = "*"\nattrs = { version = "*", optional = true }\n\n[tool.poetry.extras]\ns = ["six"]\n',
-            ["--no-dev"],
+            ["--only-group", "main"],
             "3.13",
             {"attrs", "colorama", "six"},
             "six in an extra",
@@ -970,7 +1033,7 @@ LEGACY = '[tool.poetry]\npackage-mode = false\n\n[tool.poetry.dependencies]\npyt
             LEGACY_EXTRAS_LOCK,
             LEGACY + 'colorama = { version = "*", platform = "darwin" }\nattrs = { version = "*", optional = true }\n\n'
             '[tool.poetry.extras]\nc = ["colorama", "attrs"]\n',
-            ["--no-dev"],
+            ["--only-group", "main"],
             "3.13",
             {"attrs", "colorama", "six"},
             "colorama in an extra",
@@ -1200,7 +1263,7 @@ PEP621 = '[project]\nname = "x"\nversion = "0"\nrequires-python = ">=3.10"\n'
             LEGACY + 'requests = { version = "*", optional = true }\n'
             'idna = { version = "*", markers = "sys_platform == \'win32\'" }\n\n'
             '[tool.poetry.extras]\na = ["requests"]\n',
-            ["--no-dev"],
+            ["--only-group", "main"],
             {"idna"},
         ),
         # B3: a group dependency with a marker that the extra reaches; Poetry 2.2.1 installs pysocks.
@@ -1241,7 +1304,7 @@ PEP621 = '[project]\nname = "x"\nversion = "0"\nrequires-python = ">=3.10"\n'
             ),
             PEP621 + "dependencies = [\"requests; python_version < '3.11'\"]\n\n"
             '[project.optional-dependencies]\nnet = ["urllib3"]\n',
-            ["--no-dev"],
+            ["--only-group", "main"],
             {"urllib3"},
         ),
     ],
@@ -1262,7 +1325,7 @@ def test_poetry_lock_unconditional_dependency_an_extra_reaches_needs_no_note(tmp
     (tmp_path / "poetry.lock").write_text(lock, encoding="utf-8")
     pyproject = PEP621 + 'dependencies = ["idna"]\n\n[project.optional-dependencies]\na = ["requests"]\n'
     (tmp_path / "pyproject.toml").write_text(pyproject, encoding="utf-8")
-    code, names, err = _names(capsys, [str(tmp_path), "--no-dev"], target="macos-arm64", python="3.12")
+    code, names, err = _names(capsys, [str(tmp_path), "--only-group", "main"], target="macos-arm64", python="3.12")
     assert names == {"idna"} and "note" not in err
 
 
