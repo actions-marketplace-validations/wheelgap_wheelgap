@@ -102,6 +102,13 @@ PyPI's. That's one rule, shared by the three, and it holds when all of these do:
   pointing at another index. With either, none of the three sends anything, and a note on stderr says so.
 - **The package comes from an index:** not a Git, path, URL, editable or conda package, and not one already skipped
   as `private index`.
+- **No other input of the run says otherwise:** when a run has several inputs and any of them places a name
+  somewhere other than PyPI, or can't place it (a `pdm.lock` entry, say, a conda package in a `pixi.lock`, or a
+  `poetry.lock` package that `--no-dev` left out), that name isn't sent for the other inputs either (nor for another
+  entry of the same input, such as a package a `uv.lock` forks between pypi.org and another index). An `acme-secret`
+  on a private index in `a/uv.lock` keeps the `acme-secret==1.0` in `b/requirements.txt` in, too.
+  This goes by the names wheelgap reads from each input, so it can't cover a package whose name the input doesn't
+  give, such as a path or Git URL line with no name in a requirements file.
 - **And either** its lock records its index as exactly `https://pypi.org/simple` (a `uv.lock` registry or a
   `pylock.toml` index; a `poetry.lock` legacy source or a `pixi.lock` index with that exact URL counts too, except for
   `--notes`), **or** this run looked it up and found it on pypi.org, and nothing points pip or uv at another index:
