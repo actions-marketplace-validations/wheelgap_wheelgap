@@ -60,9 +60,10 @@ jobs:
           comment: true
 ```
 
-- `args` must then start with the lockfile's path, followed only by `-p` and `-t` (what `wheelgap diff` takes); anything
-  else exits 2. The step exits 1 when something got worse and 0 when nothing did, but only when `wheelgap diff`'s exit
-  code and its report agree; anything else, such as bad input or a run that printed no report, exits 2.
+- `args` must then start with the lockfile's path, followed only by what `wheelgap diff` takes: `-p` and `-t` (and,
+  after 0.9.0, `--glibc`, `--musl`, `--macos` and `--distro`); anything else exits 2. The step exits 1 when something
+  got worse and 0 when nothing did, but only when `wheelgap diff`'s exit code and its report agree; anything else, such
+  as bad input or a run that printed no report, exits 2.
 - The lockfile must exist on both sides: one the pull request adds exits 2. A requirements file that includes others
   with `-r` or `-c` exits 2 too, because only the lockfile itself (and the `pyproject.toml` beside it) is read from git.
 - `compare-to: base` needs a `pull_request` event and the commit `actions/checkout` checks out for it by default: the

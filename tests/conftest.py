@@ -33,6 +33,22 @@ FAKE_INDEX = {
     },
     "yanked": {"1.0": [{"filename": "yanked-1.0-py3-none-any.whl", "yanked": True}]},
     "halfyanked": {"2.0": [{"filename": "halfyanked-2.0-py3-none-any.whl", "yanked": True}, "halfyanked-2.0.tar.gz"]},
+    # Only Linux wheels for a newer glibc / musl / macOS than a flag can lower the floor to: fine at the defaults,
+    # source with --glibc 2.28 (e.g. RHEL 8), --musl 1.1 or --macos 13.0 (diff tests; #286).
+    "glibclag": {
+        "1.0": ["glibclag-1.0-cp313-cp313-manylinux_2_28_x86_64.whl", "glibclag-1.0.tar.gz"],
+        "1.1": ["glibclag-1.1-cp313-cp313-manylinux_2_34_x86_64.whl", "glibclag-1.1.tar.gz"],
+    },
+    # Only a wheel for a newer musl / macOS than a flag can lower the floor to: fine at the defaults (musl 1.2,
+    # macOS 14.0), source at --musl 1.1 or --macos 13.0 (diff tests; #286).
+    "musllag": {
+        "1.0": ["musllag-1.0-cp313-cp313-musllinux_1_1_x86_64.whl", "musllag-1.0.tar.gz"],
+        "1.1": ["musllag-1.1-cp313-cp313-musllinux_1_2_x86_64.whl", "musllag-1.1.tar.gz"],
+    },
+    "maclag": {
+        "1.0": ["maclag-1.0-cp313-cp313-macosx_13_0_arm64.whl", "maclag-1.0.tar.gz"],
+        "1.1": ["maclag-1.1-cp313-cp313-macosx_14_0_arm64.whl", "maclag-1.1.tar.gz"],
+    },
 }
 
 

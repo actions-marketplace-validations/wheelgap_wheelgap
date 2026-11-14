@@ -2,7 +2,7 @@
 
 ```text
 wheelgap [OPTIONS] [INPUT ...]
-wheelgap diff [-p VER] [-t PLATFORM] [--json] OLD NEW
+wheelgap diff [-p VER] [-t PLATFORM] [--glibc X.Y] [--musl X.Y] [--distro NAME] [--macos X.Y] [--json] OLD NEW
 wheelgap mcp            (after 0.9.0; or wheelgap-mcp)
 ```
 
@@ -292,7 +292,7 @@ Show the flags and some examples, then exit.
 ### `wheelgap diff` {#diff}
 
 Compare two lockfiles: which packages got worse on a target, and which new packages have gaps. It takes `-p`, `-t`
-and `--json`. See [Comparing two lockfiles](diff.md).
+and `--json` (and, after 0.9.0, `--glibc`, `--musl`, `--distro` and `--macos`). See [Comparing two lockfiles](diff.md).
 
 ### `wheelgap mcp` {#mcp}
 

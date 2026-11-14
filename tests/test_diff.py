@@ -78,6 +78,94 @@ def test_diff_takes_next(fake_pypi, tmp_path, capsys):
     assert "wheelgap: note: next is Python 3.15, the newest CPython this wheelgap version knows" in err
 
 
+# Platform flags (#286): the new release's only Linux wheel is manylinux_2_34, the old one's is manylinux_2_28, so the
+# move is fine at the default glibc (2.36) but worse when the deployment floor is lower, as on RHEL 8 (glibc 2.28).
+NEW_GLIBC_PAIR = ("glibclag==1.0\n", "glibclag==1.1\n")
+GLIBCLAG_WORSE = [
+    "glibclag 1.0 → 1.1",
+    "  linux-x86_64: ✓ → ● source",
+    "1 package got worse.",
+]
+
+
+def test_diff_default_glibc_ignores_a_manylinux_floor_the_target_is_above(fake_pypi, tmp_path, capsys):
+    old, new = write_pair(tmp_path, *NEW_GLIBC_PAIR)
+    assert main([old, new, *TARGET]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]
+
+
+def test_diff_glibc_flag_counts_a_lost_manylinux_wheel(fake_pypi, tmp_path, capsys):
+    old, new = write_pair(tmp_path, *NEW_GLIBC_PAIR)
+    assert main([old, new, *TARGET, "--glibc", "2.28"]) == 1
+    assert capsys.readouterr().out.splitlines() == GLIBCLAG_WORSE
+
+
+def test_diff_musl_flag_counts_a_lost_musllinux_wheel(fake_pypi, tmp_path, capsys):
+    # The new release's only musl wheel is musllinux_1_2, the old one's is musllinux_1_1.
+    old, new = write_pair(tmp_path, "musllag==1.0\n", "musllag==1.1\n")
+    assert main([old, new, "-p", "3.13", "-t", "musl-x86_64"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]
+    assert main([old, new, "-p", "3.13", "-t", "musl-x86_64", "--musl", "1.1"]) == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "musllag 1.0 → 1.1",
+        "  musl-x86_64: ✓ → ● source",
+        "1 package got worse.",
+    ]
+
+
+def test_diff_macos_flag_counts_a_wheel_above_the_floor(fake_pypi, tmp_path, capsys):
+    # The new release's only macOS wheel is macosx_14_0, the old one's is macosx_13_0.
+    old, new = write_pair(tmp_path, "maclag==1.0\n", "maclag==1.1\n")
+    assert main([old, new, "-p", "3.13", "-t", "macos-arm64"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]
+    assert main([old, new, "-p", "3.13", "-t", "macos-arm64", "--macos", "13.0"]) == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "maclag 1.0 → 1.1",
+        "  macos-arm64: ✓ → ● source",
+        "1 package got worse.",
+    ]
+
+
+def test_diff_distro_supplies_the_libc_version(fake_pypi, tmp_path, capsys):
+    # rhel-8 is glibc 2.28, so it must see what --glibc 2.28 sees; the alias rocky-8 resolves the same way.
+    old, new = write_pair(tmp_path, *NEW_GLIBC_PAIR)
+    assert main([old, new, *TARGET, "--distro", "rhel-8"]) == 1
+    assert capsys.readouterr().out.splitlines() == GLIBCLAG_WORSE
+    assert main([old, new, *TARGET, "--distro", "rocky-8", "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    (item,) = data["worse"]
+    assert item["name"] == "glibclag" and item["targets"]["linux-x86_64"]["new_status"] == "source"
+
+
+def test_diff_distro_does_not_select_targets(fake_pypi, tmp_path, capsys):
+    # --distro supplies a libc version only: with -t win-amd64 the Linux glibc floor is never checked (glibclag is
+    # source on both sides there). Had --distro selected linux-x86_64, the move would be reported.
+    old, new = write_pair(tmp_path, *NEW_GLIBC_PAIR)
+    assert main([old, new, "-p", "3.13", "-t", "win-amd64", "--distro", "rhel-8"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]
+
+
+def test_diff_explicit_libc_wins_over_distro(fake_pypi, tmp_path, capsys):
+    glibc_dir = tmp_path / "glibc"
+    musl_dir = tmp_path / "musl"
+    glibc_dir.mkdir()
+    musl_dir.mkdir()
+    old, new = write_pair(glibc_dir, *NEW_GLIBC_PAIR)
+    assert main([old, new, *TARGET, "--distro", "ubuntu-24.04", "--glibc", "2.28"]) == 1
+    assert capsys.readouterr().out.splitlines() == GLIBCLAG_WORSE
+    old_m, new_m = write_pair(musl_dir, "musllag==1.0\n", "musllag==1.1\n")
+    assert main([old_m, new_m, "-p", "3.13", "-t", "musl-x86_64", "--distro", "alpine", "--musl", "1.1"]) == 1
+    assert "musllag 1.0 → 1.1" in capsys.readouterr().out
+
+
+def test_diff_unknown_distro_exits_2(fake_pypi, tmp_path, capsys):
+    old, new = write_pair(tmp_path, "purewheel==3.1\n", "purewheel==3.1\n")
+    assert main([old, new, *TARGET, "--distro", "not-a-distro"]) == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.startswith("wheelgap: error: TargetError: ") and "unknown distro 'not-a-distro'" in err
+
+
 def test_diff_counts_a_package_it_can_no_longer_check_as_worse(fake_pypi, tmp_path, capsys):
     old, new = write_pair(tmp_path, "ranged==1.5\n", "ranged==9.9\n")  # 9.9 isn't on the index
     assert main([old, new, *TARGET]) == 1
