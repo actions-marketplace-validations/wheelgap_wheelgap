@@ -224,6 +224,46 @@ It's only a hint, so it never changes a status, the summary or the exit code: a 
   down to the subdir, Python, ABI and virtual-package needs of each build of the checked version; `--no-cache` skips
   the cache and `--online` asks again. Failures aren't cached.
 
+### Newer releases with wheels {#suggest}
+
+!!! note "After 0.9.0"
+    `--suggest` is not in 0.9.0.
+
+`--suggest` adds, after a package's `--explain` blocks (it needs `--explain`), the lowest newer release with a wheel
+for each of its gap targets. For example, `wheelgap fastlib==2.0.0 -t musl-aarch64,win-amd64,linux-riscv64 --explain
+--suggest` could add:
+
+```text
+fastlib 2.0.0 -> 2.1.0 has wheels for musl-aarch64, win-amd64
+fastlib 2.0.0: no newer release has a wheel for linux-riscv64
+```
+
+- **Which release.** Only a release that keeps a wheel on every target where the checked version has one counts, so a
+  suggestion never trades one gap for another. Gap targets that no such release has a wheel for get a "no newer
+  release" line, ending `without losing one elsewhere` when some newer release has a wheel for it but drops another.
+  The other gap targets get the lowest counted release with a wheel for every one of them, when there is one;
+  otherwise each its own nearest, one line per release. A wheel counts when it isn't yanked, the target accepts its
+  tags, and its `Requires-Python` admits the target's Python. Pre-releases count only when the checked version is one,
+  and versions that don't parse are skipped.
+- **Outside your specifier.** The suggestion looks at every newer release, not only those your input allows: a range
+  or a lock entry (`foo<2` resolving to 1.9) may be told to move to 2.1, so check it against your constraints.
+- **Which packages.** Pinned packages with a gap, a version range's pick included, but not those a requirements
+  file's `--no-binary` covers (pip wouldn't use a newer release's wheels either). Each name is looked up once, on
+  PyPI's JSON API (`https://pypi.org/pypi/<name>/json`), and only names that pass
+  [the PyPI-origin rule](how-it-works.md#pypi-origin); a note on stderr names the others. A run with `--index-url`,
+  `index-url` or `WHEELGAP_INDEX_URL` looks nothing up, and `--offline` refuses the flag.
+- **Time and size.** Each request is tried once (with a 10-second socket timeout), at most four at a time, all of them
+  together get 30 seconds, and the first that can't reach the index stops the rest. Answers over 32 MB are refused.
+  When a lookup fails or is dropped, a note on stderr says no suggestion isn't a "no". Answers aren't cached.
+
+With `--json --explain --suggest`, each package with a gap that was looked up gets a `suggest` object keyed by target
+label like `rejected`: `"suggest": {"musl-aarch64": "2.1.0", "win-amd64": "2.1.0"}`. A target with no counted release is
+left out (so the object can be empty). The key is left out for a package with no gap, a row with no version, a package a
+requirements file's `--no-binary` covers, a package that wasn't looked up (its index isn't known to be PyPI, or the run
+uses `--index-url` or `WHEELGAP_INDEX_URL`), and a failed or dropped lookup (a note on stderr says so). Like the other
+hints, it never changes a status, the summary or the exit code. Quiet text output can't show it (quiet can't be combined
+with `--explain`), and `--markdown --suggest` is an error for now.
+
 ## --json {#json}
 
 `--json` prints one object. Its shape is described by

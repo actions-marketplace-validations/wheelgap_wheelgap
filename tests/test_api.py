@@ -437,3 +437,24 @@ def test_check_lockfile_pixi_failed_lookup_has_no_files(fixtures, monkeypatch):
     (fastlib,) = [r for r in wheelgap.check_lockfile(fixtures / "pixiproj", targets) if r.name == "fastlib"]
     # Not the lock's two files, which are only what pixi picked for its platforms
     assert (fastlib.statuses[targets[0]], fastlib.files) == (Status.UNKNOWN, ())
+
+
+def test_check_lockfile_requirements_format_control_explain(fake_pypi, tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("--no-binary fastlib\n--only-binary nowheels\nfastlib==2.0.0\nnowheels==0.9\n", encoding="utf-8")
+    (lin,) = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")
+    results = {r.name: r for r in wheelgap.check_lockfile(req, [lin])}
+
+    assert results["fastlib"].statuses[lin] is Status.SOURCE
+    assert results["fastlib"].rejected[lin] == [
+        ("fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl", "ignored (--no-binary)")
+    ]
+    assert "ignored (--no-binary)" in results["fastlib"].reasons[lin]
+    assert results["fastlib"].to_dict(explain=True)["rejected"] == {
+        lin.label(True): [
+            {"file": "fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl", "reason": "ignored (--no-binary)"}
+        ]
+    }
+
+    assert results["nowheels"].statuses[lin] is Status.MISSING
+    assert "--only-binary forbids building from source" in results["nowheels"].reasons[lin]

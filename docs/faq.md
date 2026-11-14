@@ -57,7 +57,7 @@ Not for lockfiles that record their files (`uv.lock`, `pylock.toml`, and most `p
 long as their `requires-python` includes the Pythons you check. Requirements files, `Pipfile.lock`, `pyproject.toml`,
 package names and (after 0.9.0) `pixi.lock` are looked up on PyPI or the index you choose. `--offline` guarantees no
 index is contacted. See [Index lookups](how-it-works.md#index-lookups). After 0.9.0, the opt-in `--notes`,
-`--build-info` and `--conda-forge` make requests of their own, for [some package names](how-it-works.md#pypi-origin).
+`--build-info`, `--conda-forge` and `--suggest` make requests of their own, for [some package names](how-it-works.md#pypi-origin).
 
 ## Why does a Windows-only package show `–` on Linux?
 

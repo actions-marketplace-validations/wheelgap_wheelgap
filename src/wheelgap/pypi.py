@@ -248,6 +248,27 @@ def fetch_json(
         return _request(req, timeout, attempts, lambda resp: json.loads(_read_capped(resp, max_bytes)))
 
 
+# A project's JSON API page lists every file of every release: grpcio's is about 10 MB, numpy's about 4 MB.
+RELEASES_MAX_BYTES = 32 * 1024 * 1024
+
+
+def fetch_releases(key: str, timeout: float = 10.0, deadline: float | None = None) -> dict:
+    """--suggest: the `releases` mapping (version -> file list) of the project page `{index}/{key}/json`, where `key`
+    is the canonical name. Tried once, and capped at RELEASES_MAX_BYTES; ValueError when the answer has no release
+    list (a mirror may leave it out)."""
+    data = fetch_json(
+        f"{index_url()}/{quote(key)}/json",
+        timeout=timeout,
+        attempts=1,
+        max_bytes=RELEASES_MAX_BYTES,
+        deadline=deadline,
+    )
+    releases = data.get("releases") if isinstance(data, dict) else None
+    if not isinstance(releases, dict):
+        raise ValueError("no release list")
+    return releases
+
+
 # --explain --build-info reads sdists (see build.py). Past any of these caps an sdist gives no answer.
 SDIST_MAX_BYTES = 64 * 1024 * 1024  # downloaded (numpy's sdist is 19 MiB)
 SDIST_MAX_UNPACKED = 512 * 1024 * 1024  # of tar unpacked from them
@@ -607,8 +628,13 @@ def _fill_simple_data(pkg: Package, data: dict, python: str | None) -> Package:
             if not entries:
                 pkg.error = f"version {pkg.version} not on index"
                 return pkg
-            pkg.files = [e["filename"] for e in entries]
-            pkg.yanked = frozenset(e["filename"] for e in entries if _is_yanked(e))
+            live_entries = [e for e in entries if _supports_python(e, python, "requires-python")]
+            rejected_entries = [e for e in entries if not _supports_python(e, python, "requires-python")]
+            pkg.files = [e["filename"] for e in live_entries]
+            pkg.yanked = frozenset(e["filename"] for e in live_entries if _is_yanked(e))
+            pkg.requires_python_rejected = {
+                e["filename"]: f"requires Python {e['requires-python']}" for e in rejected_entries
+            }
             return pkg
 
         # A range, or no pin: the newest matching release that isn't fully yanked. As in fill(), a range only
@@ -699,9 +725,9 @@ def _not_found(base: str, name: str, version: str | None) -> str:
 def _resolve_pythons(
     pkg: Package, pythons: tuple[str, ...], resolve: Callable[[Package, str | None], Package], python: str | None
 ) -> Package:
-    """Share one index response, never files, between a range's per-Python resolutions."""
+    """Share one index response, never files, between per-Python resolutions."""
     versions = tuple(dict.fromkeys(pythons))
-    if not pkg.version and pkg.spec and len(versions) > 1:
+    if (bool(pkg.version) or bool(pkg.spec)) and len(versions) > 1:
         for py in versions:
             resolved = resolve(replace(pkg, resolutions={}), py)
             # Equal versions can still have different eligible files. Coalesce only identical answers.
@@ -735,7 +761,9 @@ def fill(
         return pkg
     _resolve_pythons(pkg, pythons, lambda p, py: _fill_json_data(p, data, py, base), python)
     # Only a fresh, valid pinned response is cached; a range is resolved anew on every run.
-    if key and write_cache and cached is None and not pkg.error and isinstance(data.get("urls"), list):
+    # With several Pythons the error is on each resolution, not on pkg.
+    valid = not any(p.error for p in pkg.variants) and isinstance(data, dict) and isinstance(data.get("urls"), list)
+    if key and write_cache and cached is None and valid:
         cache.save_files(*key, _files(data["urls"]))
     return pkg
 
@@ -753,19 +781,22 @@ def _fill_json_data(pkg: Package, data: dict, python: str | None, base: str) -> 
                 return pkg
             pkg.version, urls = found
             pkg.version_from_index = True
+            names = [u["filename"] for u in urls if not u.get("yanked")]
+            pkg.files = names
+        elif pinned:
+            urls = _files(data.get("urls", []))
+            live = [u for u in urls if _supports_python(u, python)]
+            rejected = [u for u in urls if not _supports_python(u, python)]
+            pkg.files = [u["filename"] for u in live]
+            pkg.yanked = frozenset(u["filename"] for u in live if u.get("yanked"))
+            pkg.requires_python_rejected = {u["filename"]: f"requires Python {u['requires_python']}" for u in rejected}
         else:
             urls = _files(data.get("urls", []))
-            if not pinned:
-                info = data.get("info")
-                pkg.version = info.get("version") if isinstance(info, dict) else None
-                pkg.version_from_index = True
-        names = [u["filename"] for u in urls]
-        if pinned:
-            # Keep yanked files but mark them: check.status_for uses them only if nothing else fits (PEP 592).
-            pkg.yanked = frozenset(u["filename"] for u in urls if u.get("yanked"))
-        else:
+            info = data.get("info")
+            pkg.version = info.get("version") if isinstance(info, dict) else None
+            pkg.version_from_index = True
             names = [u["filename"] for u in urls if not u.get("yanked")]
-        pkg.files = names
+            pkg.files = names
         pkg.found_on_pypi = base == DEFAULT_INDEX
     except (ValueError, TypeError, KeyError, AttributeError):
         pkg.error = "unexpected response from the index"

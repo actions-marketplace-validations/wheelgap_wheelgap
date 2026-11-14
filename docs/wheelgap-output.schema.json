@@ -186,6 +186,11 @@
                         }
                     }
                 },
+                "suggest": {
+                    "description": "Present with --explain --suggest, in versions after 0.9.0, for a pinned package with a gap whose releases were looked up on PyPI: for each target in rejected, a newer release with a wheel for it (not yanked, Requires-Python admitting the target's Python, and no pre-release unless the checked version is one) that also keeps a wheel on every target where this package is wheel now. The targets get the lowest such release with a wheel for all of them when there is one, otherwise each its own nearest; a target with no such release is left out, so the object can be empty. The release can be outside the input's own version specifier (foo<2 resolving to 1.9 may get 2.1). Absent when the package has no gap, has no version, is covered by a requirements file's --no-binary, wasn't looked up (its index isn't known to be PyPI, or the run uses --index-url or WHEELGAP_INDEX_URL), or its lookup failed or was dropped (a note on stderr says so). It doesn't change results, summary or the exit code.",
+                    "type": "object",
+                    "additionalProperties": {"type": "string"}
+                },
                 "bundled": {
                     "description": "Present with --pyodide-lock when this package is bundled on a Pyodide target: the version Pyodide ships.",
                     "type": "string"

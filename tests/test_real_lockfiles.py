@@ -61,7 +61,7 @@ EXPECTED = {
     "pdfly/pylock.toml": Expect(
         104, 103, 102, 0, 0, 0, {"pdfly": "directory"}, [("cryptography", "46.0.5"), ("pypdf", "6.9.0")]
     ),
-    "pipenv/Pipfile.lock": Expect(85, 0, 0, 1012, 81, 0, {}, [("virtualenv", "21.15.1"), ("sphinx", "9.0.4")]),
+    "pipenv/Pipfile.lock": Expect(85, 0, 0, 1004, 81, 0, {}, [("virtualenv", "21.15.1"), ("sphinx", "9.0.4")]),
 }
 LICENCE_TEXT = {
     "MIT": "Permission is hereby granted",

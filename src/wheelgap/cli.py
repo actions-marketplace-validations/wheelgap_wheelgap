@@ -21,6 +21,7 @@ from packaging.utils import canonicalize_name
 
 from . import __version__, cache, condaforge, origin
 from . import notes as tracker
+from . import suggest as release_suggest
 from .api import running_python
 from .build import BuildInfo, describe, lookup_all, requires_for, shown
 from .check import CELL, EXPLAIN_LIMIT, Row, Status, check, explain, explain_lines, marker_holds, reachable
@@ -49,9 +50,9 @@ from .sources import (
     select_uv_dependencies,
     uv_selected_roots,
 )
-from .suggest_targets import render_text as render_suggestions
-from .suggest_targets import suggest
-from .suggest_targets import to_json as suggestions_json
+from .suggest_targets import render_text as render_target_suggestions
+from .suggest_targets import suggest as suggest_targets
+from .suggest_targets import to_json as target_suggestions_json
 from .targets import (
     ALIASES,
     DEFAULT_ANDROID_API,
@@ -231,6 +232,12 @@ def make_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="with --explain, also say when conda-forge has a package of the same name with builds for a gap's "
         "platform (sends the names of PyPI packages with gaps to anaconda.org)",
+    )
+    p.add_argument(
+        "--suggest",
+        action="store_true",
+        help="with --explain, also name the nearest newer release with a wheel for each gap's target "
+        "(looks the PyPI packages with gaps up on pypi.org)",
     )
     p.add_argument(
         "--notes",
@@ -581,6 +588,9 @@ def gap_targets(row: Row, targets: list[Target]) -> list[Target]:
 
 RowNotes = dict[int, list[tuple[tracker.Note, list[Target]]]]
 """The tracker's notes that apply to a row's gaps, keyed by id(row), each with the gap targets it covers."""
+Suggestions = dict[int, release_suggest.Suggestion]
+"""--suggest: by id() of a gap row's package that was looked up, the release it names for each gap target that has
+one (see release_suggest.suggest)."""
 
 
 def notes_eligible(
@@ -633,9 +643,10 @@ def render_explain(
     conda_forge: dict[int, condaforge.Hint] | None = None,
     notes: RowNotes | None = None,
     build_info: dict[int, BuildInfo] | None = None,
+    suggestions: Suggestions | None = None,
 ) -> list[str]:
-    """`conda_forge`: --conda-forge hints and `build_info`: --build-info answers, by id() of the row's package.
-    `notes`: --notes, by id() of the row."""
+    """`conda_forge`: --conda-forge hints, `build_info`: --build-info answers and `suggestions`: --suggest's, by id()
+    of the row's package. `notes`: --notes, by id() of the row."""
     multi_py = len({t.python for t in targets}) > 1
     out = []
     for r in rows:
@@ -653,7 +664,17 @@ def render_explain(
             if needs and r.results[t] == Status.SOURCE:  # once per release, under its first source cell
                 out.append(f"  build needs: {needs}")
                 needs = None
-            lines = explain_lines(files, t, yanked=r.package.yanked, limit=EXPLAIN_LIMIT, dim=style.dim, align=True)
+            lines = explain_lines(
+                files,
+                t,
+                yanked=r.package.yanked,
+                requires_python_rejected=r.package.requires_python_rejected,
+                limit=EXPLAIN_LIMIT,
+                dim=style.dim,
+                align=True,
+                no_binary=r.package.no_binary,
+                only_binary=r.package.only_binary,
+            )
             out += [f"  {line}" for line in lines]
             out.append("")
         if conda_forge and (h := conda_forge.get(id(r.package))):
@@ -668,6 +689,9 @@ def render_explain(
             out.append(f"  - {note.text}")
             out += [f"    {link}" for link in note.links]
             out.append("")
+        if suggestions is not None and (found := suggestions.get(id(r.package))) is not None:
+            gaps = gap_targets(r, targets)
+            out += [*release_suggest.suggest_lines(r.package.name, r.package.version or "?", gaps, found, multi_py), ""]
     return out
 
 
@@ -756,6 +780,7 @@ def report_json(
     conda_forge: dict[int, condaforge.Hint] | None = None,
     notes: RowNotes | None = None,
     build_info: dict[int, BuildInfo] | None = None,
+    suggestions: Suggestions | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -774,7 +799,15 @@ def report_json(
         if explained:
             out["rejected"] = {
                 t.label(multi_py): [
-                    {"file": f, "reason": why} for f, why in explain(r.package.files or [], t, r.package.yanked)
+                    {"file": f, "reason": why}
+                    for f, why in explain(
+                        r.package.files or [],
+                        t,
+                        r.package.yanked,
+                        r.package.requires_python_rejected,
+                        no_binary=r.package.no_binary,
+                        only_binary=r.package.only_binary,
+                    )
                 ]
                 for t in gap_targets(r, targets)
             }
@@ -794,6 +827,11 @@ def report_json(
             if build_info is not None:  # --build-info: what the sdist requires, on the targets that build it
                 info, sources = build_info.get(id(r.package)), source_targets(r, targets)
                 out["build_requires"] = [shown(q) for q in requires_for(info, sources)] if info and sources else None
+            if suggestions is not None and (found := suggestions.get(id(r.package))) is not None:
+                # --suggest: by gap target, the release it names; a target with no newer wheel is left out.
+                out["suggest"] = {
+                    t.label(multi_py): found.found[t] for t in gap_targets(r, targets) if t in found.found
+                }
         return out
 
     report: dict[str, object] = {
@@ -1214,6 +1252,61 @@ def conda_forge_hints(
     return hints
 
 
+def version_suggestions(
+    gaps: list[Row], targets: list[Target], sources: list[Source], index_url: str | None, quiet: bool
+) -> Suggestions:
+    """--suggest: look the pinned gap packages' releases up on PyPI, one request per name, and return what to move to,
+    by id() of the package. Only names that are positively PyPI's are looked up, by the rule --conda-forge follows
+    (origin.known_pypi), and nothing in a run that uses another index; notes on stderr say which weren't, and why."""
+    other = origin.other_index(index_url)
+    if other is not None:
+        if not quiet:
+            print(
+                f"wheelgap: note: --suggest looks nothing up when packages come from another index ({other})",
+                file=sys.stderr,
+            )
+        return {}
+    elsewhere = origin.private_names(sources, simple_index=index_url)
+    source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
+    asked: dict[str, list[Row]] = {}  # by canonical name: one lookup per package, however many rows it has
+    kept_in: dict[str, str] = {}
+    for r in gaps:
+        # Under --no-binary, pip uses no release's wheels, so a newer one with wheels wouldn't close the gap.
+        if r.package.version and not r.package.no_binary and gap_targets(r, targets):
+            if origin.known_pypi(r.package, source_of[id(r.package)], simple_index=index_url, private=elsewhere):
+                asked.setdefault(r.package.key, []).append(r)
+            else:
+                kept_in.setdefault(r.package.key, r.package.name)
+    if kept_in and not quiet:
+        private = list(kept_in.values())
+        print(
+            f"wheelgap: note: --suggest didn't look up {len(private)} package{'s' * (len(private) != 1)} "
+            f"whose index isn't known to be PyPI ({_names(private)}), so their names stay private",
+            file=sys.stderr,
+        )
+    # A suggestion must keep a wheel on every target where this row (this resolution, on its Pythons) has one now.
+    found, failed = release_suggest.look_up_all(
+        {
+            key: [
+                (r.package.version or "", gap_targets(r, targets), [t for t in targets if r.results[t] is Status.WHEEL])
+                for r in rows
+            ]
+            for key, rows in asked.items()
+        }
+    )
+    if failed and not quiet:
+        n = len(failed)
+        which = _names([f"{asked[key][0].package.name} ({why})" for key, why in failed.items()])
+        print(
+            f"wheelgap: note: --suggest couldn't look up {n} package{'s' * (n != 1)}: {which}; "
+            "no suggestion doesn't mean no newer release has wheels",
+            file=sys.stderr,
+        )
+    return {
+        id(r.package): s for key, rows in asked.items() if key in found for r, s in zip(rows, found[key], strict=True)
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         # Don't crash printing ✓ to a non-UTF-8 pipe (e.g. Windows cp1252).
@@ -1278,17 +1371,21 @@ def _main(argv: list[str]) -> int:
         if given:
             parser.error(f"--suggest-targets only suggests, so it can't be used with {', '.join(given)}")
         try:
-            found = suggest(Path(args.suggest_targets))
+            found = suggest_targets(Path(args.suggest_targets))
         except OSError as e:
             print(f"wheelgap: error: {e}", file=sys.stderr)
             return input_error_json(e) if args.json else 2
         if args.json:
-            print(json.dumps(suggestions_json(found), indent=2))
+            print(json.dumps(target_suggestions_json(found), indent=2))
         else:
-            print("\n".join(render_suggestions(found)))
+            print("\n".join(render_target_suggestions(found)))
         return 0
     if args.conda_forge and not args.explain:
         parser.error("--conda-forge only adds to --explain; pass --explain too")
+    if args.suggest and not args.explain:
+        parser.error("--suggest only adds to --explain; pass --explain too")
+    if args.suggest and args.markdown:
+        parser.error("--suggest has no Markdown form yet (use --json, or the text output)")
     if args.notes and not args.explain:
         parser.error("--notes only adds to --explain; pass --explain too")
     try:
@@ -1441,6 +1538,11 @@ def _main(argv: list[str]) -> int:
                 raise SourceError(
                     f"{offline_how}: --conda-forge would look packages up on anaconda.org; "
                     f"drop --conda-forge, or {undo_offline(offline_how)}"
+                )
+            if args.suggest:
+                raise SourceError(
+                    f"{offline_how}: --suggest would look packages up on PyPI; "
+                    f"drop --suggest, or {undo_offline(offline_how)}"
                 )
         fail_on = args.fail_on or config.get("fail-on", "source")
         pyodide_lock = None
@@ -1635,6 +1737,8 @@ def _main(argv: list[str]) -> int:
                 file=sys.stderr,
             )
     conda_forge = conda_forge_hints(gaps, targets, sources, index_url, quiet, cached) if args.conda_forge else {}
+    # None: not asked for. Like the hints above, it never changes a status or the exit code.
+    suggestions = version_suggestions(gaps, targets, sources, index_url, quiet) if args.suggest else None
     # With --fail-on missing, source builds are accepted; missing and unknown packages still fail. Gaps on
     # --advisory targets never fail the run.
     fail_statuses = GAP_STATUSES if fail_on == "source" else (Status.MISSING, Status.UNKNOWN)
@@ -1687,6 +1791,7 @@ def _main(argv: list[str]) -> int:
                 conda_forge,
                 row_notes,
                 build_info,
+                suggestions,
             )
         )
         return code
@@ -1752,7 +1857,7 @@ def _main(argv: list[str]) -> int:
         if args.explain and gaps:
             if hidden:
                 print()
-            for ln in render_explain(gaps, targets, style, conda_forge, row_notes, build_info):
+            for ln in render_explain(gaps, targets, style, conda_forge, row_notes, build_info, suggestions):
                 print(ln)
 
     bundled = [r for r in rows if Status.BUNDLED in r.results.values()]

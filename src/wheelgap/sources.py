@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import tomllib
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -68,9 +69,14 @@ class Package:
     # `files` are only some of the release's files (pixi.lock records the one it picked per platform), so the
     # package is looked up on its index anyway, and skipped as a private index if it can't be.
     partial_files: bool = False
-    # A range resolved for several Python major.minors. Each value owns only that Python's eligible files.
+    # A range or pin resolved for several Python major.minors. Each value owns only that Python's eligible files.
     # Identical resolutions share a Package, so reports can keep one row for them.
     resolutions: dict[str, Package] = field(default_factory=dict)
+    # Files of a pinned release whose Requires-Python excludes the target Python, mapped to their --explain reason.
+    requires_python_rejected: dict[str, str] = field(default_factory=dict)
+    # pip requirements.txt --no-binary / --only-binary policy for this package.
+    no_binary: bool = False
+    only_binary: bool = False
 
     @property
     def key(self) -> str:
@@ -1170,6 +1176,7 @@ def requirement_to_package(text: str, origin: str) -> Package:
 _NAMED_URL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\s*(\[[^\]]*\])?\s*@")
 _EGG_RE = re.compile(r"[#&]egg=([A-Za-z0-9][A-Za-z0-9._-]*)")
 _COMMENT_RE = re.compile(r"\s#")
+_FULL_LINE_COMMENT_RE = re.compile(r"^\s*#")
 _INCLUDE_RE = re.compile(r"^(?:-r|--requirement)(?:\s+|=)?(\S.*)$")
 _CONSTRAINT_RE = re.compile(r"^(?:-c(?:\s+|=)?|--constraint(?:\s+|=))(\S.*)$")
 
@@ -1202,11 +1209,112 @@ def _abbreviated_include(line: str) -> bool:
     )
 
 
+class _FormatControl:
+    """Matches pip's FormatControl for --no-binary and --only-binary options in requirements files."""
+
+    def __init__(self) -> None:
+        self.no_binary: set[str] = set()
+        self.only_binary: set[str] = set()
+
+    def apply(self, option: str, value: str) -> None:
+        target, other = (
+            (self.no_binary, self.only_binary) if option == "--no-binary" else (self.only_binary, self.no_binary)
+        )
+        for item in value.split(","):
+            if item == ":all:":
+                other.clear()
+                target.clear()
+                target.add(":all:")
+            elif item == ":none:":
+                target.clear()
+            else:
+                key = canonicalize_name(item)
+                other.discard(key)
+                target.add(key)
+
+    def policy(self, key: str) -> tuple[bool, bool]:
+        if key in self.only_binary:
+            return (False, True)
+        if key in self.no_binary:
+            return (True, False)
+        if ":all:" in self.only_binary:
+            return (False, True)
+        if ":all:" in self.no_binary:
+            return (True, False)
+        return (False, False)
+
+
+def _join_continued_lines(text: str) -> list[str]:
+    """Joins backslash-continued non-comment lines without inserting spaces, matching pip's join_lines."""
+    joined: list[str] = []
+    pending: list[str] = []
+    for line in text.splitlines():
+        is_comment = _FULL_LINE_COMMENT_RE.match(line) is not None
+        if not line.endswith("\\") or is_comment:
+            if is_comment:
+                line = " " + line
+            if pending:
+                pending.append(line)
+                joined.append("".join(pending))
+                pending.clear()
+            else:
+                joined.append(line)
+        else:
+            pending.append(line.strip("\\"))
+    if pending:
+        joined.append("".join(pending))
+    return joined
+
+
+def _format_option(token: str) -> tuple[str, str | None] | None:
+    """--no-binary or --only-binary and its =VALUE, if any, from an option token. optparse accepts unambiguous
+    prefixes: --no-b on (--no- is also --no-index), and --o on for --only-binary (pip 26's --only-final makes that
+    --only-b, but older pips take the shorter ones)."""
+    option, eq, value = token.partition("=")
+    if option.startswith("--no-b") and "--no-binary".startswith(option):
+        name = "--no-binary"
+    elif option.startswith("--o") and "--only-binary".startswith(option):
+        name = "--only-binary"
+    else:
+        return None
+    return name, value if eq else None
+
+
+def _apply_format_options(line: str, format_control: _FormatControl) -> bool:
+    if not line.startswith("-"):
+        return False
+    try:
+        tokens = shlex.split(line)
+    except ValueError:
+        tokens = line.split()
+    if not tokens:
+        return False
+    i = 0
+    while i < len(tokens):
+        found = _format_option(tokens[i])
+        if not found:
+            i += 1
+            continue
+        option, given = found
+        if given is not None:
+            val = given
+            i += 1
+        elif i + 1 < len(tokens):
+            val = tokens[i + 1]
+            i += 2
+        else:
+            break
+        if val:
+            format_control.apply(option, val)
+    return True
+
+
 def parse_requirements(path: Path) -> Source:
     constraints: list[Package] = []
     seen: dict[bool, set[Path]] = {False: set(), True: set()}  # requirement files, constraint files
     index_options: list[str] = []
-    pkgs = _read_requirements(path, seen, constraints, index_options=index_options)
+    format_control = _FormatControl()
+    pkgs = _read_requirements(path, seen, constraints, index_options=index_options, format_control=format_control)
     by_name: dict[str, list[Package]] = {}
     for entry in constraints:
         by_name.setdefault(entry.key, []).append(entry)
@@ -1227,6 +1335,9 @@ def parse_requirements(path: Path) -> Source:
             for entry in entries:
                 spec &= SpecifierSet(entry.spec or "")
             pkg.spec = str(spec) or None
+    for pkg in pkgs:
+        if not pkg.skip:
+            pkg.no_binary, pkg.only_binary = format_control.policy(pkg.key)
     return Source(
         path.name, pkgs, requirements=True, pypi_only=not index_options and not _nearby_config_names_an_index(path)
     )
@@ -1238,59 +1349,87 @@ def _read_requirements(
     constraints: list[Package],
     constraint: bool = False,
     index_options: list[str] | None = None,
+    format_control: _FormatControl | None = None,
+    stack: dict[bool, set[Path]] | None = None,
 ) -> list[Package]:
     """`index_options` collects the lines that may point pip at another index: index options (--index-url,
     --extra-index-url, --find-links, --no-index), includes that aren't read, and abbreviated include options."""
     path = path.resolve()
-    if path in seen[constraint]:
+    if stack is None:
+        stack = {False: set(), True: set()}
+    if path in stack[constraint]:
         return []
+    already_seen = path in seen[constraint]
     seen[constraint].add(path)
+    stack[constraint].add(path)
     pkgs: list[Package] = []
-    append = constraints.append if constraint else pkgs.append
-    # utf-8-sig: a byte order mark (Windows editors) mustn't hide an option on the first line.
-    lines = path.read_text(encoding="utf-8-sig").replace("\\\n", " ").splitlines()
-    for raw in lines:
-        line = _COMMENT_RE.split(raw, 1)[0].strip()  # " # note" or "<TAB># note"
-        if not line or line.startswith("#"):
-            continue
-        if index_options is not None and (_names_index_option(line) or _abbreviated_include(line)):
-            index_options.append(line)
-        if m := _CONSTRAINT_RE.match(line):
-            target = m.group(1).strip()
-            # A URL (-c https://releases.openstack.org/...) or ${VAR} is left to pip: it's skipped, as before. Unread,
-            # it may name an index, so the input isn't PyPI-only.
-            if "://" not in target and "${" not in target:
-                _read_requirements(path.parent / target, seen, constraints, True, index_options)
-            elif index_options is not None:
+    try:
+        append = constraints.append if constraint else pkgs.append
+        # utf-8-sig: a byte order mark (Windows editors) mustn't hide an option on the first line.
+        lines = _join_continued_lines(path.read_text(encoding="utf-8-sig"))
+        for raw in lines:
+            line = _COMMENT_RE.split(raw, 1)[0].strip()  # " # note" or "<TAB># note"
+            if not line or line.startswith("#"):
+                continue
+            if (
+                not already_seen
+                and index_options is not None
+                and (_names_index_option(line) or _abbreviated_include(line))
+            ):
                 index_options.append(line)
-            continue
-        if m := _INCLUDE_RE.match(line):  # -r file, -rfile, --requirement file, --requirement=file
-            pkgs.extend(
-                _read_requirements(path.parent / m.group(1).strip(), seen, constraints, constraint, index_options)
+            if m := _CONSTRAINT_RE.match(line):
+                target = m.group(1).strip()
+                # A URL (-c https://releases.openstack.org/...) or ${VAR} is left to pip: it's skipped, as before.
+                # Unread, it may name an index, so the input isn't PyPI-only.
+                if "://" not in target and "${" not in target:
+                    _read_requirements(
+                        path.parent / target, seen, constraints, True, index_options, format_control, stack
+                    )
+                elif not already_seen and index_options is not None:
+                    index_options.append(line)
+                continue
+            if m := _INCLUDE_RE.match(line):  # -r file, -rfile, --requirement file, --requirement=file
+                pkgs.extend(
+                    _read_requirements(
+                        path.parent / m.group(1).strip(),
+                        seen,
+                        constraints,
+                        constraint,
+                        index_options,
+                        format_control,
+                        stack,
+                    )
+                )
+                continue
+            if line.startswith("-e ") or line.startswith("--editable"):
+                if not already_seen:
+                    name = line.split("#egg=", 1)[1] if "#egg=" in line else line.split(None, 1)[-1]
+                    append(Package(name, None, skip="editable", origin=path.name))
+                continue
+            if line.startswith("-"):
+                if format_control is not None:
+                    _apply_format_options(line, format_control)
+                continue  # pip options: --index-url, --no-binary, --hash continuation, ...
+            if already_seen:
+                continue
+            tokens = line.split()
+            # Drop --hash=sha256:... and "--hash sha256:..." (option and value as two tokens).
+            line = " ".join(
+                t for k, t in enumerate(tokens) if not t.startswith("--hash") and (k == 0 or tokens[k - 1] != "--hash")
             )
-            continue
-        if line.startswith("-e ") or line.startswith("--editable"):
-            name = line.split("#egg=", 1)[1] if "#egg=" in line else line.split(None, 1)[-1]
-            append(Package(name, None, skip="editable", origin=path.name))
-            continue
-        if line.startswith("-"):
-            continue  # pip options: --index-url, --hash continuation, ...
-        tokens = line.split()
-        # Drop --hash=sha256:... and "--hash sha256:..." (option and value as two tokens).
-        line = " ".join(
-            t for k, t in enumerate(tokens) if not t.startswith("--hash") and (k == 0 or tokens[k - 1] != "--hash")
-        )
-        if line.startswith((".", "/")):
-            append(Package(line, None, skip="path", origin=path.name))
-            continue
-        if "://" in line and not _NAMED_URL_RE.match(line):
-            # A bare URL (git+ssh://git@github.com/org/repo.git#egg=foo): never from the index.
-            # "name @ url" lines are left to Requirement, which knows the name and markers.
-            egg = _EGG_RE.search(line)
-            name = egg.group(1) if egg else line.split(";", 1)[0].strip()
-            append(Package(name, None, skip="url", origin=path.name))
-            continue
-        append(requirement_to_package(line, path.name))
+            if line.startswith((".", "/")):
+                append(Package(line, None, skip="path", origin=path.name))
+                continue
+            if "://" in line and not _NAMED_URL_RE.match(line):
+                # A bare URL (git+ssh://git@github.com/org/repo.git#egg=foo): never from the index.
+                # "name @ url" lines are left to Requirement, which knows the name and markers.
+                egg = _EGG_RE.search(line)
+                name = egg.group(1) if egg else line.split(";", 1)[0].strip()
+                append(Package(name, None, skip="url", origin=path.name))
+                continue
+            append(requirement_to_package(line, path.name))
+    finally:
+        stack[constraint].remove(path)
     return pkgs
 
 

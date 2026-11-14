@@ -105,7 +105,7 @@ Version ranges select the newest matching release whose `Requires-Python` permit
 resolutions appear in separate rows, including in JSON, with `n/a` for targets using another resolution. See
 [version ranges](https://wheelgap.github.io/wheelgap/how-it-works/#version-ranges) for details.
 
-After 0.9.0, `--explain` can also show the coverage tracker's notes (`--notes`), what a source build needs (`--build-info`) and conda-forge builds that fit (`--conda-forge`). These are opt-in, since they send package names elsewhere ([which names](https://wheelgap.github.io/wheelgap/how-it-works/#pypi-origin)).
+After 0.9.0, `--explain` can also show the coverage tracker's notes (`--notes`), what a source build needs (`--build-info`), conda-forge builds that fit (`--conda-forge`) and the nearest newer release with wheels for a gap (`--suggest`). These are opt-in, since they send package names elsewhere ([which names](https://wheelgap.github.io/wheelgap/how-it-works/#pypi-origin)).
 
 The docs cover [inputs and dependency selection](https://wheelgap.github.io/wheelgap/inputs/), [`--explain`](https://wheelgap.github.io/wheelgap/output/#explain), [the `--json` schema](https://wheelgap.github.io/wheelgap/output/#json), [every flag](https://wheelgap.github.io/wheelgap/cli/) and the [recipes](https://wheelgap.github.io/wheelgap/recipes/) for multi-arch images, monorepos and free-threading readiness.
 

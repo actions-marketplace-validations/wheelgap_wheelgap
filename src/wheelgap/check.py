@@ -13,7 +13,7 @@ from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.tags import Tag
 from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
-from packaging.version import InvalidVersion
+from packaging.version import InvalidVersion, Version
 
 try:  # packaging's parsed-marker node types (private, so guarded: without them every comparison is unknown)
     from packaging._parser import Value as _Value
@@ -109,8 +109,16 @@ def has_sdist(files: list[str]) -> bool:
     return any(f.endswith(SDIST_SUFFIXES) for f in files)
 
 
-def _installable(files: list[str], target: Target) -> bool:
-    return any(target.accepts(t) for t in wheel_tags(files)) or (has_sdist(files) and target.builds_sdists)
+def _installable(
+    files: list[str],
+    target: Target,
+    *,
+    no_binary: bool = False,
+    only_binary: bool = False,
+) -> bool:
+    if not no_binary and any(target.accepts(t) for t in wheel_tags(files)):
+        return True
+    return not only_binary and has_sdist(files) and target.builds_sdists
 
 
 def status_for(
@@ -118,6 +126,9 @@ def status_for(
     target: Target,
     _wheels: list[frozenset[Tag]] | None = None,
     yanked: frozenset[str] = frozenset(),
+    *,
+    no_binary: bool = False,
+    only_binary: bool = False,
 ) -> Status:
     if files is None:
         return Status.UNKNOWN
@@ -125,12 +136,14 @@ def status_for(
         # `yanked` is only non-empty for a release pinned with ==. Like pip, ignore its yanked files
         # unless every file this target could use is yanked; then pip installs them anyway (PEP 592).
         live = [f for f in files if f not in yanked]
-        if _installable(live, target):
+        if _installable(live, target, no_binary=no_binary, only_binary=only_binary):
             files = live
         _wheels = None
-    wheels = _wheels if _wheels is not None else wheel_tags(files)
+    wheels = [] if no_binary else (_wheels if _wheels is not None else wheel_tags(files))
     if any(target.accepts(t) for t in wheels):
         return Status.WHEEL
+    if only_binary:
+        return Status.MISSING
     return Status.SOURCE if has_sdist(files) and target.builds_sdists else Status.MISSING
 
 
@@ -250,22 +263,40 @@ def _closeness(filename: str, target: Target) -> tuple[int, int, str]:
     return (group, distance, filename)
 
 
-def explain(files: list[str], target: Target, yanked: frozenset[str] = frozenset()) -> list[tuple[str, str]]:
+def explain(
+    files: list[str],
+    target: Target,
+    yanked: frozenset[str] = frozenset(),
+    requires_python_rejected: dict[str, str] | None = None,
+    *,
+    no_binary: bool = False,
+    only_binary: bool = False,
+) -> list[tuple[str, str]]:
     """(filename, reason) for every wheel `target` rejects, the closest misses first.
 
     A wheel the target accepts but status_for() leaves out because it's yanked (the release has other files the
-    target can use) is listed with the reason "yanked".
+    target can use) is listed with the reason "yanked", and with `no_binary` an accepted wheel is listed as
+    "ignored (--no-binary)".
     """
-    skips_yanked = bool(yanked) and _installable([f for f in files if f not in yanked], target)
+    skips_yanked = bool(yanked) and _installable(
+        [f for f in files if f not in yanked], target, no_binary=no_binary, only_binary=only_binary
+    )
     out = []
     for f in files:
         if not f.endswith(".whl"):
             continue
         reason = rejection(f, target)
-        if reason is None and skips_yanked and f in yanked:
-            reason = "yanked"
+        if reason is None:
+            if no_binary:
+                reason = "ignored (--no-binary)"
+            elif skips_yanked and f in yanked:
+                reason = "yanked"
         if reason:
             out.append((f, reason))
+    if requires_python_rejected:
+        for f, reason in requires_python_rejected.items():
+            if f.endswith(".whl"):  # a wheel the target can't use anyway says why, not that a newer Python fits
+                out.append((f, rejection(f, target) or reason))
     return sorted(out, key=lambda fr: _closeness(fr[0], target))
 
 
@@ -278,9 +309,12 @@ def explain_lines(
     target: Target,
     *,
     yanked: frozenset[str] = frozenset(),
+    requires_python_rejected: dict[str, str] | None = None,
     limit: int | None = None,
     dim: Callable[[str], str] = lambda text: text,
     align: bool = False,
+    no_binary: bool = False,
+    only_binary: bool = False,
 ) -> list[str]:
     """What --explain says under a gap on `target`: each rejected wheel and why (the closest misses first, at most
     `limit` of them), or that none were published, and a note when the target can't build the sdist there is.
@@ -288,15 +322,21 @@ def explain_lines(
     The command line aligns the reasons in a column, dims them and indents each line; Result.reasons joins them
     unaligned (one space-separated "file  reason" per line) and with no limit.
     """
-    rejected = explain(files, target, yanked)
+    rejected = explain(files, target, yanked, requires_python_rejected, no_binary=no_binary, only_binary=only_binary)
     out = [] if rejected else [dim("no wheels published for this version")]
     shown = rejected[:limit]
     width = max((len(f) for f, _ in shown), default=0) if align else 0
     out += [f"{f.ljust(width)}  {dim(reason)}" for f, reason in shown]
     if len(rejected) > len(shown):
         out.append(dim(f"… and {len(rejected) - len(shown)} more (--json lists them all)"))
-    if not target.builds_sdists and has_sdist(files):
-        out.append(dim(f"there is an sdist, but {target.platform} can't build packages from source"))
+    if has_sdist(files):
+        if not target.builds_sdists:
+            out.append(dim(f"there is an sdist, but {target.platform} can't build packages from source"))
+        elif only_binary:
+            out.append(dim("there is an sdist, but --only-binary forbids building from source"))
+    for f, reason in (requires_python_rejected or {}).items():
+        if f.endswith(SDIST_SUFFIXES):
+            out.append(dim(f"there is an sdist, but it {reason}"))
     return out
 
 
@@ -310,6 +350,8 @@ _marker_cache: dict[str, Marker | None] = {}
 # false on macOS (so it doesn't). Only a definite False hides a package. Target.unknown_markers adds
 # platform_machine on 32-bit x86 and Arm, where it depends on the machine rather than the Python.
 _UNKNOWABLE = frozenset({"extra", "extras", "dependency_groups", "platform_release", "platform_version"})
+_FULL_VERSION_MARKERS = frozenset({"python_full_version", "implementation_version"})
+_RELEASE = re.compile(r"\d+(?:\.\d+)+")
 _atom_cache: dict[tuple[str, Target], bool | None] = {}
 
 
@@ -317,6 +359,36 @@ def _quote(text: str) -> str | None:
     if '"' not in text:
         return f'"{text}"'
     return f"'{text}'" if "'" not in text else None  # both kinds of quote: can't re-serialise safely
+
+
+def _evaluate_atom(
+    text: str,
+    node: tuple,
+    target: Target,
+    base_env: dict,
+    full_names: frozenset[str],
+    *,
+    lock_file: bool,
+) -> bool | None:
+    try:
+        marker = Marker(text)
+        evaluate = (lambda env: marker.evaluate(env, context="lock_file")) if lock_file else marker.evaluate
+        if not full_names:
+            return evaluate(base_env)
+        prefix = f"{target.major}.{target.minor}."
+        probes = [f"{prefix}0", f"{prefix}999999"]
+        # Also every X.Y.Z the value names, however it's written ('3.13.1.*', 'v3.13.2', '3.13.1;3.13.2'): == and
+        # in can hold at exactly one patch release.
+        for item in node:
+            if isinstance(item, _Value):
+                for found in _RELEASE.findall(item.value):
+                    release = Version(found).release
+                    if release[:2] == (target.major, target.minor) and len(release) >= 3:
+                        probes.append(".".join(map(str, release[:3])))
+        outcomes = {evaluate({**base_env, **{name: patch for name in full_names}}) for patch in probes}
+        return outcomes.pop() if len(outcomes) == 1 else None
+    except Exception:  # undefined names, odd comparisons: unknown rather than a confident answer
+        return None
 
 
 def _atom(
@@ -344,17 +416,26 @@ def _atom(
     if target is None or not names or names & ((_UNKNOWABLE - (environment or {}).keys()) | target.unknown_markers):
         return None
     text = " ".join(parts)
+    full_names = (_FULL_VERSION_MARKERS & names) - (environment or {}).keys()
     if environment is not None:
-        try:
-            return Marker(text).evaluate({**target.marker_env, **environment}, context="lock_file")
-        except Exception:
-            return None
+        return _evaluate_atom(
+            text,
+            node,
+            target,
+            {**target.marker_env, **environment},
+            full_names,
+            lock_file=True,
+        )
     key = (text, target)
     if key not in _atom_cache:
-        try:
-            _atom_cache[key] = Marker(text).evaluate(target.marker_env)
-        except Exception:  # undefined names, odd comparisons: unknown rather than a confident answer
-            _atom_cache[key] = None
+        _atom_cache[key] = _evaluate_atom(
+            text,
+            node,
+            target,
+            target.marker_env,
+            full_names,
+            lock_file=False,
+        )
     return _atom_cache[key]
 
 
@@ -666,7 +747,16 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                 files = None if resolved.error else resolved.files
                 needed = i in installed[t] if installed is not None else applies(pkg, t)
                 row.results[t] = (
-                    status_for(files, t, parsed[id(resolved)], resolved.yanked) if needed else Status.NOT_NEEDED
+                    status_for(
+                        files,
+                        t,
+                        parsed[id(resolved)],
+                        resolved.yanked,
+                        no_binary=resolved.no_binary,
+                        only_binary=resolved.only_binary,
+                    )
+                    if needed
+                    else Status.NOT_NEEDED
                 )
                 if needed and installed is not None:
                     row.via[t] = (

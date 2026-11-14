@@ -225,6 +225,11 @@ carry no platform markers.
 (`numpy==2.3.4`) is checked at that version; a range or a bare name uses the newest matching release (see
 [How it works](how-it-works.md#version-ranges)).
 
+**`--no-binary` and `--only-binary`** lines (`:all:`, `:none:` or package names) apply as pip applies them, in order
+and to every requirement, including those in `-r` and `-c` files: with `--no-binary` a package's wheels are ignored
+(`source` if it has an sdist), and with `--only-binary` a package with no fitting wheel is `missing`, since pip won't
+build it. `--explain` says which option did it.
+
 **Constraint files** (`-c FILE`, `-cFILE`, `--constraint FILE` or `--constraint=FILE`) restrict unpinned requirements
 without adding packages. Exact constraints select a version; ranges are intersected. A constraint wheelgap can't apply
 leaves the package `unknown` rather than guessed: one with an environment marker, a URL or path, or two different

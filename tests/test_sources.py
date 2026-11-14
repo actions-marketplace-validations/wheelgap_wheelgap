@@ -1518,3 +1518,160 @@ def test_pixi_lock_that_isnt_utf8(tmp_path):
     lock.write_bytes(b"version: 7\nplatforms:\n- name: linux-\xff64\n")
     with pytest.raises(SourceError, match=r"^pixi.lock: not valid UTF-8 \(byte 36\)"):
         parse_pixi_lock(lock)
+
+
+@pytest.mark.parametrize(
+    "lines,expected",
+    [
+        ("--no-binary :all:\nfastlib==2.0.0\npurewheel==3.1\n", {"fastlib": (True, False), "purewheel": (True, False)}),
+        ("--no-binary=:all:\nfastlib==2.0.0\n", {"fastlib": (True, False)}),
+        ("--only-binary :all:\nfastlib==2.0.0\n", {"fastlib": (False, True)}),
+        ("--only-binary=:all:\nfastlib==2.0.0\n", {"fastlib": (False, True)}),
+        (
+            "--no-binary my_pkg,purewheel\nmy-pkg==1.0\npurewheel==3.1\nfastlib==2.0.0\n",
+            {"my-pkg": (True, False), "purewheel": (True, False), "fastlib": (False, False)},
+        ),
+        (
+            "--no-binary :all:\n--only-binary purewheel\n--no-binary :none:\nfastlib==2.0.0\npurewheel==3.1\n",
+            {"fastlib": (False, False), "purewheel": (False, True)},
+        ),
+        (
+            "--only-binary fastlib\n--no-binary fastlib\n--no-binary :none:\nfastlib==2.0.0\n",
+            {"fastlib": (False, False)},
+        ),
+        (
+            "--no-binary :all: --only-binary purewheel\nfastlib==2.0.0\npurewheel==3.1\n",
+            {"fastlib": (True, False), "purewheel": (False, True)},
+        ),
+        (
+            "--no-binary :none:,fastlib\nfastlib==2.0.0\npurewheel==3.1\n",
+            {"fastlib": (True, False), "purewheel": (False, False)},
+        ),
+        (
+            "--no-binary fastlib,:none:\nfastlib==2.0.0\n",
+            {"fastlib": (False, False)},
+        ),
+        (
+            "--no-binary :all:,:none:\nfastlib==2.0.0\n",
+            {"fastlib": (False, False)},
+        ),
+        (
+            (
+                "--no-index --no-binary fastlib\n"
+                "--index-url https://example.com/simple --only-binary purewheel\n"
+                "fastlib==2.0.0\npurewheel==3.1\n"
+            ),
+            {"fastlib": (True, False), "purewheel": (False, True)},
+        ),
+        (
+            '--no-binary "fastlib, :none:"\nfastlib==2.0.0\n',
+            {"fastlib": (True, False)},
+        ),
+        (
+            '--no-binary "fastlib, purewheel"\nfastlib==2.0.0\npurewheel==3.1\n',
+            {"fastlib": (True, False), "purewheel": (False, False)},
+        ),
+        (
+            '--only-binary="fastlib,purewheel"\nfastlib==2.0.0\npurewheel==3.1\n',
+            {"fastlib": (False, True), "purewheel": (False, True)},
+        ),
+        (
+            "--no-binary 'fastlib,:none:'\nfastlib==2.0.0\n",
+            {"fastlib": (False, False)},
+        ),
+        (
+            '--no-binary "fastlib,\\\npurewheel"\npurewheel==3.1\n',
+            {"purewheel": (True, False)},
+        ),
+        (
+            '--only-binary "fastlib,\\\nnowheels"\nnowheels==0.9\n',
+            {"nowheels": (False, True)},
+        ),
+        (
+            "--no-binary fastlib,\\\npurewheel\npurewheel==3.1\n",
+            {"purewheel": (True, False)},
+        ),
+        (
+            "--only-binary fastlib,\\\nnowheels\nnowheels==0.9\n",
+            {"nowheels": (False, True)},
+        ),
+        (
+            '--no-binary "fastlib, \\\npurewheel"\nfastlib==2.0.0\npurewheel==3.1\n',
+            {"fastlib": (True, False), "purewheel": (False, False)},
+        ),
+        (
+            "# comment ending with \\\npurewheel==3.1\n",
+            {"purewheel": (False, False)},
+        ),
+        (
+            '--no-binary "fastlib,\\\\\npurewheel"\npurewheel==3.1\n',
+            {"purewheel": (True, False)},
+        ),
+        (
+            '--only-binary "fastlib,\\\\\nnowheels"\nnowheels==0.9\n',
+            {"nowheels": (False, True)},
+        ),
+        (
+            '--no-binary "fastlib,\\\\\r\npurewheel"\r\npurewheel==3.1\r\n',
+            {"purewheel": (True, False)},
+        ),
+        (
+            '--only-binary "fastlib,\\\\\r\nnowheels"\r\nnowheels==0.9\r\n',
+            {"nowheels": (False, True)},
+        ),
+    ],
+)
+def test_requirements_binary_format_control(tmp_path, lines, expected):
+    req = tmp_path / "requirements.txt"
+    req.write_bytes(lines.encode())  # as written: write_text would turn \r\n into \r\r\n on Windows
+    pkgs = by_name(parse_requirements(req))
+    assert {name: (pkgs[name].no_binary, pkgs[name].only_binary) for name in expected} == expected
+
+
+def test_requirements_binary_format_control_with_includes(tmp_path):
+    (tmp_path / "base.txt").write_text("--no-binary :all:\npurewheel==3.1\n", encoding="utf-8")
+    (tmp_path / "override.txt").write_text("--only-binary purewheel\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text("-r base.txt\nfastlib==2.0.0\n-r override.txt\n", encoding="utf-8")
+    pkgs = by_name(parse_requirements(req))
+    assert (pkgs["fastlib"].no_binary, pkgs["fastlib"].only_binary) == (True, False)
+    assert (pkgs["purewheel"].no_binary, pkgs["purewheel"].only_binary) == (False, True)
+
+
+def test_requirements_binary_format_control_reapplied_on_repeated_includes(tmp_path):
+    (tmp_path / "options.txt").write_text("--no-binary :all:\npurewheel==3.1\n", encoding="utf-8")
+    (tmp_path / "constraints.txt").write_text("--only-binary nowheels\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        "-r options.txt\n--no-binary :none:\n-r options.txt\n"
+        "-c constraints.txt\n--only-binary :none:\n-c constraints.txt\n"
+        "fastlib==2.0.0\nnowheels==0.9\n",
+        encoding="utf-8",
+    )
+    pkgs = parse_requirements(req).packages
+    assert [p.name for p in pkgs] == ["purewheel", "fastlib", "nowheels"]
+    by = {p.name: (p.no_binary, p.only_binary) for p in pkgs}
+    assert by == {
+        "purewheel": (True, False),
+        "fastlib": (True, False),
+        "nowheels": (False, True),
+    }
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("--no-b :all:", (True, False)),
+        ("--no-bin=:all:", (True, False)),
+        ("--only-b :all:", (False, True)),
+        ("--o=:all:", (False, True)),
+        ("--no- :all:", (False, False)),  # --no-index too: pip refuses it
+        ("--only-final", (False, False)),
+    ],
+)
+def test_requirements_binary_options_abbreviated(tmp_path, line, expected):
+    # optparse, which reads pip's requirements files, takes an unambiguous prefix of a long option
+    req = tmp_path / "requirements.txt"
+    req.write_text(f"{line}\nsix==1.16.0\n", encoding="utf-8")
+    (six,) = parse_requirements(req).packages
+    assert (six.no_binary, six.only_binary) == expected
