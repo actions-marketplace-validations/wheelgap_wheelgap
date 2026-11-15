@@ -1012,7 +1012,10 @@ class Server:
                 data["notes"] = [*data.get("notes", []), *notes]
             text = json.dumps(data, indent=1)
         except (ToolError, TargetError, SourceError) as e:
-            return {"content": [{"type": "text", "text": str(e)}], "isError": True}
+            text = str(e)
+            if notes:
+                text += "\n\n" + "\n".join(notes)
+            return {"content": [{"type": "text", "text": text}], "isError": True}
         except Exception as e:  # a bug: report it to the model rather than end the connection
             return {"content": [{"type": "text", "text": f"internal error: {type(e).__name__}: {e}"}], "isError": True}
         finally:

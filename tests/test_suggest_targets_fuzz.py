@@ -246,7 +246,7 @@ def flow_map(rng, entry):
 
 def noise_step(rng, pad):
     text = rng.choice(NOISE)
-    kind = rng.choices(range(7), weights=[6, 6, 6, 6, 6, 1, 1])[0]
+    kind = rng.choices(range(9), weights=[6, 6, 6, 6, 6, 1, 1, 4, 4])[0]
     if kind == 0:
         return f"{pad}- run: |\n{pad}    echo hi\n{pad}    {text}\n"
     if kind == 1:
@@ -259,6 +259,10 @@ def noise_step(rng, pad):
         return f"{pad}- uses: actions/checkout@v5\n{pad}  with:\n{pad}    fetch-depth: {scalar(rng, text)}\n"
     if kind == 5:
         return f"{pad}- run: {rng.choice(['&r', '!!str'])} |\n{pad}    {text}\n"
+    if kind in (7, 8):
+        quote = "'" if kind == 7 else '"'
+        escaped = text.replace("'", "''") if kind == 7 else text.replace("\\", "\\\\").replace('"', '\\"')
+        return f"{pad}- run: {quote}{escaped}\n{pad}    architecture: x86{quote}{comment(rng)}\n"
     return f"{pad}\t# a comment after a tab\n{pad}- run: echo\n"
 
 
@@ -294,6 +298,11 @@ def realistic_job(rng):
             elif entries:
                 lines.append(f"        {name}:")
                 for e in entries:
+                    if rng.random() < 0.5:
+                        lines.append("          - {")
+                        lines += [f"              {k}: {scalar(rng, v, flow=True)}," for k, v in e.items()]
+                        lines.append("            }")
+                        continue
                     first, *rest = e.items()
                     lines.append(f"          - {first[0]}: {scalar(rng, first[1])}")
                     lines += [f"            {k}: {scalar(rng, v)}" for k, v in rest]

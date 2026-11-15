@@ -639,7 +639,6 @@ def test_flow_matches_pyyaml(text, expected):
         ("'it''s'", "refused"),
         ("'a'b", "refused"),
         ("'a'#c", "refused"),  # `#` straight after a quote isn't a comment
-        ('"a', "refused"),
         ("[a]x", "refused"),
         ("[a]#c", "refused"),
         ("|x", "refused"),
@@ -738,12 +737,12 @@ JOB = "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
             [],
             [(4, NOT_READ + "test:")],
         ),
-        (('name: "a\n  b"\n' + JOB), [], [(1, "uses YAML this scanner doesn't read: name: \"a")]),
-        (("env:\n  A: 'x\n    y'\n" + JOB), [], [(2, "uses YAML this scanner doesn't read: A: 'x")]),
+        (('name: "a\n  b"\n' + JOB), [("linux-x86_64", CI, 5)], []),
+        (("env:\n  A: 'x\n    y'\n" + JOB), [("linux-x86_64", CI, 6)], []),
         (
             ('jobs:\n  test:\n    runs-on: "ubuntu-\n      latest"\n'),
             [],
-            [(3, "uses YAML this scanner doesn't read: runs-on: \"ubuntu-")],
+            [(3, "job test: runs-on: a quoted value over several lines isn't read")],
         ),
         (("name: [a,\n  b\n"), [], [(1, "uses YAML this scanner doesn't read: name: [a,")]),
         (
@@ -760,8 +759,8 @@ JOB = "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
         (("jobs:\n  call:\n    uses: ./.github/workflows/x.yml\n"), [], []),
         (
             ('jobs:\n  test:\n    name: "Build\n      it"\n    runs-on: windows-latest\n'),
+            [("win-amd64", CI, 5)],
             [],
-            [(3, "uses YAML this scanner doesn't read: name: \"Build")],
         ),
         (
             (JOB + "    steps: [{uses: actions/setup-python@v6}]\n"),
@@ -1542,17 +1541,99 @@ jobs:
 @pytest.mark.parametrize(
     ("env", "refused"),
     [
-        # Quoted values over several lines aren't in the grammar, whatever they hold.
-        ('  A: "x \\" # not a comment\n    y"\n', (2, 'A: "x \\" # not a comment')),
-        ("  B: 'it''s # not a comment\n    either'\n", (2, "B: 'it''s # not a comment")),
-        ("  C: 'one\n    two'\n", (2, "C: 'one")),
+        # Quoted continuations are opaque; their contents are never interpreted as keys or comments.
+        ('  A: "x \\" # not a comment\n    y"\n', None),
+        ("  B: 'it''s # not a comment\n    either'\n", None),
+        ("  C: 'one\n    two'\n", None),
         # A plain value goes on over more-indented lines: those are text, never keys.
         ('  D: echo building\n    "quoted\n    runs-on: windows-latest\n', (4, "runs-on: windows-latest")),
     ],
 )
 def test_values_over_several_lines(tmp_path, env, refused):
     _, got, _ = read(tmp_path, "env:\n" + env + JOB)
-    assert got == [(refused[0], f"uses YAML this scanner doesn't read: {refused[1]}")]
+    assert got == ([(refused[0], f"uses YAML this scanner doesn't read: {refused[1]}")] if refused else [])
+
+
+@pytest.mark.parametrize("flow_list", [False, True])
+def test_multiline_flat_flow_mapping(tmp_path, flow_list):
+    entries = (
+        "          [\n            {\n              os: windows-latest,\n"
+        "              python: '3.13',\n            },\n          ]"
+        if flow_list
+        else "\n          - {\n              os: windows-latest,\n              python: '3.13',\n            }"
+    )
+    text = (
+        "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
+        f"        include:{entries}\n    steps:\n      - uses: actions/setup-python@v6\n"
+        "        with:\n          python-version: ${{ matrix.python }}\n"
+    )
+    if flow_list:
+        text = text.replace("include:          [", "include: [")
+    _, refused, found = read(tmp_path, text)
+    assert refused == []
+    assert {f.value for f in found.targets} == {"win-amd64"}
+    assert {f.value for f in found.pythons} == {"3.13"}
+    assert found.pythons[0].line == 9
+
+
+@pytest.mark.parametrize("quote", ["'", '"'])
+@pytest.mark.parametrize("key", ["runs-on", "python-version", "architecture", "uses"])
+def test_multiline_quoted_values_are_never_read(tmp_path, quote, key):
+    if key == "runs-on":
+        text = f"jobs:\n  test:\n    runs-on: {quote}windows-\n      latest{quote}\n"
+    elif key == "uses":
+        text = JOB + f"    steps:\n      - uses: {quote}actions/setup-\n          python@v6{quote}\n"
+    else:
+        text = (
+            JOB + "    steps:\n      - uses: actions/setup-python@v6\n        with:\n"
+            f"          {key}: {quote}3.\n            13{quote}\n"
+        )
+    _, refused, found = read(tmp_path, text)
+    assert refused
+    assert not found.pythons
+    assert {f.value for f in found.targets} == ({"linux-x86_64"} if key == "python-version" else set())
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "a: x\n  b: y",  # missing comma
+        "a: x,\n  a: y",  # duplicate key
+        "a: [x]",  # only scalars
+        "a: {b: x}",
+        "a: &x value",
+        "a: *x",
+        "a: !!str x",
+        "a: 'x\n    y'",  # no multi-line values inside the mapping
+        "a: x,,",
+        "a:x",
+    ],
+)
+def test_multiline_mapping_refuses_wider_yaml(tmp_path, body):
+    text = "env: {\n  " + body + "\n}\n" + JOB
+    _, refused, found = read(tmp_path, text)
+    assert refused and not found.targets and not found.pythons
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "name: 'unclosed\n  text\n",
+        'name: "unclosed\n  text\n',
+        "name: 'one\n  two'junk\n",
+        "name: 'one\n  two'#not-a-comment\n",
+        'name: "one\n  \\q two"\n',
+        'name: "one\n  \\UFFFFFFFF"\n',
+        "name: 'one\n  \x7f two'\n",
+        "name: 'one\n  \uffff two'\n",
+        "env: {\n  a: x,\n},\n",  # no enclosing flow list
+        "env: {\n  a: x,\n} extra\n",
+        "env: {\n  a: x\n",
+    ],
+)
+def test_multiline_values_must_close_cleanly(tmp_path, text):
+    _, refused, found = read(tmp_path, text + JOB)
+    assert refused and not found.targets and not found.pythons
 
 
 def test_plain_values_over_several_lines_are_skipped(tmp_path):

@@ -1060,8 +1060,38 @@ def test_roots_timeout_is_noted_and_a_late_answer_is_used(fake_pypi, fixtures, t
     )
     first, second = [m["result"]["structuredContent"] for m in out.messages if m.get("id") in (1, 2)]
     assert first["path"] == second["path"] == str((fixtures / "uvproj").resolve())
-    assert any("roots/list did not answer within 0.01 s" in note for note in first["notes"])
+    assert sum("roots/list did not answer within 0.01 s" in note for note in first["notes"]) == 1
+    assert json.loads(next(m for m in out.messages if m.get("id") == 1)["result"]["content"][0]["text"]) == first
     assert not any("roots/list" in note for note in second["notes"])
+
+
+@pytest.mark.parametrize("version", ["2024-11-05", "2025-06-18", "2025-11-25"])
+def test_roots_timeout_is_noted_when_relative_path_fails(fake_pypi, tmp_path, monkeypatch, version):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(mcp, "_ROOTS_WAIT_SECONDS", 0.01)
+    message = init_with_roots()
+    message["params"]["protocolVersion"] = version
+    (_, _, reply) = run(message, INITIALIZED, call("check_lockfile", path="uvproj", python="3.13"))
+    result = reply["result"]
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert "uvproj" in text and "no such file" in text
+    assert "\n\nroots/list did not answer within 0.01 s; relative paths use the last known roots" in text
+    assert text.count("roots/list") == 1
+    assert not fake_pypi
+
+
+@pytest.mark.parametrize("error", [mcp.ToolError, mcp.TargetError, mcp.SourceError])
+@pytest.mark.parametrize("notes", [(), ("first note", "second note")])
+def test_tool_errors_preserve_notes(monkeypatch, error, notes):
+    def fail(arguments):
+        raise error("original error")
+
+    monkeypatch.setitem(mcp._HANDLERS, "list_targets", fail)
+    server = mcp.Server(lambda message: None)
+    result = server._tool_result("list_targets", {}, "2025-06-18", (), False, notes)
+    expected = "original error" + ("\n\n" + "\n".join(notes) if notes else "")
+    assert result == {"content": [{"type": "text", "text": expected}], "isError": True}
 
 
 def test_roots_timeout_waits_once_per_request(fake_pypi, fixtures, monkeypatch):

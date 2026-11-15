@@ -204,6 +204,7 @@ _BLOCK = _Opaque("a multi-line value")  # `key: |` and the lines under it
 _LINES = _Opaque("a value over several lines")  # a plain scalar continued on more-indented lines
 _ALIAS = _Opaque("an alias")  # `key: *name`
 _ESCAPED = _Opaque("a quoted value with escapes")  # `key: "a\tb"`
+_QUOTED_LINES = _Opaque("a quoted value over several lines")
 
 
 @dataclass
@@ -273,6 +274,8 @@ class _Scalar:
 # - a double-quoted scalar on one line with escapes (never read);
 # - `[` alone, opening a flow list over several lines (also on the line after the key, as Prettier writes it): one item
 #   per line, each but the last followed by `,`, then `]`.
+# - `{` alone, followed by one `key: ITEM` scalar pair per line with commas, then `}`;
+# - a quoted scalar over more-indented lines (never read), with a whole closing quote and optional comment.
 _KEY_RE = re.compile(r"[A-Za-z0-9_.-]+", re.ASCII)
 _QUOTED_RE = re.compile(r"'[^'\n]*'(?!')|\"[^\"\\\n]*\"")  # no escapes: no `\` in "...", no `''` in '...'
 _BLOCK_HEADER_RE = re.compile(r"[|>](?:[1-9][-+]?|[-+][1-9]?)?", re.ASCII)
@@ -375,6 +378,32 @@ class _Flow:
 
 
 _OPEN = object()  # `[` alone: a flow list continues on the next lines
+_OPEN_MAP = object()  # `{` alone: a flat flow mapping continues on the next lines
+_OPEN_QUOTE = object()
+
+
+def _quoted_end(text: str, quote: str, line: int) -> int | None:
+    """The end of a whole quoted value's line, or None when it continues. Its contents are never decoded."""
+    pos = 0
+    while pos < len(text):
+        char = text[pos]
+        if char == quote:
+            if quote == "'" and text[pos : pos + 2] == "''":
+                pos += 2
+                continue
+            return pos + 1
+        if quote == '"' and char == "\\":
+            if pos + 1 == len(text):  # YAML's escaped line break
+                return None
+            escape = re.match(r'\\(?:[0abtnvfre "/\\N_LP]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})', text[pos:])
+            if escape is None or escape.group().startswith("\\U") and int(escape.group()[2:], 16) > 0x10FFFF:
+                raise _NotRead(line, text)
+            pos += len(escape.group())
+            continue
+        if ord(char) < 32 and char != "\t" or 0x7F <= ord(char) <= 0x9F or ord(char) in (0xFFFE, 0xFFFF):
+            raise _NotRead(line, text)
+        pos += 1
+    return None
 
 
 def _value(text: str, line: int) -> tuple[object, str]:
@@ -386,12 +415,16 @@ def _value(text: str, line: int) -> tuple[object, str]:
             return _Scalar(m.group()[1:-1], True, line), m.group()
         if (m := _ESCAPED_RE.match(text)) and _comment_only(text[m.end() :]):
             return _ESCAPED, m.group()
+        if _quoted_end(text[1:], text[0], line) is None:
+            return _OPEN_QUOTE, text
         raise _NotRead(line, text)
     if (m := _PROPERTY_RE.match(text)) and _comment_only(text[m.end() :]):
         # An anchor on the block below (read as it is) or an alias (never read).
         return (None if m.group(1) == "&" else _ALIAS), m.group()
     if text[0] == "[" and _comment_only(text[1:]):
         return _OPEN, "["
+    if text[0] == "{" and _comment_only(text[1:]):
+        return _OPEN_MAP, "{"
     if text[0] in "[{":
         flow = _Flow(text, line)
         value = flow.collection()
@@ -426,7 +459,8 @@ def _flow_children(mapping: dict[str, object], line: int, indent: float) -> list
     """A flow mapping's entries as the nodes a block mapping would have."""
     children = []
     for key, value in mapping.items():
-        node = _Node(line, indent + 1, key, value, value.text if isinstance(value, _Scalar) else "...", sealed=True)
+        at = value.line if isinstance(value, _Scalar) else line
+        node = _Node(at, indent + 1, key, value, value.text if isinstance(value, _Scalar) else "...", sealed=True)
         if isinstance(value, dict):
             node.children, node.value = _flow_children(value, line, indent + 1), None
         children.append(node)
@@ -486,6 +520,11 @@ def _parse_tree(text: str) -> _Node:
                 return i
             if indent <= base or not closed:
                 raise _NotRead(i, line)
+            if body.startswith("{") and _comment_only(body[1:]):
+                item = _Node(i, indent, None)
+                i, closed = mapping_lines(item, i, comma=True)
+                items.append(item.value)
+                continue
             flow = _Flow(body, i)
             items.append(flow.value())
             end = flow.pos  # the comment (if any) after the item needs the space before it
@@ -494,6 +533,54 @@ def _parse_tree(text: str) -> _Node:
             if not _comment_only(body[flow.pos + 1 :] if closed else body[end:]):
                 raise _NotRead(i, line)
         raise _NotRead(node.line, lines[node.line - 1])  # never closed
+
+    def mapping_lines(node: _Node, start: int, comma: bool = False) -> tuple[int, bool]:
+        """A flat multi-line flow mapping; a comma after `}` belongs to an enclosing flow list only."""
+        base = len(lines[node.line - 1]) - len(lines[node.line - 1].lstrip(" "))
+        mapping: dict[str, object] = {}
+        i, closed = start, True
+        while i < len(lines):
+            line = lines[i]
+            i += 1
+            if not content(i - 1):
+                continue
+            indent, body = len(line) - len(line.lstrip(" ")), line.strip(_WS)
+            if line[indent : indent + 1] == "\t" or indent < base:
+                raise _NotRead(i, line)
+            if body.startswith("}"):
+                rest = body[1:]
+                end_comma = comma and rest.startswith(",")
+                if not _comment_only(rest[1:] if end_comma else rest):
+                    raise _NotRead(i, line)
+                node.value, node.raw = mapping, "{...}"
+                return i, end_comma
+            pair = _split_key(body)
+            if indent <= base or not closed or pair is None or pair[0] in mapping:
+                raise _NotRead(i, line)
+            flow = _Flow(pair[1], i)
+            mapping[pair[0]] = flow.scalar()  # no nested collections, aliases or multi-line items
+            end = flow.pos
+            flow.spaces()
+            closed = flow.peek() == ","
+            if not _comment_only(pair[1][flow.pos + 1 :] if closed else pair[1][end:]):
+                raise _NotRead(i, line)
+        raise _NotRead(node.line, lines[node.line - 1])
+
+    def quoted_lines(node: _Node, start: int, column: int) -> int:
+        quote, i = node.raw[0], start
+        while i < len(lines):
+            line = lines[i]
+            i += 1
+            indent = len(line) - len(line.lstrip(" "))
+            if line.strip(_WS) and (indent <= column or line[indent : indent + 1] == "\t"):
+                raise _NotRead(node.line, lines[node.line - 1])
+            end = _quoted_end(line[indent:], quote, i)
+            if end is not None:
+                if not _comment_only(line[indent + end :]):
+                    raise _NotRead(i, line)
+                node.value = _QUOTED_LINES
+                return i
+        raise _NotRead(node.line, lines[node.line - 1])
 
     while number < len(lines):
         line = lines[number]
@@ -576,6 +663,10 @@ def _parse_tree(text: str) -> _Node:
         elif node.value is _OPEN:
             node.value = None
             number = flow_lines(node, number)
+        elif node.value is _OPEN_MAP:
+            number, _ = mapping_lines(node, number)
+        elif node.value is _OPEN_QUOTE:
+            number = quoted_lines(node, number, column)
         elif isinstance(node.value, _Scalar) and not node.value.quoted and not re.search(r"[ \t]#", line):
             plain = node, column
         elif node.value is None and node.key is not None:
