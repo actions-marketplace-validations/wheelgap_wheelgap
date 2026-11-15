@@ -88,11 +88,15 @@
             "additionalProperties": false,
             "required": ["packages", "with_gaps"],
             "properties": {
-                "packages": {"type": "integer", "minimum": 0, "description": "Number of entries in packages."},
+                "packages": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Requirements checked, each input entry once: a range that resolves to a different release per Python counts once though it has more than one entry in packages, while two entries for the same name (such as forked versions in a uv.lock) count twice. Equal to the length of packages unless a range was split."
+                },
                 "with_gaps": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Packages whose results include source, missing or unknown, not counting the platforms in ignored_targets. Gaps on advisory targets count."
+                    "description": "How many of the requirements counted in packages have source, missing or unknown in the results of any of their entries, not counting the platforms in ignored_targets. Gaps on advisory targets count."
                 },
                 "per_target": {
                     "type": "object",

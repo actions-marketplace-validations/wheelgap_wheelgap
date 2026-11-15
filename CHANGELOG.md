@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- When checking several `-p` versions splits a version range into more than one release row, summary counts (`N packages`, the gap and clean summaries, `--markdown`, `-q`, the hidden and advisory lines, and `--json` `summary.packages` and `summary.with_gaps`) now count that requirement once instead of once per row, under its worst status across those rows. Per-target counts and package rows stay per release. (#330, thanks [@X6M-Work](https://github.com/X6M-Work))
 - MCP: when a relative-path tool call fails after waiting for the client's roots, the error now includes the `roots/list` timeout note, so a missing-file error explains that the client's roots never arrived. (#329, thanks [@kunalkshah1](https://github.com/kunalkshah1))
 - `--suggest-targets` reads flat multi-line flow mappings and skips multi-line quoted values where their contents are not inspected, so those shapes no longer make an entire workflow unreadable. Multi-line quoted target and Python inputs remain unreadable. (#326, thanks [@kunalkshah1](https://github.com/kunalkshah1))
 - MCP: on the handshake (protocol versions 2024-11-05 to 2025-11-25), a tool call with a relative path sent right after `notifications/initialized` (as the official Python SDK does) now waits up to 2 seconds for the client's `roots/list` answer, instead of resolving the path against the server's working directory. If no answer comes, it falls back as before and says so in `notes`, and later calls don't wait for that request again. (#318, thanks [@kunalkshah1](https://github.com/kunalkshah1))

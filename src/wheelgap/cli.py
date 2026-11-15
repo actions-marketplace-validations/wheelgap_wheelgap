@@ -10,7 +10,7 @@ import re
 import sys
 import sysconfig
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -478,16 +478,42 @@ def apart_from_ignored(rows: list[Row]) -> str:
     return f", apart from {n} ignored gap{'s' * (n != 1)}" if n else ""
 
 
-def hidden_line(hidden: list[Row]) -> str:
-    """'3 packages with wheels for every target hidden', not counting those with only ignored gaps as such."""
-    only_ignored = sum(1 for r in hidden if ignored_gaps(r))
-    wheels = len(hidden) - only_ignored
+def _input_key(row: Row, index: int) -> tuple[int, int]:
+    """Identity of the input requirement a row came from (ranges resolved per Python share one)."""
+    return (0, id(row.input_package)) if row.input_package is not None else (1, index)
+
+
+def _group_rows(rows: list[Row]) -> list[list[Row]]:
+    """Group resolved rows by their input requirement, preserving first-seen order."""
+    groups: dict[tuple[int, int], list[Row]] = {}
+    for i, row in enumerate(rows):
+        groups.setdefault(_input_key(row, i), []).append(row)
+    return list(groups.values())
+
+
+def hidden_line(hidden: list[Row], shown: list[Row] | None = None) -> str:
+    """'3 packages with wheels for every target hidden', not counting those with only ignored gaps as such.
+
+    A hidden release of a range whose other release is shown (split per Python) isn't another package: it's
+    counted as an other release of a package with gaps, so the line doesn't contradict the gap summary.
+    """
+    shown_inputs = {id(r.input_package) for r in shown or [] if r.input_package is not None}
+    rest = [r for r in hidden if r.input_package is None or id(r.input_package) not in shown_inputs]
+    others = len(hidden) - len(rest)
+    of = len({id(r.input_package) for r in hidden if r.input_package is not None} & shown_inputs)
+    groups = _group_rows(rest)
+    only_ignored = sum(1 for group in groups if any(ignored_gaps(r) for r in group))
+    wheels = len(groups) - only_ignored
     parts = []
     if wheels:
         parts.append(f"{wheels} package{'s' * (wheels != 1)} with wheels for every target")
     if only_ignored:
         noun = "" if wheels else f" package{'s' * (only_ignored != 1)}"
         parts.append(f"{only_ignored}{noun} with only ignored gaps")
+    if others:
+        parts.append(
+            f"{others} other release{'s' * (others != 1)} of {'a package' if of == 1 else 'packages'} with gaps"
+        )
     return " and ".join(parts) + " hidden"
 
 
@@ -513,12 +539,16 @@ def advisory_line(rows: list[Row], targets: list[Target], advisory: frozenset[Ta
     """
     multi_py = len({t.python for t in targets}) > 1
     cells = [
-        (r, t) for r in rows for t in targets if t in advisory and t not in r.ignored and r.results[t] in GAP_STATUSES
+        (i, t)
+        for i, r in enumerate(rows)
+        for t in targets
+        if t in advisory and t not in r.ignored and r.results[t] in GAP_STATUSES
     ]
     if not cells:
         return ""
     labels = [t.label(multi_py) for t in targets if any(t is cell_target for _, cell_target in cells)]
-    n, packages = len(cells), len({id(r) for r, _ in cells})
+    n = len(cells)
+    packages = len({_input_key(rows[i], i) for i, _ in cells})
     return (
         f"{n} gap{'s' * (n != 1)} in {packages} package{'s' * (packages != 1)} on advisory "
         f"target{'s' * (len(labels) != 1)} {', '.join(labels)} {'do' if n != 1 else 'does'}n't fail the run."
@@ -849,7 +879,11 @@ def report_json(
             {"name": name, "platforms": platforms} for name, platforms in ignored if platforms is not None
         ],
         "advisory": [t.label(multi_py) for t in targets if t in advisory],
-        "summary": {"packages": len(rows), "with_gaps": len(gaps), "per_target": target_counts(gaps, targets)},
+        "summary": {
+            "packages": len(_group_rows(rows)),
+            "with_gaps": len(_group_rows(gaps)),
+            "per_target": target_counts(gaps, targets),
+        },
     }
     if blocking is not None:
         report["blocking_newer_python"] = blocking.names
@@ -927,17 +961,24 @@ def print_target_list(args: argparse.Namespace, config: dict) -> None:
         print(f"  {name:<18} {libc} {version}" + (f" (also {names})" if names else ""))
 
 
-def worst_status(row: Row) -> Status:
-    """The status that best describes a gap package: can't install, then unknown, then from source."""
+def _worst_in(statuses: Iterable[Status]) -> Status:
+    seen = set(statuses)
     for s in (Status.MISSING, Status.UNKNOWN, Status.SOURCE):
-        if s in row.counted:
+        if s in seen:
             return s
     return Status.WHEEL
 
 
+def worst_status(row: Row) -> Status:
+    """The status that best describes a gap package: can't install, then unknown, then from source."""
+    return _worst_in(row.counted)
+
+
 def gap_summary(gaps: list[Row], total: int, style: Style) -> str:
-    # Each package is counted once, under its worst status, so the parts always add up to len(gaps).
-    worst = [worst_status(r) for r in gaps]
+    # Each package is counted once, under its worst status across its rows, so the parts always add up to n_gaps.
+    groups = _group_rows(gaps)
+    worst = [_worst_in(s for r in group for s in r.counted) for group in groups]
+    n_gaps = len(groups)
     source, missing, unknown = (worst.count(s) for s in (Status.SOURCE, Status.MISSING, Status.UNKNOWN))
     parts = []
     if source:
@@ -946,9 +987,9 @@ def gap_summary(gaps: list[Row], total: int, style: Style) -> str:
         parts.append(style.red(f"{missing} can't install at all"))
     if unknown:
         parts.append(style.dim(f"{unknown} unknown"))
-    verb = "has" if len(gaps) == 1 else "have"
+    verb = "has" if n_gaps == 1 else "have"
     noun = "package" if total == 1 else "packages"
-    return f"{style.bold(f'{len(gaps)} of {total} {noun}')} {verb} gaps: " + ", ".join(parts) + "."
+    return f"{style.bold(f'{n_gaps} of {total} {noun}')} {verb} gaps: " + ", ".join(parts) + "."
 
 
 def target_counts(gaps: list[Row], targets: list[Target]) -> dict[str, dict[str, int]]:
@@ -1036,10 +1077,12 @@ def render_markdown(
     """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment)."""
     plain = Style(False)
     gaps = [r for r in rows if not r.ok]
+    total_pkgs = len(_group_rows(rows))
+    gap_pkgs = len(_group_rows(gaps))
     n_t = len(targets)
     if gaps:
-        noun = "package" if len(rows) == 1 else "packages"
-        out = [f"### wheelgap: {len(gaps)} of {len(rows)} {noun} {'has' if len(gaps) == 1 else 'have'} gaps", ""]
+        noun = "package" if total_pkgs == 1 else "packages"
+        out = [f"### wheelgap: {gap_pkgs} of {total_pkgs} {noun} {'has' if gap_pkgs == 1 else 'have'} gaps", ""]
     elif not rows:  # "every package" reads like a success when the run checked nothing
         out = ["### wheelgap: no packages to check", ""]
     else:
@@ -1049,7 +1092,7 @@ def render_markdown(
             "",
         ]
     pys = ", ".join(dict.fromkeys(t.python for t in targets))
-    n_pkgs = f"{len(rows)} package{'s' * (len(rows) != 1)}"
+    n_pkgs = f"{total_pkgs} package{'s' * (total_pkgs != 1)}"
     out += [f"wheelgap {__version__} · {' + '.join(map(_code, source_labels))} · {n_pkgs} · Python {pys}", ""]
 
     shown = rows if args.all else gaps
@@ -1064,14 +1107,14 @@ def render_markdown(
         out.append("")
         hidden = [] if args.all else [r for r in rows if r.ok]
         if hidden:
-            out += [f"{hidden_line(hidden)} (`--all` to show).", ""]
+            out += [f"{hidden_line(hidden, shown)} (`--all` to show).", ""]
 
     if gaps:
         per_target = shown_target_lines(gaps, targets, plain, advisory)
         if per_target:
             out += [f"- {_md(head)}: {text}" for head, text in per_target]
             out.append("")
-        out += [gap_summary(gaps, len(rows), plain), ""]
+        out += [gap_summary(gaps, total_pkgs, plain), ""]
         if blocking := blocking_newer_python(rows, targets):
             out += [_md(blocking_line(blocking)), ""]
         if line := advisory_line(rows, targets, advisory):
@@ -1831,10 +1874,11 @@ def _main(argv: list[str]) -> int:
         return code
 
     style = Style(use_color(args.color))
+    total_pkgs = len(_group_rows(rows))
     if quiet:
         if gaps:
-            print(gap_summary(gaps, len(rows), style))
-            print("gaps: " + ", ".join(r.package.name for r in gaps))
+            print(gap_summary(gaps, total_pkgs, style))
+            print("gaps: " + ", ".join(group[0].package.name for group in _group_rows(gaps)))
             if blocking := blocking_newer_python(rows, targets):
                 print(blocking_line(blocking))
             if line := advisory_line(rows, targets, advisory):
@@ -1855,7 +1899,7 @@ def _main(argv: list[str]) -> int:
         return code
 
     pys = ", ".join(dict.fromkeys(t.python for t in targets))
-    n_pkgs = f"{len(rows)} package{'s' * (len(rows) != 1)}"
+    n_pkgs = f"{total_pkgs} package{'s' * (total_pkgs != 1)}"
     print(style.dim(f"wheelgap {__version__} · {' + '.join(source_labels)} · {n_pkgs} · Python {pys}"))
     print()
 
@@ -1866,7 +1910,7 @@ def _main(argv: list[str]) -> int:
         print()
         hidden = [] if args.all else [r for r in rows if r.ok]
         if hidden:
-            print(style.dim(f"{hidden_line(hidden)} (--all to show)"))
+            print(style.dim(f"{hidden_line(hidden, shown)} (--all to show)"))
         if args.explain and gaps:
             if hidden:
                 print()
@@ -1893,14 +1937,14 @@ def _main(argv: list[str]) -> int:
         print(style.dim("No packages to check."))
         return 0
     if not gaps:
-        what = "The 1 package has" if len(rows) == 1 else f"All {len(rows)} packages have"
+        what = "The 1 package has" if total_pkgs == 1 else f"All {total_pkgs} packages have"
         every = f"{'every one of ' if n_t > 1 else ''}{n_t} target{'s' * (n_t > 1)}{apart_from_ignored(rows)}"
         print(style.green(f"✓ {what} a wheel for {every}."))
         return 0
 
     for line in target_lines(gaps, targets, style, advisory):
         print(line)
-    print(gap_summary(gaps, len(rows), style))
+    print(gap_summary(gaps, total_pkgs, style))
     if blocking := blocking_newer_python(rows, targets):
         print(blocking_line(blocking))
     if line := advisory_line(rows, targets, advisory):

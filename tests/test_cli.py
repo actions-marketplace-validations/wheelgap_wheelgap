@@ -1758,6 +1758,15 @@ def test_hidden_line_counts_wheels_and_ignored_gaps_apart():
     assert cli.hidden_line([clean, clean, accepted]) == (
         "2 packages with wheels for every target and 1 with only ignored gaps hidden"
     )
+    # A range split per Python: its clean release is hidden while its other release is shown with a gap.
+    split = Package("s", None)
+    old_release = Row(Package("s", "1"), {lin: Status.WHEEL, musl: Status.WHEEL}, input_package=split)
+    new_release = Row(Package("s", "2"), {lin: Status.WHEEL, musl: Status.SOURCE}, input_package=split)
+    assert cli.hidden_line([old_release], [new_release]) == "1 other release of a package with gaps hidden"
+    assert cli.hidden_line([clean, old_release], [new_release]) == (
+        "1 package with wheels for every target and 1 other release of a package with gaps hidden"
+    )
+    assert cli.hidden_line([old_release], []) == "1 package with wheels for every target hidden"
 
 
 def test_ignore_on_one_target_quiet(capsys, fixtures):
@@ -2221,19 +2230,23 @@ def _assert_matches_output_schema(data):
         assert isinstance(item["name"], str) and isinstance(item["reason"], str)
     summary = data["summary"]
     assert set(summary) == {"packages", "with_gaps", "per_target"}
-    assert summary["packages"] == len(data["packages"])
+    distinct_names = {pkg["name"] for pkg in data["packages"]}
+    assert len(distinct_names) <= summary["packages"] <= len(data["packages"])
     assert isinstance(summary["with_gaps"], int) and 0 <= summary["with_gaps"] <= summary["packages"]
     # with_gaps counts packages that are not all wheel/n/a/bundled, leaving out the targets ignored for them
-    expected = sum(
-        1
+    gap_rows = [
+        pkg
         for pkg in data["packages"]
         if any(
             s in {"source", "missing", "unknown"}
             for label, s in pkg["results"].items()
             if label not in ignored_on.get(pkg["name"], set())
         )
-    )
-    assert summary["with_gaps"] == expected
+    ]
+    assert len({pkg["name"] for pkg in gap_rows}) <= summary["with_gaps"] <= len(gap_rows)
+    if len(distinct_names) == len(data["packages"]):
+        assert summary["packages"] == len(data["packages"])
+        assert summary["with_gaps"] == len(gap_rows)
     # per_target counts each target's gap cells, for every target (zeros included), leaving out ignored cells
     assert summary["per_target"] == {
         label: {
@@ -3296,3 +3309,169 @@ def test_only_editable_requirements_says_no_packages_to_check(capsys, fake_pypi,
     skipped = next(i for i, line in enumerate(lines) if "skipped" in line)
     assert lines.index("No packages to check.") > skipped  # the reason comes first
     assert "All 0" not in out
+
+
+def test_range_split_clean_counts_as_one_package(capsys, fake_pypi):
+    base = ("pythonranged>=1", "-p", "3.9,3.13", "-t", "linux-x86_64")
+
+    code, out, _ = run(capsys, *base, "--color", "never")
+    assert code == 0
+    assert "· 1 package ·" in out
+    assert "The 1 package has a wheel for every one of 2 targets." in out
+
+    code, out, _ = run(capsys, *base, "--markdown")
+    assert code == 0
+    assert "### wheelgap: every package has a wheel for all 2 targets" in out
+    assert "· 1 package ·" in out
+
+    code, out, _ = run(capsys, *base, "--json")
+    assert code == 0
+    data = json.loads(out)
+    assert len(data["packages"]) == 2
+    assert data["summary"]["packages"] == 1
+    assert data["summary"]["with_gaps"] == 0
+    _assert_matches_output_schema(data)
+
+    # A second distinct input package counts as 2, and both clean releases of pythonranged count once when hidden.
+    both_clean_plus_gap = ("pythonranged>=1", "nowheels==0.9", "-p", "3.9,3.13", "-t", "linux-x86_64")
+    code, out, _ = run(capsys, *both_clean_plus_gap, "--color", "never")
+    assert code == 1
+    assert "· 2 packages ·" in out
+    assert "1 package with wheels for every target hidden (--all to show)" in out
+    assert "1 of 2 packages has gaps: 1 will build from source." in out
+
+    code, out, _ = run(capsys, "pythonranged>=1", "purewheel==3.1", "-p", "3.9,3.13", "-t", "linux-x86_64", "--json")
+    assert code == 0
+    data = json.loads(out)
+    assert len(data["packages"]) == 3
+    assert data["summary"]["packages"] == 2
+    assert data["summary"]["with_gaps"] == 0
+
+
+def test_range_split_one_clean_one_gap_counts_as_one_package(capsys, fake_pypi, monkeypatch, tmp_path):
+    from conftest import FAKE_INDEX
+
+    monkeypatch.setitem(
+        FAKE_INDEX,
+        "splitgap",
+        {
+            "1.0": [{"filename": "splitgap-1.0-py3-none-any.whl", "requires_python": "<3.10"}],
+            "2.0": [{"filename": "splitgap-2.0.tar.gz", "requires_python": ">=3.10"}],
+        },
+    )
+    base = ("splitgap>=1", "-p", "3.9,3.13", "-t", "linux-x86_64")
+
+    code, out, _ = run(capsys, *base, "--color", "never")
+    assert code == 1
+    assert "· 1 package ·" in out
+    # The clean 3.9 release is the same requirement, not another package with wheels everywhere.
+    assert "1 other release of a package with gaps hidden (--all to show)" in out
+    assert "package with wheels for every target" not in out
+    assert "1 of 1 package has gaps: 1 will build from source." in out
+
+    code, out, _ = run(capsys, *base, "-q", "--color", "never")
+    assert code == 1
+    assert out.splitlines() == [
+        "1 of 1 package has gaps: 1 will build from source.",
+        "gaps: splitgap",
+        "blocking 3.13: splitgap",
+    ]
+
+    code, out, _ = run(capsys, *base, "--markdown")
+    assert code == 1
+    assert "### wheelgap: 1 of 1 package has gaps" in out
+    assert "· 1 package ·" in out
+    assert "1 other release of a package with gaps hidden (`--all` to show)." in out
+    assert "1 of 1 package has gaps: 1 will build from source." in out
+
+    code, out, _ = run(capsys, *base, "--json")
+    assert code == 1
+    data = json.loads(out)
+    assert len(data["packages"]) == 2
+    assert data["summary"] == {
+        "packages": 1,
+        "with_gaps": 1,
+        "per_target": {
+            "3.9 linux-x86_64": {"source": 0, "missing": 0, "unknown": 0},
+            "3.13 linux-x86_64": {"source": 1, "missing": 0, "unknown": 0},
+        },
+    }
+    _assert_matches_output_schema(data)
+
+    # When both releases are hidden via --ignore, the one input package counts once in hidden_line.
+    code, out, _ = run(
+        capsys, "splitgap>=1", "nowheels==0.9", *base[1:], "--ignore", "splitgap:linux-x86_64", "--color", "never"
+    )
+    assert code == 1
+    assert "· 2 packages ·" in out
+    assert "1 package with only ignored gaps hidden (--all to show)" in out
+    assert "1 of 2 packages has gaps: 1 will build from source." in out
+
+    # When splitgap is checked on its own with gaps ignored, the clean summary counts it as 1 package.
+    code, out, _ = run(capsys, *base, "--ignore", "splitgap:linux-x86_64", "--color", "never")
+    assert code == 0
+    assert "The 1 package has a wheel for every one of 2 targets, apart from 1 ignored gap." in out
+
+    # Two distinct requirements entries for the same package name still count separately (2), unlike a split range (1).
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        "splitgap==1.0; python_version < '3.10'\nsplitgap==2.0; python_version >= '3.10'\n", encoding="utf-8"
+    )
+    code, out, _ = run(capsys, str(req), "-p", "3.9,3.13", "-t", "linux-x86_64", "--json")
+    assert code == 1
+    data = json.loads(out)
+    assert len(data["packages"]) == 2
+    assert data["summary"]["packages"] == 2
+    assert data["summary"]["with_gaps"] == 1
+
+
+def test_range_split_both_releases_with_different_gaps_counts_as_one_package(capsys, fake_pypi, monkeypatch):
+    from conftest import FAKE_INDEX
+
+    monkeypatch.setitem(
+        FAKE_INDEX,
+        "bothgaps",
+        {
+            "1.0": [{"filename": "bothgaps-1.0.tar.gz", "requires_python": "<3.10"}],
+            "2.0": [{"filename": "bothgaps-2.0-cp313-cp313-win_amd64.whl", "requires_python": ">=3.10"}],
+        },
+    )
+    base = ("bothgaps>=1", "-p", "3.9,3.13", "-t", "linux-x86_64")
+
+    code, out, _ = run(capsys, *base, "--color", "never")
+    assert code == 1
+    assert "· 1 package ·" in out
+    assert "3.9 linux-x86_64   1 from source" in out
+    assert "3.13 linux-x86_64  1 missing" in out
+    assert "1 of 1 package has gaps: 1 can't install at all." in out
+
+    code, out, _ = run(capsys, *base, "-q", "--color", "never")
+    assert code == 1
+    assert out.splitlines() == [
+        "1 of 1 package has gaps: 1 can't install at all.",
+        "gaps: bothgaps",
+        "blocking 3.13: none (every gap on 3.13 is on 3.9 too)",
+    ]
+
+    code, out, _ = run(capsys, *base, "--markdown")
+    assert code == 1
+    assert "### wheelgap: 1 of 1 package has gaps" in out
+    assert "1 of 1 package has gaps: 1 can't install at all." in out
+
+    code, out, _ = run(capsys, *base, "--json")
+    assert code == 1
+    data = json.loads(out)
+    assert len(data["packages"]) == 2
+    assert data["summary"] == {
+        "packages": 1,
+        "with_gaps": 1,
+        "per_target": {
+            "3.9 linux-x86_64": {"source": 1, "missing": 0, "unknown": 0},
+            "3.13 linux-x86_64": {"source": 0, "missing": 1, "unknown": 0},
+        },
+    }
+    _assert_matches_output_schema(data)
+
+    code, out, _ = run(capsys, *base, "--advisory", "linux-x86_64", "--color", "never")
+    assert code == 0
+    assert "2 gaps in 1 package on advisory targets 3.9 linux-x86_64, 3.13 linux-x86_64 don't fail the run." in out

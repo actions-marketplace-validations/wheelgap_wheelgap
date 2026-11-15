@@ -69,6 +69,8 @@ class Row:
     via: dict[Target, list[str]] = field(default_factory=dict)
     # --ignore NAME:TARGET: targets whose result is still reported but doesn't count as a gap.
     ignored: frozenset[Target] = frozenset()
+    # The input requirement that resolved to this row (a range resolved per Python spawns one Row per release).
+    input_package: Package | None = field(default=None, repr=False, compare=False)
 
     @property
     def counted(self) -> list[Status]:
@@ -763,7 +765,9 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
             for t in targets:
                 resolved = pkg.resolutions.get(f"{t.major}.{t.minor}", pkg)
                 if id(resolved) not in resolved_rows:
-                    resolved_rows[id(resolved)] = Row(resolved, dict.fromkeys(targets, Status.NOT_NEEDED))
+                    resolved_rows[id(resolved)] = Row(
+                        resolved, dict.fromkeys(targets, Status.NOT_NEEDED), input_package=pkg
+                    )
                     parsed[id(resolved)] = wheel_tags(resolved.files) if resolved.files is not None else []
                 row = resolved_rows[id(resolved)]
                 files = None if resolved.error else resolved.files
