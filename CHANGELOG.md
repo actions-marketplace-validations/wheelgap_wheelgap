@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- With `--explain --notes`, packages with gaps only on platforms the tracker does not scan (such as iOS or RISC-V) are no longer sent to wheelgap.github.io. The "add --notes" hint is also suppressed for those runs. (#315, thanks [@kunalkshah1](https://github.com/kunalkshah1))
 - `--dockerfile` now recognizes `index.docker.io/python` and `index.docker.io/library/python` as official Python images. (#306, thanks [@LetMeSleep8h](https://github.com/LetMeSleep8h))
 - A file URL that can't be parsed in `uv.lock`, `pylock.toml`, `poetry.lock` or `pdm.lock` (an unclosed IPv6 bracket, or a space in the host) is now an input error (exit 2) that names the lock file and the package, such as `uv.lock: package b has a file URL that can't be parsed`, instead of `ValueError: Invalid IPv6 URL`. A URL with a space in its host used to be read as if it were fine. (#304, thanks [@Franky100-pig](https://github.com/Franky100-pig))
 - `python -m wheelgap.scan --max-error-rate` now rejects values that aren't a number from 0 to 1 (exit 2), such as `nan`, `inf`, `-0.1`, `1.5` or `abc`. `nan` used to turn the outage guard off, so a scan where every lookup failed still wrote the dataset; a negative value made a clean scan refuse to write; `inf` and values above 1 behaved like 1. (#302, thanks [@bfs2021](https://github.com/bfs2021))

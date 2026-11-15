@@ -71,6 +71,22 @@ def test_note_shown_for_a_matching_target_and_not_another(capsys, tmp_path, trac
     assert pkg["notes"] == [{**NOTE, "targets": ["linux-x86_64"]}]
 
 
+@pytest.mark.parametrize("platform", ["ios-arm64", "linux-riscv64"])
+def test_unsupported_tracker_platform_never_sends_name_or_hints(capsys, tmp_path, tracker, platform):
+    folder = uv_lock(tmp_path)
+    code, _, err = run(capsys, folder, "-p", "3.13", "-t", platform, "--explain", "--notes")
+    assert code == 1 and not err and tracker.calls == []
+
+    code, _, err = run(capsys, folder, "-p", "3.13", "-t", platform, "--explain")
+    assert code == 1 and "add --notes" not in err
+
+
+def test_supported_gap_still_sends_name_with_unsupported_gap(capsys, tmp_path, tracker):
+    code, _, err = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "ios-arm64,linux-x86_64", "--explain", "--notes")
+    assert code == 1 and not err
+    assert tracker.calls == [f"{notes.TRACKER}/pkg.json"]
+
+
 def test_note_for_another_platform_only_shows_nothing(capsys, tmp_path, tracker):
     tracker.add("pkg", note(platforms=["macos-arm64"]))
     code, out, _ = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
@@ -800,6 +816,20 @@ def test_poetry_lock_never(capsys, tmp_path, tracker, fake_pypi, lock):
     )
     assert code == 1 and "nowheels 0.9 on linux-x86_64" in out
     assert tracker.calls == []
+
+
+def test_online_poetry_legacy_pypi_source_never_sends_name(capsys, tmp_path, tracker, fake_pypi):
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "nowheels"\nversion = "0.9"\n'
+        '[package.source]\ntype = "legacy"\nurl = "https://pypi.org/simple"\nreference = "pypi"\n'
+        '\n[metadata]\nlock-version = "2.0"\n',
+        encoding="utf-8",
+    )
+    code, out, _ = run(
+        capsys, str(tmp_path / "poetry.lock"), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes", "--online"
+    )
+    assert code == 1 and "nowheels 0.9 on linux-x86_64" in out
+    assert fake_pypi and tracker.calls == []
 
 
 def test_pylock_without_index_never_even_online(capsys, tmp_path, tracker, fake_pypi):

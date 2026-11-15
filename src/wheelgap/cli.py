@@ -596,11 +596,15 @@ one (see release_suggest.suggest)."""
 def notes_eligible(
     row: Row, targets: list[Target], source_of: dict[int, Source], private: frozenset[str] = frozenset()
 ) -> bool:
-    """Whether --notes would look this row's package up: it has a gap, and it's positively a PyPI package
-    (tracker.may_send). `source_of` maps id() of each package to the input it was read from; `private` holds the
-    names some input of the run places elsewhere (origin.private_names)."""
+    """Whether --notes would look this row's package up: it has a gap on a platform the tracker scans, and it's
+    positively a PyPI package (tracker.may_send). `source_of` maps id() of each package to the input it was read
+    from; `private` holds the names some input of the run places elsewhere (origin.private_names)."""
     source = source_of.get(id(row.package))
-    return source is not None and bool(gap_targets(row, targets)) and tracker.may_send(row.package, source, private)
+    return (
+        source is not None
+        and any(t.platform in tracker.PLATFORMS for t in gap_targets(row, targets))
+        and tracker.may_send(row.package, source, private)
+    )
 
 
 def tracker_notes(
