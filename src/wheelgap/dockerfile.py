@@ -487,7 +487,7 @@ def _heredoc_rules(syntax: str | None) -> int | None:
 
 
 # Docker reads instruction keywords in any case, so `arg` is an ARG too.
-_GLOBAL_ARG_RE = re.compile(r"^(?i:ARG)[\t\v\f\r ]+([A-Za-z_][A-Za-z0-9_]*)(?:=([^ \t\v\f\r]+))?$", re.ASCII)
+_GLOBAL_ARG_RE = re.compile(r"^(?i:ARG)[\t\v\f\r ]+([A-Za-z_][A-Za-z0-9_]*)(?:=([^ \t\v\f\r]*))?$", re.ASCII)
 _VAR_REF_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))", re.ASCII)
 
 
@@ -506,10 +506,12 @@ def _global_arg_defaults(instructions: list[tuple[str, bool]]) -> _GlobalArgs:
     """The `ARG NAME=default` values Docker expands in FROM, from the instructions before the first FROM.
 
     A global ARG without a default can only come from `--build-arg`, which wheelgap doesn't read, so using it is an
-    error. A default using quotes, escapes or `$` (another ARG, a shell modifier) is one too: Docker would expand it,
-    and guessing it could pick the wrong image. An ARG that declares more than one variable (`ARG A=1 B=2`), or that
-    is split over a line continuation, is Docker's too, but wheelgap would read the whole thing as one value, so a
-    FROM using any build argument is an error while one is there.
+    error. An empty default (`ARG PY=`) sets the name to the empty string, which Docker accepts but which leaves the
+    image as `python:-slim`, so it's one too. A default using quotes, escapes or `$` (another ARG, a shell modifier)
+    is one as well: Docker would expand it, and guessing it could pick the wrong image. An ARG that declares more than
+    one variable (`ARG A=1 B=2`), that is split over a line continuation, or whose value has a non-ASCII character
+    (Docker splits an ARG on any Unicode space, so `ARG A=1<U+00A0>B=2` declares two), is Docker's too, but wheelgap
+    would read the whole thing as one value, so a FROM using any build argument is an error while one is there.
     """
     args = _GlobalArgs({}, {}, [])
     for instruction, joined in instructions:
@@ -523,11 +525,16 @@ def _global_arg_defaults(instructions: list[tuple[str, bool]]) -> _GlobalArgs:
             args.unreadable.append(f"{instruction}: an ARG must declare one NAME=value, pass -p/-t instead")
             continue
         name, value = m.group(1), m.group(2)
+        if value is not None and not value.isascii():
+            args.unreadable.append(f"{instruction}: non-ASCII characters in an ARG aren't supported")
+            continue
         # A later declaration of the same name replaces the earlier one, as in Docker.
         args.defaults.pop(name, None)
         args.problems.pop(name, None)
         if value is None:
             args.problems[name] = f"ARG {name} has no default: a --build-arg value isn't read, pass -p/-t instead"
+        elif value == "":
+            args.problems[name] = f"ARG {name} has an empty default, pass -p/-t instead"
         elif any(c in value for c in "\"'\\$`"):
             args.problems[name] = (
                 f"ARG {name}={value}: defaults with quotes, escapes or $ aren't supported, pass -p/-t instead"

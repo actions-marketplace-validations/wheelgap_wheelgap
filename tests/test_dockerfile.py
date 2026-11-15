@@ -242,6 +242,10 @@ def test_read_dockerfile_expands_a_global_arg_default_in_platform(tmp_path):
     ("dockerfile", "message"),
     [
         ("ARG PYTHON_VERSION\nFROM python:${PYTHON_VERSION}-slim\n", "has no default"),
+        # Docker accepts an empty default and sets PY to "", which names the image python:-slim.
+        ("ARG PY=\nFROM python:${PY}-slim\n", "has an empty default"),
+        # Docker splits this on the no-break space and declares two variables; wheelgap would read one value.
+        ("ARG PY=3.12\u00a0PY=3.13\nFROM python:${PY}-slim\n", "non-ASCII characters in an ARG"),
         ('ARG PYTHON_VERSION="3.12"\nFROM python:${PYTHON_VERSION}-slim\n', "defaults with quotes"),
         ("ARG PYTHON_VERSION=3.1${SUFFIX}\nFROM python:${PYTHON_VERSION}-slim\n", "defaults with quotes"),
         ("ARG ARCH=linux/amd64\nFROM --platform=${ARCH:-linux/amd64} python:3.13\n", "build arguments"),
@@ -267,6 +271,7 @@ def test_read_dockerfile_global_arg_errors(tmp_path, dockerfile, message):
     "args",
     [
         "ARG VERSION\n",
+        "ARG X=\n",
         'ARG LABEL="my app"\n',
         "ARG A=1 B=2\n",
         "ARG BUILD_DATE=x \\\n    y\n",

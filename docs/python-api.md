@@ -30,7 +30,7 @@ make_targets(python=None, platforms=None, *, glibc="2.36", musl="1.2", macos="14
 Targets from the same names the command line takes: `python="3.13,3.14t"` or a list, and
 `platforms=["all", "pyodide", "mobile"]` (names, aliases, groups). `python` defaults to the running Python
 (`wheelgap.running_python()`), and `platforms` to `linux-x86_64`, `linux-aarch64`, `macos-arm64` and `win-amd64`.
-An unknown name raises `wheelgap.TargetError`. After 0.9.0, `python="next"` (or `"next-t"`) is the newest CPython
+An unknown name raises `wheelgap.TargetError`. `python="next"` (or `"next-t"`) is the newest CPython
 this wheelgap version knows.
 
 ## Checking
@@ -69,7 +69,7 @@ lock's files if a lookup fails).
   list, and skips the re-check for Python versions outside the lock's `requires-python` (so those versions may show
   false gaps).
 - The two can't be combined.
-- After 0.9.0, `environment=` picks a `pixi.lock` environment (default: `default`); for a project directory it makes
+- `environment=` picks a `pixi.lock` environment (default: `default`); for a project directory it makes
   `pixi.lock` the lockfile read. Naming one for any other lockfile raises `SourceError`.
 
 `check_lockfile()` doesn't read `pyproject.toml` as an input.
@@ -100,9 +100,6 @@ Each check returns a `Result` (a list of them for `check_packages()` and `check_
 | `to_dict()` | the package in the shape of a `--json` package entry, keyed by each target's full label (`"3.13 musl-aarch64"`, with the Python even when only one is checked) |
 
 ### Explaining a gap
-
-!!! note "After 0.9.0"
-    `rejected`, `reasons`, `via` and `to_dict(explain=True)` are not in 0.9.0.
 
 ```python
 for r in wheelgap.check_lockfile("uv.lock", targets):

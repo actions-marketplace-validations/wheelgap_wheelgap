@@ -119,7 +119,7 @@ uvx wheelgap@latest uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --json > wheel
 - `uvx wheelgap@latest` runs the newest release from PyPI. Plain
   `uvx wheelgap` can run an older one: uv uses a version installed with
   `uv tool install` unless a version is requested, and may reuse one from its
-  cache. Pin a release, such as `uvx wheelgap@0.8.0`, when the result must not
+  cache. Pin a release, such as `uvx wheelgap@0.10.0`, when the result must not
   change between runs, and check `--help` on the same command for the flags
   that release has. `pipx run wheelgap` works too.
 - Always pass `-p` and `-t`. Without them, the Python comes from

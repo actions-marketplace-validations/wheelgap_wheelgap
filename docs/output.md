@@ -16,14 +16,14 @@ report.
 - `--fail-on missing` (or `fail-on = "missing"`) accepts source builds and only exits `1` when a package can't be
   installed at all, or couldn't be checked.
 - `--ignore NAME` and `--ignore NAME:TARGET` take accepted gaps out of the exit status.
-- After 0.9.0, gaps on `--advisory` targets never change the exit code.
+- Gaps on `--advisory` targets never change the exit code.
 
 Add `set -o pipefail` when you pipe the output, so input errors still fail.
 
 ## Text
 
 ```text
-wheelgap 0.9.0 · uv.lock · 5 packages · Python 3.13
+wheelgap 0.10.0 · uv.lock · 5 packages · Python 3.13
 
 package    version  linux-aarch64  musl-aarch64
 fastlib    2.0.0    ● source       ● source
@@ -90,9 +90,6 @@ Other inputs have no dependency graph, so they show no path. If you think wheelg
 
 ### Tracker notes {#notes}
 
-!!! note "After 0.9.0"
-    `--notes` and `notes = true` are not in 0.9.0.
-
 With `--notes` (or `notes = true` in `[tool.wheelgap]`), `--explain` also shows the
 [coverage tracker](https://wheelgap.github.io/tracker/)'s
 [notes](https://github.com/wheelgap/tracker/blob/main/notes/README.md) for a package with a gap: what the scan can't
@@ -133,9 +130,6 @@ psycopg2 2.9.10: note from the wheelgap tracker for linux-x86_64 (alternative, c
 
 ### Build requirements {#build-info}
 
-!!! note "After 0.9.0"
-    `--build-info` and `build-info = true` are not in 0.9.0.
-
 With `--build-info` (or `build-info = true` in `[tool.wheelgap]`), `--explain` also says what each `source` build
 needs, from the `[build-system]` table in the sdist's own `pyproject.toml`, once per package:
 
@@ -174,9 +168,6 @@ rpds-py 0.27.0 on musl-armv7l: ● source
   24 hours with the other lookups, but only from a download that matched its sha256.
 
 ### conda-forge hint {#conda-forge}
-
-!!! note "After 0.9.0"
-    `--conda-forge` is not in 0.9.0.
 
 `--conda-forge` adds a hint to `--explain` (it needs `--explain`): for a package with a gap on a glibc Linux, macOS
 or Windows target, it asks [anaconda.org](https://anaconda.org/conda-forge) whether conda-forge has a package
@@ -225,9 +216,6 @@ It's only a hint, so it never changes a status, the summary or the exit code: a 
   the cache and `--online` asks again. Failures aren't cached.
 
 ### Newer releases with wheels {#suggest}
-
-!!! note "After 0.9.0"
-    `--suggest` is not in 0.9.0.
 
 `--suggest` adds, after a package's `--explain` blocks (it needs `--explain`), the lowest newer release with a wheel
 for each of its gap targets. For example, `wheelgap fastlib==2.0.0 -t musl-aarch64,win-amd64,linux-riscv64 --explain
@@ -310,7 +298,7 @@ wheels go in a collapsed section.
 ```markdown
 ### wheelgap: 3 of 5 packages have gaps
 
-wheelgap 0.9.0 · `uv.lock` · 5 packages · Python 3.13
+wheelgap 0.10.0 · `uv.lock` · 5 packages · Python 3.13
 
 | package | version | linux-aarch64 | musl-aarch64 |
 | --- | --- | --- | --- |
@@ -331,9 +319,6 @@ Skipped 2 non-index packages: `demo` (editable), `gitdep` (git)
 `--json` and `--markdown` can't be used together.
 
 ## In GitHub Actions logs
-
-!!! note "After 0.9.0"
-    This guard is not in 0.9.0.
 
 The Actions runner treats a line that starts with `::`, or contains `##[`, as a workflow command, and a lockfile in a
 pull request could put such text in a package name or version. So everything `wheelgap` and `wheelgap diff` print goes
@@ -362,7 +347,7 @@ report, alongside whatever output mode you use. It has one testsuite per target 
 
 - A cell that fails the run is a failure: `missing`, `unknown`, and `source` unless `--fail-on missing`.
 - `n/a` cells are skipped, and so are gaps that `--ignore NAME:TARGET` accepts (message `ignored`).
-- After 0.9.0, a gap on an `--advisory` target is skipped with the message `advisory: source` (or `missing`,
+- A gap on an `--advisory` target is skipped with the message `advisory: source` (or `missing`,
   `unknown`), so dashboards that mark a build unstable on failed tests don't.
 - Other cells (`wheel`, `bundled`, and `source` with `--fail-on missing`) pass.
 - A package locked at several versions gets the version in its testcase name; one that several inputs lock at the

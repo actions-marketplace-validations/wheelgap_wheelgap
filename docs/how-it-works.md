@@ -11,7 +11,7 @@ sdist means the install fails (`missing`). Where wheelgap can't be sure, it says
 - **Lockfiles are read offline.** `uv.lock`, `pylock.toml`, `poetry.lock` and `pdm.lock` already record every file
   published for each pinned version (except a `uv.lock` or `pylock.toml` whose `requires-python` leaves out the Python
   you check; see [below](#index-lookups)).
-- **`requirements.txt`, `requirements.lock`, `Pipfile.lock`, `pyproject.toml`, package names and (after 0.9.0)
+- **`requirements.txt`, `requirements.lock`, `Pipfile.lock`, `pyproject.toml`, package names and
   `pixi.lock`** are looked up on the PyPI JSON API. wheelgap checks the requirements you give it and doesn't resolve
   dependencies, so feed it a fully pinned file. See [Inputs](inputs.md).
 
@@ -69,7 +69,7 @@ deletes all of them (add inputs to check them right after). Both also remove obs
 its removed count. Both touch only wheelgap's own files, and never follow a link. Unpinned names, version ranges and
 `--index-url` lookups aren't cached, and neither are lookups from the Python API.
 
-After 0.9.0, the same folder also keeps, for 24 hours each:
+The same folder also keeps, for 24 hours each:
 
 - `--conda-forge` answers, cut down to the subdir, Python, ABI and virtual-package needs of each build of the checked
   version;
@@ -91,9 +91,6 @@ package. They keep their locked files, or are skipped as `private index` when th
 points the JSON API lookups at a mirror; see [Pipfile.lock](inputs.md#pipfilelock).
 
 ## Which package names leave the run {#pypi-origin}
-
-!!! note "After 0.9.0"
-    `--conda-forge`, `--notes`, `--build-info` and `--suggest` are not in 0.9.0.
 
 Four opt-in flags send the names of packages with gaps somewhere other than the index: `--conda-forge` to
 anaconda.org, `--notes` to wheelgap.github.io, `--build-info` to PyPI's file host, for the sdist, and `--suggest` to

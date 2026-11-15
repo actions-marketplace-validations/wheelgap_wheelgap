@@ -14,8 +14,8 @@ you ran wheelgap with `uvx` before 0.9.0 and get "An executable named
 `wheelgap-mcp` is not provided", uvx is reusing its cached copy: run
 `uvx --refresh --from wheelgap wheelgap-mcp --version` once. Pick your client,
 paste the snippet, restart the client (or reload its MCP servers) and try the
-prompt at the end. In releases after 0.9.0, `uvx wheelgap mcp` starts the same
-server too.
+prompt at the end. From 0.10.0 on, `uvx wheelgap mcp` starts the same server
+too.
 
 ## Tools
 
@@ -24,13 +24,12 @@ All five are read-only. They look packages up on PyPI, or on the index in
 `packaging`.
 
 - `check_package`: one package, the latest release or a given version, on each
-  target. In releases after 0.9.0, `explain: true` adds why each target with a
-  gap can't use its wheels.
+  target. `explain: true` adds why each target with a gap can't use its
+  wheels.
 - `check_lockfile`: the same answer as `wheelgap PATH --json`, `[tool.wheelgap]`
   settings included: the packages with gaps, the ones it skipped (git, path and
-  private-index packages, which aren't checked) and any notes. In releases after
-  0.9.0 it also returns `blocking_newer_python` when two Pythons, one newer, are
-  checked.
+  private-index packages, which aren't checked) and any notes. It also returns
+  `blocking_newer_python` when two Pythons, one newer, are checked.
 - `check_dockerfile`: the answer of
   `wheelgap PATH --dockerfile DOCKERFILE --json` (`PATH` defaults to the
   Dockerfile's folder), plus the `image` it read (`python`, `platform`,
@@ -194,15 +193,14 @@ works only when the client shares its
 [roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots).
 
 `check_lockfile` and `check_dockerfile` apply the project's `[tool.wheelgap]`
-settings. Their `ok` is true only when no package has a gap on any target. In
-releases after 0.9.0, `passes` is the command line's verdict (exit code 0),
-which also accepts gaps on the project's advisory targets (`advisory = [...]`)
-and, with `fail-on = "missing"`, source builds. In releases after 0.9.0, the
-result also lists the advisory targets under `advisory`, and each entry in
-`gaps` has `advisory_gaps`: which of its `gaps` are on advisory targets.
+settings. Their `ok` is true only when no package has a gap on any target.
+`passes` is the command line's verdict (exit code 0), which also accepts gaps on
+the project's advisory targets (`advisory = [...]`) and, with
+`fail-on = "missing"`, source builds. The result also lists the advisory targets
+under `advisory`, and each entry in `gaps` has `advisory_gaps`: which of its
+`gaps` are on advisory targets.
 
-In releases after 0.9.0, you can also ask why a package has no wheel for a
-target:
+You can also ask why a package has no wheel for a target:
 
 > Why doesn't numpy 2.3.4 have a wheel for Python 3.14t on Alpine ARM64?
 
@@ -215,9 +213,9 @@ abi3t ones can)`), and `rejected_omitted` counting any it left out. Without
 
 ## Protocol versions
 
-In releases after 0.9.0, the server speaks every MCP revision from 2024-11-05 to
-2026-07-28, so it works with older and newer clients alike (0.9.0 speaks the
-`initialize` handshake of 2024-11-05 to 2025-11-25 only):
+The server speaks every MCP revision from 2024-11-05 to 2026-07-28, so it works
+with older and newer clients alike (0.9.0 speaks the `initialize` handshake of
+2024-11-05 to 2025-11-25 only):
 
 - **2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25** start with the
   `initialize` handshake. Results include `structuredContent` from 2025-06-18 on.

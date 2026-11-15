@@ -93,16 +93,13 @@ remains a list of platforms.
 ## Python versions
 
 `-p` takes versions such as `3.13`, repeated or comma-separated. A trailing `t` means a free-threaded build
-(`3.14t`), which correctly rejects `abi3` wheels. After 0.9.0, a `t` on a version before 3.13 (`3.12t`) is an input
+(`3.14t`), which correctly rejects `abi3` wheels. A `t` on a version before 3.13 (`3.12t`) is an input
 error (exit 2), because free-threading starts at Python 3.13.
 
 Without `-p`, the Python comes from `--dockerfile`, then `python` in `[tool.wheelgap]`, then a `.python-version` file
 next to the lockfile (or `pyproject.toml`), and otherwise the Python wheelgap is running on.
 
 ### Free-threading and new Python readiness
-
-!!! note "After 0.9.0"
-    `-p next`, `-p next-t` and the "blocking" summary line are not in 0.9.0.
 
 A new CPython comes out each October, and for months many packages have no wheels for it yet. To see what would
 build from source if you upgraded, check the Python you use now next to the new one. `-p next` is the newest CPython
@@ -143,7 +140,7 @@ Target platforms come from the first of these that gives any:
 4. uv's `[tool.uv] required-environments` in the project's `pyproject.toml`;
 5. the built-in defaults: `linux-x86_64`, `linux-aarch64`, `macos-arm64` and `win-amd64`.
 
-Not sure what to put in `-t` or `[tool.wheelgap]`? After 0.9.0,
+Not sure what to put in `-t` or `[tool.wheelgap]`?
 [`--suggest-targets`](#suggest-targets) reads the platforms your CI and Dockerfiles already name and suggests them.
 
 ### uv's required-environments
@@ -182,9 +179,6 @@ built on (bullseye for 3.10 and 3.11, bookworm for 3.12 and 3.13, trixie for 3.1
 answer that doesn't move. A Dockerfile wheelgap can't read the way Docker does is an error, not a guess.
 
 ## Suggest targets from your CI and Dockerfiles {#suggest-targets}
-
-!!! note "After 0.9.0"
-    `--suggest-targets` is not in 0.9.0.
 
 `wheelgap --suggest-targets [DIR]` (default: the current directory) reads the platforms and Pythons the project already
 names, and prints each suggestion with the file and line it came from, then a `[tool.wheelgap]` snippet to paste into
@@ -300,9 +294,6 @@ and never guessed:
 Setup steps inside your own composite actions aren't read.
 
 ## Advisory targets
-
-!!! note "After 0.9.0"
-    `--advisory` and `advisory = [...]` are not in 0.9.0.
 
 To watch a platform before you support it, such as Windows on ARM, make it advisory:
 `-t linux-x86_64,win-arm64 --advisory win-arm64` (or `advisory = ["win-arm64"]` in `[tool.wheelgap]`). Its gaps are

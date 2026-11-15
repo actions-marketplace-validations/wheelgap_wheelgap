@@ -16,16 +16,16 @@ It exits `1` if there are any, `0` if not, and `2` on bad input. `python -m whee
 | --- | --- |
 | `OLD` | the lockfile before the change: a file, a directory, or git's `REF:PATH` |
 | `NEW` | the lockfile after the change, in the same forms |
-| `-p`, `--python VER` | target Python, repeatable (default: the running Python); after 0.9.0, `next` and `next-t` work too |
+| `-p`, `--python VER` | target Python, repeatable (default: the running Python); `next` and `next-t` work too |
 | `-t`, `--target PLATFORM` | target platform, repeatable |
-| `--glibc X.Y` | after 0.9.0: glibc version for `linux-*` targets (default: 2.36), e.g. `--glibc 2.28` for RHEL 8 |
-| `--musl X.Y` | after 0.9.0: musl version for `musl-*` targets (default: 1.2) |
-| `--distro NAME` | after 0.9.0: default glibc/musl version from a distro, e.g. `--distro ubuntu-22.04`; doesn't select `-t`, and an explicit `--glibc` or `--musl` wins over it |
-| `--macos X.Y` | after 0.9.0: minimum macOS for `macos-*` targets (default: 14.0) |
+| `--glibc X.Y` | glibc version for `linux-*` targets (default: 2.36), e.g. `--glibc 2.28` for RHEL 8 |
+| `--musl X.Y` | musl version for `musl-*` targets (default: 1.2) |
+| `--distro NAME` | default glibc/musl version from a distro, e.g. `--distro ubuntu-22.04`; doesn't select `-t`, and an explicit `--glibc` or `--musl` wins over it |
+| `--macos X.Y` | minimum macOS for `macos-*` targets (default: 14.0) |
 | `--json` | print one JSON object instead of the text report |
 
 The same `-p` and `-t` apply to both lockfiles. `[tool.wheelgap]` and `.python-version` aren't read yet, so pass them
-explicitly. `--advisory` (after 0.9.0) doesn't work with `wheelgap diff` yet.
+explicitly. `--advisory` doesn't work with `wheelgap diff` yet.
 
 ## What counts as worse
 

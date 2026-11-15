@@ -18,12 +18,12 @@ Or install it: `pip install wheelgap`. wheelgap needs Python 3.11 or later, and 
 [`packaging`](https://packaging.pypa.io/).
 
 Run it in a project directory. It finds `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`,
-`requirements.txt` or `requirements.lock` (and, after 0.9.0, `pixi.lock`) on its own, and reads the first of those it
+`requirements.txt`, `requirements.lock` or `pixi.lock` on its own, and reads the first of those it
 finds. You can also pass a file,
 a directory, or package names. [Inputs](inputs.md) has the details.
 
 `uvx wheelgap` can reuse an older copy that uv installed or cached. Run `uvx wheelgap@latest` for the newest release,
-or pin one (`uvx wheelgap@0.9.0`) when the result must not change between runs.
+or pin one (`uvx wheelgap@0.10.0`) when the result must not change between runs.
 
 ## Pick your Python and platforms
 
@@ -94,9 +94,9 @@ installs the package (`via: myapp → uvicorn → uvloop`). If you think wheelga
 ## Next steps
 
 - Run it in CI: [the GitHub Action, pre-commit and GitLab](ci.md).
-- Accept known gaps with [`--ignore`](cli.md#ignore), or, after 0.9.0, watch a platform without failing on it with
+- Accept known gaps with [`--ignore`](cli.md#ignore), or watch a platform without failing on it with
   [`--advisory`](cli.md#advisory).
-- Not sure which targets you ship to? After 0.9.0,
+- Not sure which targets you ship to?
   [`wheelgap --suggest-targets`](targets.md#suggest-targets) reads them from your CI and Dockerfiles.
 - Compare the lockfile before and after a dependency bump with [`wheelgap diff`](diff.md).
 - See the [recipes](recipes.md) for multi-arch images, monorepos and free-threading readiness.

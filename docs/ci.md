@@ -8,7 +8,7 @@ Python is checked.
 
 ```yaml
 - uses: actions/checkout@v7
-- uses: wheelgap/wheelgap@v0.9.0
+- uses: wheelgap/wheelgap@v0.10.0
   with:
     args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
 ```
@@ -20,22 +20,18 @@ drops ARM wheels. The gap table also goes to the run's summary page.
 | --- | --- | --- |
 | `args` | `""` | the arguments passed to wheelgap, as on the [command line](cli.md) |
 | `summary` | `"true"` | also write the gap table to the job summary page (skipped when `args` include `--json`); `"false"` turns it off |
-| `compare-to` | `""` | after 0.9.0: `base`, or a git ref such as `origin/main`, to fail only when the pull request makes the lockfile worse; see [below](#compare-to) |
-| `comment` | `"false"` | after 0.9.0, with `compare-to`: also post one pull request comment when something got worse, and edit it on later runs |
-| `github-token` | `${{ github.token }}` | after 0.9.0: the token for the pull request comment |
-| `comment-author` | `""` | after 0.9.0: the login the token comments as, such as `my-app[bot]`, for a GitHub App's token |
+| `compare-to` | `""` | `base`, or a git ref such as `origin/main`, to fail only when the pull request makes the lockfile worse; see [below](#compare-to) |
+| `comment` | `"false"` | with `compare-to`: also post one pull request comment when something got worse, and edit it on later runs |
+| `github-token` | `${{ github.token }}` | the token for the pull request comment |
+| `comment-author` | `""` | the login the token comments as, such as `my-app[bot]`, for a GitHub App's token |
 
-After 0.9.0, the Action also has a `report` output: with `compare-to`, the path of the Markdown report that went to the
-job summary.
+The Action also has a `report` output: with `compare-to`, the path of the Markdown report that went to the job
+summary.
 
 The step's result is wheelgap's exit code: [`--fail-on missing`](cli.md#fail-on), [`--ignore`](cli.md#ignore) and
 [`--exit-zero`](cli.md#exit-zero) in `args` work as they do on the command line.
 
 ### Only fail when a pull request makes things worse {#compare-to}
-
-!!! note "After 0.9.0"
-    `compare-to`, `comment`, `github-token`, `comment-author` and the `report` output aren't in
-    `wheelgap/wheelgap@v0.9.0`: until the next release, use `wheelgap/wheelgap@main`.
 
 With `compare-to: base`, the Action runs `wheelgap diff` between the lockfile on the pull
 request's base commit and the one in the checkout, so it fails only when a dependency bump (from Dependabot, Renovate or
@@ -53,15 +49,15 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: wheelgap/wheelgap@main  # a release after 0.9.0, once there is one
+      - uses: wheelgap/wheelgap@v0.10.0
         with:
           args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64,musl-aarch64
           compare-to: base
           comment: true
 ```
 
-- `args` must then start with the lockfile's path, followed only by what `wheelgap diff` takes: `-p` and `-t` (and,
-  after 0.9.0, `--glibc`, `--musl`, `--macos` and `--distro`); anything else exits 2. The step exits 1 when something
+- `args` must then start with the lockfile's path, followed only by what `wheelgap diff` takes: `-p`, `-t`,
+  `--glibc`, `--musl`, `--macos` and `--distro`; anything else exits 2. The step exits 1 when something
   got worse and 0 when nothing did, but only when `wheelgap diff`'s exit code and its report agree; anything else, such
   as bad input or a run that printed no report, exits 2.
 - The lockfile must exist on both sides: one the pull request adds exits 2. A requirements file that includes others
@@ -108,17 +104,13 @@ summary for the comparison, and can comment on the pull request.
 - uses: actions/checkout@v7
   with:
     fetch-depth: 0  # so git can read the base branch's lockfile
-- uses: wheelgap/wheelgap@v0.9.0
+- uses: wheelgap/wheelgap@v0.10.0
   with:
     args: diff origin/${{ github.base_ref }}:uv.lock uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
     summary: "false"
 ```
 
 ### Annotations {#annotations}
-
-!!! note "After 0.9.0"
-    The annotations need the Action from `main` or a release after 0.9.0: `wheelgap/wheelgap@v0.9.0` doesn't add
-    them.
 
 Each package with a gap is also marked on its own line of the lockfile in the pull request's diff, as a GitHub
 annotation: an error when it fails the check, or a warning for a source build that `--fail-on missing` allows or a
@@ -135,9 +127,6 @@ a line.
 
 ### Watching a platform
 
-!!! note "After 0.9.0"
-    `--advisory` is not in 0.9.0.
-
 To watch a platform before you support it, put `--advisory` in `args`:
 `args: uv.lock -t linux-x86_64,win-arm64 --advisory win-arm64`. Its gaps show on the summary page, marked as
 advisory, but don't fail the job. See [`--advisory`](cli.md#advisory).
@@ -150,7 +139,7 @@ Markdown report to the summary page:
 ```yaml
 - run: |
     set -o pipefail
-    pipx run --spec wheelgap==0.9.0 wheelgap uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --markdown | tee -a "$GITHUB_STEP_SUMMARY"
+    pipx run --spec wheelgap==0.10.0 wheelgap uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --markdown | tee -a "$GITHUB_STEP_SUMMARY"
 ```
 
 ## pre-commit
@@ -158,13 +147,13 @@ Markdown report to the summary page:
 ```yaml
 repos:
   - repo: https://github.com/wheelgap/wheelgap
-    rev: v0.9.0
+    rev: v0.10.0
     hooks:
       - id: wheelgap
 ```
 
-The hook runs when `uv.lock`, `poetry.lock`, `pdm.lock`, `pylock.toml`, `Pipfile.lock`, or a `requirements*.txt` or
-`requirements*.lock` file changes, and after 0.9.0 also `pixi.lock`. Put your targets in `[tool.wheelgap]` in
+The hook runs when `uv.lock`, `poetry.lock`, `pdm.lock`, `pylock.toml`, `Pipfile.lock`, `pixi.lock`, or a
+`requirements*.txt` or `requirements*.lock` file changes. Put your targets in `[tool.wheelgap]` in
 `pyproject.toml` so the hook checks the right platforms. Pass extra options with `args:`, for example
 `args: [--fail-on, missing]`.
 
@@ -181,7 +170,7 @@ wheelgap:
         - uv.lock
         - pyproject.toml
   script:
-    - uvx wheelgap@0.9.0 uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --junit wheelgap-junit.xml
+    - uvx wheelgap@0.10.0 uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --junit wheelgap-junit.xml
   artifacts:
     when: always
     reports:

@@ -3,17 +3,17 @@
 ```text
 wheelgap [OPTIONS] [INPUT ...]
 wheelgap diff [-p VER] [-t PLATFORM] [--glibc X.Y] [--musl X.Y] [--distro NAME] [--macos X.Y] [--json] OLD NEW
-wheelgap mcp            (after 0.9.0; or wheelgap-mcp)
+wheelgap mcp            (or wheelgap-mcp)
 ```
 
 `INPUT` is a lockfile, a requirements file, a `pyproject.toml`, a directory, or package specs such as `numpy==2.3.4`
 (default: the current directory). See [Inputs](inputs.md).
 
-Flags that take a list (`-p`, `-t`, `--extra`, `--group`, `--only-group`, `--ignore`, and after 0.9.0 `--advisory`)
+Flags that take a list (`-p`, `-t`, `--extra`, `--group`, `--only-group`, `--ignore`, `--advisory`)
 can be repeated; `-p`, `-t`, `--ignore` and `--advisory` also take comma-separated values. Flags win over
 [`[tool.wheelgap]`](configuration.md).
 
-`wheelgap --help` lists the flags of the version you run. This page describes `main`; flags marked **after 0.9.0**
+`wheelgap --help` lists the flags of the version you run. This page describes `main`; flags marked **after 0.10.0**
 aren't in a release yet.
 
 ## Targets
@@ -24,7 +24,7 @@ aren't in a release yet.
 `-p 3.13,3.14t`. Default: the image's Python with `--dockerfile`, then `python` in `[tool.wheelgap]`, then a
 `.python-version` file next to the input, then the Python wheelgap runs on.
 
-After 0.9.0, `next` and `next-t` are the newest CPython this wheelgap knows and its free-threaded build. See
+`next` and `next-t` are the newest CPython this wheelgap knows and its free-threaded build. See
 [Python versions](targets.md#python-versions).
 
 ### `-t`, `--target` {#target}
@@ -73,7 +73,7 @@ final stage, such as `FROM python:3.13-alpine`. `-p`, `-t`, `--glibc` and `--mus
 
 ### `--advisory` {#advisory}
 
-**After 0.9.0.** `--advisory TARGET`: report gaps on `TARGET` without letting them fail the run.
+`--advisory TARGET`: report gaps on `TARGET` without letting them fail the run.
 
 Its gaps are reported as usual but never fail the run: the column is headed `win-arm64 (advisory)` in the table and the
 Markdown report, the summary includes a line like
@@ -96,7 +96,7 @@ per advisory target, while the line above it counts packages), and `--json` list
   isn't counted as an advisory gap.
 - In `--junit` reports an advisory gap is a skipped testcase with the message `advisory: source` (or `missing`,
   `unknown`), not a failure.
-- `--advisory` (after 0.9.0) doesn't work with `wheelgap diff` yet.
+- `--advisory` doesn't work with `wheelgap diff` yet.
 
 ## Dependency selection
 
@@ -105,14 +105,13 @@ These select which dependencies of a `uv.lock`, Poetry 2.x `poetry.lock`, `pdm.l
 
 ### `--extra` {#extra}
 
-`--extra NAME`: include a uv project extra, or a `pyproject.toml` `[project.optional-dependencies]` group, and after
-0.9.0 a Poetry 2.x `poetry.lock` extra (like `poetry install --extras NAME`). Repeatable. Not supported for
+`--extra NAME`: include a uv project extra, or a `pyproject.toml` `[project.optional-dependencies]` group, or a
+Poetry 2.x `poetry.lock` extra (like `poetry install --extras NAME`). Repeatable. Not supported for
 `pdm.lock`.
 
 ### `--all-extras` {#all-extras}
 
-Include every uv project extra (or every `pyproject.toml` extra, and after 0.9.0 every Poetry 2.x `poetry.lock`
-extra).
+Include every uv project extra (or every `pyproject.toml` extra, or every Poetry 2.x `poetry.lock` extra).
 
 ### `--group` {#group}
 
@@ -129,7 +128,7 @@ groups. Repeatable; combine it with `--group` to add more groups, but not with `
 
 ### `--environment` {#environment}
 
-**After 0.9.0.** `--environment NAME`: the `pixi.lock` environment to check (default: `default`). It also makes a
+`--environment NAME`: the `pixi.lock` environment to check (default: `default`). It also makes a
 directory's `pixi.lock` the lockfile read. Naming one for any other input is an error. See
 [pixi.lock](inputs.md#pixilock).
 
@@ -145,7 +144,7 @@ to PyPI. Can't be combined with `--offline`.
 ### `--offline` {#offline}
 
 Never contact an index, for CI and coding agents without network. Inputs that need a lookup (requirements files,
-`pyproject.toml`, `Pipfile.lock`, package names, lockfile entries with no file list, and after 0.9.0 `pixi.lock`)
+`pyproject.toml`, `Pipfile.lock`, package names, lockfile entries with no file list, and `pixi.lock`)
 make it exit 2 with an error
 naming the packages, so use a lockfile instead. A `--pyodide-lock` URL is refused too: pass a downloaded copy. The
 [`requires-python` re-check](inputs.md#uvlock) is skipped, with a note that those Pythons may show false gaps.
@@ -180,11 +179,11 @@ For each gap, list the wheels that were rejected and why, closest misses first, 
 the package where the input has one. With `--json`, adds `rejected` and `via` to each package. Text output can't
 combine it with quiet mode. See [Output](output.md#explain).
 
-After 0.9.0, a wheel that would fit but whose release was yanked is named with the reason `yanked`.
+A wheel that would fit but whose release was yanked is named with the reason `yanked`.
 
 ### `--conda-forge` {#conda-forge}
 
-**After 0.9.0.** With `--explain`, also say when conda-forge has a package with exactly the same name and a build of
+With `--explain`, also say when conda-forge has a package with exactly the same name and a build of
 the same version that fits a gap's target. Only glibc Linux, macOS and Windows targets with a current conda-forge
 Python can match, and it never changes a status, the summary or the exit code. Only names known to be on PyPI are sent
 to anaconda.org; a run with `--index-url` or `WHEELGAP_INDEX_URL` looks nothing up, and `--offline` refuses the flag.
@@ -192,7 +191,7 @@ See [conda-forge hint](output.md#conda-forge) and [the PyPI-origin rule](how-it-
 
 ### `--notes`, `--no-notes` {#notes}
 
-**After 0.9.0.** With `--explain`, also show the [coverage tracker](https://wheelgap.github.io/tracker/)'s notes for a
+With `--explain`, also show the [coverage tracker](https://wheelgap.github.io/tracker/)'s notes for a
 package with a gap, such as a binary package to use instead. It sends the names of packages with gaps to
 wheelgap.github.io, so it's opt-in, and only for names that pass [the PyPI-origin rule](how-it-works.md#pypi-origin);
 never with `--offline`, `--index-url` or a `WHEELGAP_INDEX_URL` mirror. `notes = true` in `[tool.wheelgap]` turns it
@@ -200,7 +199,7 @@ on by default, and `--no-notes` turns it off for one run. See [Tracker notes](ou
 
 ### `--build-info` {#build-info}
 
-**After 0.9.0.** With `--explain`, also say what each `source` build needs (`build needs: at least a Rust toolchain
+With `--explain`, also say what each `source` build needs (`build needs: at least a Rust toolchain
 (maturin<2.0,>=1.9)`), from the `[build-system]` table of the sdist's `pyproject.toml`. It downloads sdists, so it's
 opt-in, and only for packages that pass [the PyPI-origin rule](how-it-works.md#pypi-origin); it's off with `--offline`,
 `--index-url`, `WHEELGAP_INDEX_URL` or a pip or uv index setting in the environment. `build-info = true` in
@@ -208,7 +207,7 @@ opt-in, and only for packages that pass [the PyPI-origin rule](how-it-works.md#p
 
 ### `--suggest` {#suggest}
 
-**After 0.9.0.** With `--explain`, also name the lowest newer release with a wheel for a pinned package's gap targets
+With `--explain`, also name the lowest newer release with a wheel for a pinned package's gap targets
 (`fastlib 2.0.0 -> 2.1.0 has wheels for musl-aarch64, win-amd64`) that keeps the wheels the package has on its other
 targets, or each target's nearest when no one release has them all. It looks each package with a gap up on pypi.org
 once, only for names that pass [the PyPI-origin rule](how-it-works.md#pypi-origin), and never changes a status, the
@@ -237,8 +236,8 @@ a pull request comment. See [Output](output.md#markdown).
 
 ### `--github-annotations` {#github-annotations}
 
-**After 0.9.0.** Also mark each package with a gap on its own line of the lockfile in GitHub Actions, as an
-annotation. The GitHub Action on `main` passes it; see [CI](ci.md#annotations).
+Also mark each package with a gap on its own line of the lockfile in GitHub Actions, as an
+annotation. The GitHub Action passes it; see [CI](ci.md#annotations).
 
 ### `--color` {#color}
 
@@ -281,7 +280,7 @@ the platforms as JSON. Can't be combined with `--markdown`.
 
 ### `--suggest-targets` {#suggest-targets}
 
-**After 0.9.0.** `--suggest-targets [DIR]`: read the platforms and Pythons that `DIR` (default: the current directory)
+`--suggest-targets [DIR]`: read the platforms and Pythons that `DIR` (default: the current directory)
 already names in its GitHub Actions workflows and Dockerfiles, print each with the file and line it came from, then a
 `[tool.wheelgap]` snippet to paste into `pyproject.toml`. It only suggests: nothing is changed or checked, and it exits
 0. With `--json`, it prints the same as an object. It can't be combined with `-p`, `-t`, `--dockerfile`,
@@ -301,12 +300,12 @@ Show the flags and some examples, then exit.
 
 ### `wheelgap diff` {#diff}
 
-Compare two lockfiles: which packages got worse on a target, and which new packages have gaps. It takes `-p`, `-t`
-and `--json` (and, after 0.9.0, `--glibc`, `--musl`, `--distro` and `--macos`). See [Comparing two lockfiles](diff.md).
+Compare two lockfiles: which packages got worse on a target, and which new packages have gaps. It takes `-p`, `-t`,
+`--json`, `--glibc`, `--musl`, `--distro` and `--macos`. See [Comparing two lockfiles](diff.md).
 
 ### `wheelgap mcp` {#mcp}
 
-**After 0.9.0.** Start the MCP server, as `wheelgap-mcp` does. See [MCP server](mcp.md).
+Start the MCP server, as `wheelgap-mcp` does. See [MCP server](mcp.md).
 
 ## Other commands
 
@@ -323,4 +322,4 @@ behind the [coverage tracker](https://wheelgap.github.io/tracker/). See
 | `WHEELGAP_INDEX_URL` | the PyPI JSON API to use instead of `https://pypi.org/pypi`, such as a mirror's; see [Pipfile.lock](inputs.md#pipfilelock) |
 | `NO_COLOR` | no color with `--color auto` |
 | `FORCE_COLOR` | color with `--color auto`, even when stdout isn't a terminal |
-| `GITHUB_WORKSPACE` | with `--github-annotations` (after 0.9.0), annotation paths are relative to it |
+| `GITHUB_WORKSPACE` | with `--github-annotations`, annotation paths are relative to it |

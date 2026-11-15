@@ -20,7 +20,7 @@ Run the same command with `--explain`: it lists every wheel the target rejected 
   [Version ranges](how-it-works.md#version-ranges)), which may have no wheel where an older one does. Pin the version
   you install.
 - **A yanked wheel.** pip skips a yanked wheel when the release has other files it can use, so it builds the sdist;
-  after 0.9.0, `--explain` names such a wheel with the reason `yanked`.
+  `--explain` names such a wheel with the reason `yanked`.
 
 If none of these explain it, wheelgap may be wrong, and that's the most useful bug report there is. Check the cell with
 `pip download --only-binary=:all:` for the target's tags, as
@@ -55,8 +55,8 @@ requirements file (from `uv pip compile`, `pip-compile` or `uv export`) for the 
 
 Not for lockfiles that record their files (`uv.lock`, `pylock.toml`, and most `poetry.lock` and `pdm.lock` files), as
 long as their `requires-python` includes the Pythons you check. Requirements files, `Pipfile.lock`, `pyproject.toml`,
-package names and (after 0.9.0) `pixi.lock` are looked up on PyPI or the index you choose. `--offline` guarantees no
-index is contacted. See [Index lookups](how-it-works.md#index-lookups). After 0.9.0, the opt-in `--notes`,
+package names and `pixi.lock` are looked up on PyPI or the index you choose. `--offline` guarantees no
+index is contacted. See [Index lookups](how-it-works.md#index-lookups). The opt-in `--notes`,
 `--build-info`, `--conda-forge` and `--suggest` make requests of their own, for [some package names](how-it-works.md#pypi-origin).
 
 ## Why does a Windows-only package show `–` on Linux?
@@ -72,5 +72,5 @@ gap.
 
 ## Which version of the docs is this?
 
-These pages follow the `main` branch. Anything marked **after 0.9.0** isn't released yet; the
+These pages follow the `main` branch. Anything marked **after 0.10.0** isn't released yet; the
 [changelog](https://github.com/wheelgap/wheelgap/blob/main/CHANGELOG.md) lists it under "Unreleased".

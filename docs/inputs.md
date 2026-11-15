@@ -17,7 +17,7 @@ wheelgap psycopg2 numpy==2.3.4    # package names, with or without a version
 | [`poetry.lock`](#poetrylock) | yes, if it lists files | lock-version before 2.1 only |
 | [`pdm.lock`](#pdmlock) | yes, if it lists files | no |
 | [`Pipfile.lock`](#pipfilelock) | no | no |
-| [`pixi.lock`](#pixilock) (after 0.9.0) | no | no |
+| [`pixi.lock`](#pixilock) | no | no |
 | [requirements files](#requirements-files) | no | no |
 | [`pyproject.toml`](#pyprojecttoml) | no | no |
 | [package names](#package-names) | no | no |
@@ -30,8 +30,8 @@ needs no index lookup (except when its `requires-python` leaves out a Python you
 ## Which file is read
 
 A **directory** is searched for, in this order, `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`,
-`Pipfile.lock`, `requirements.txt` and `requirements.lock` (and, after 0.9.0, `pixi.lock`), and the first one found is
-read. After 0.9.0, `--environment` makes a directory's `pixi.lock` the one read, and when a directory has `pixi.lock`
+`Pipfile.lock`, `requirements.txt`, `requirements.lock` and `pixi.lock`, and the first one found is read.
+`--environment` makes a directory's `pixi.lock` the one read, and when a directory has `pixi.lock`
 next to another lockfile, a note on stderr names the `pixi.lock` it passed over. A directory with none of them is an
 error; if it has a `pyproject.toml` with a `[project]` table, the error suggests checking that file
 instead. wheelgap doesn't switch to `pyproject.toml` on its own.
@@ -45,7 +45,7 @@ A **file** is read by its name:
 | `poetry.lock` | `poetry.lock` |
 | `pdm.lock` | `pdm.lock` |
 | `Pipfile.lock` | `Pipfile.lock` |
-| `pixi.lock` (after 0.9.0) | `pixi.lock` |
+| `pixi.lock` | `pixi.lock` |
 | `requirements*.lock`, `*.txt`, `*.in` | a requirements file |
 | `pyproject.toml` | a project's direct dependencies |
 
@@ -132,7 +132,7 @@ lock nor its `pyproject.toml` has a `dev` group. A package counts if any of its 
 groups. A command-line selection on a Poetry 1.x lock (no per-package groups) is an error; a configured selection
 leaves a 1.x lock unfiltered.
 
-**Extras** (after 0.9.0): `--extra NAME` and `--all-extras`, and configured `extras`, work like
+**Extras:** `--extra NAME` and `--all-extras`, and configured `extras`, work like
 `poetry install --extras NAME` and `--all-extras`, as Poetry 2.3 and later install with default settings. Once any
 selector is used, a package whose lock markers are only extra comparisons (`extra == "s3"`) counts only if one of those
 extras is selected, with extra names normalized as Poetry does (`Fancy_Name` is `fancy-name`). An extra that isn't in
@@ -148,8 +148,6 @@ the lock alone can't tell, wheelgap checks a superset of what any Poetry 2.x ins
 - extras leave no package out of a lock with no `pyproject.toml` beside it, or whose `pyproject.toml` declares a name
   from an extra somewhere else too (in the dependencies, a group, or another extra with a marker) or has a requirement
   wheelgap can't read.
-
-In 0.9.0, `--extra` isn't supported for `poetry.lock`.
 
 ## pdm.lock
 
@@ -187,9 +185,6 @@ mirror that only serves the simple API, such as the Tsinghua or Aliyun mirrors, 
 errors like `not on index` instead. `--index-url` lookups don't use this.
 
 ## pixi.lock
-
-!!! note "After 0.9.0"
-    `pixi.lock` input and `--environment` are not in 0.9.0.
 
 wheelgap checks the PyPI packages of one pixi environment: `default`, or the one `--environment NAME` names. Lock
 versions 6 and 7 are read (pixi writes 7 since 0.68); a lock version wheelgap doesn't know, or YAML outside the plain
@@ -278,5 +273,5 @@ wheelgap psycopg2 uvloop numpy==2.3.4 -t windows,win-arm64
 Each argument is read as a requirement (PEP 508). A pinned version is checked as given; a bare name or a range uses
 the newest matching release. An argument that is also the name of a file or directory here is read as that file or
 directory, so pin the package to check it on PyPI instead (`wheelgap numpy==2.3.4`). The same goes for the subcommand
-names as the first argument: `wheelgap diff==2023.12.6` checks the PyPI package `diff`, and, after 0.9.0,
+names as the first argument: `wheelgap diff==2023.12.6` checks the PyPI package `diff`, and
 `wheelgap mcp==2.3.0` the package `mcp`.

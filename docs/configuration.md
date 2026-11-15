@@ -10,7 +10,7 @@ targets = ["linux-x86_64", "linux-aarch64", "musl-aarch64"]
 glibc = "2.31"
 ```
 
-Not sure what to put there? After 0.9.0, [`wheelgap --suggest-targets`](targets.md#suggest-targets) reads the
+Not sure what to put there? [`wheelgap --suggest-targets`](targets.md#suggest-targets) reads the
 platforms and Pythons your CI and Dockerfiles already name and suggests these lines.
 
 wheelgap reads the `pyproject.toml` in the folder of the first file or directory you pass (next to the lockfile),
@@ -30,7 +30,7 @@ Keys that take a list also accept a single string (`targets = "linux-aarch64"`).
 A list of Python versions, as `-p` takes them: `python = ["3.13", "3.14t"]`. Used when `-p` and `--dockerfile`
 aren't given, before a `.python-version` file. See [Python versions](targets.md#python-versions).
 
-After 0.9.0, `next` and `next-t` work here too (`python = ["3.14", "next"]`).
+`next` and `next-t` work here too (`python = ["3.14", "next"]`).
 
 ### `targets` {#targets}
 
@@ -40,7 +40,7 @@ A list of platforms, as `-t` takes them (names, aliases, Docker names, `all`, `e
 
 ### `advisory` {#advisory}
 
-*After 0.9.0.* A list of targets whose gaps are reported but never fail the run, as
+A list of targets whose gaps are reported but never fail the run, as
 [`--advisory`](cli.md#advisory) takes them: `advisory = ["win-arm64"]`. `--advisory` on the command line replaces
 the list, and `--advisory ""` clears it for one run. A configured target that a run doesn't check (`-t linux`, a
 `--dockerfile` image) gets a note on stderr rather than an error.
@@ -84,8 +84,8 @@ as [`--pyodide-lock`](cli.md#pyodide-lock); see [Pyodide](targets.md#pyodide).
 
 ### `extras` {#extras}
 
-A list of project extras to include: `extras = ["api"]`. Applies to `uv.lock` inputs, and after 0.9.0 to Poetry 2.x
-`poetry.lock` inputs too. `--extra` replaces the list; an empty list selects no extras. See
+A list of project extras to include: `extras = ["api"]`. Applies to `uv.lock` and Poetry 2.x
+`poetry.lock` inputs. `--extra` replaces the list; an empty list selects no extras. See
 [dependency selection](inputs.md#uvlock).
 
 ### `groups` {#groups}
@@ -114,13 +114,13 @@ exits 1 when a package can't be installed at all (or couldn't be checked). Same 
 
 ### `notes` {#notes}
 
-*After 0.9.0.* `true` or `false`. `notes = true` makes `--explain` also show the coverage tracker's notes, as
+`true` or `false`. `notes = true` makes `--explain` also show the coverage tracker's notes, as
 [`--notes`](cli.md#notes) does, which sends the names of packages with gaps to wheelgap.github.io; `--no-notes` turns it
 off for one run. See [Tracker notes](output.md#notes).
 
 ### `build-info` {#build-info}
 
-*After 0.9.0.* `true` or `false`. `build-info = true` makes `--explain` also say what each `source` build needs, as
+`true` or `false`. `build-info = true` makes `--explain` also say what each `source` build needs, as
 [`--build-info`](cli.md#build-info) does, which downloads the sdists of packages known to be PyPI's. See
 [Build requirements](output.md#build-info).
 
