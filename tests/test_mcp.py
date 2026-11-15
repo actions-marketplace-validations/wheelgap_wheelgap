@@ -113,6 +113,26 @@ def test_check_package(fake_pypi):
     assert fake_pypi == ["https://pypi.org/pypi/winonly/json"]
 
 
+def test_check_package_pin_respects_requires_python_per_target(fake_pypi):
+    (_, reply) = run(
+        init(),
+        call(
+            "check_package",
+            name="pythonranged",
+            version="2.0",
+            python="3.9,3.13",
+            targets=["linux-x86_64"],
+            explain=True,
+        ),
+    )
+    data = reply["result"]["structuredContent"]
+    assert data["results"] == {"3.9 linux-x86_64": "missing", "3.13 linux-x86_64": "wheel"}
+    assert data["rejected"] == {
+        "3.9 linux-x86_64": [{"file": "pythonranged-2.0-py3-none-any.whl", "reason": "requires Python >=3.10"}]
+    }
+    assert data["gaps"] == ["3.9 linux-x86_64"]
+
+
 def test_python_next(fake_pypi, fixtures):
     (_, reply) = run(init(), call("check_package", name="purewheel", python="3.14,next-t", targets=["linux-x86_64"]))
     assert reply["result"]["structuredContent"]["results"] == {
@@ -984,6 +1004,142 @@ def test_relative_path_resolves_against_the_client_roots(fake_pypi, fixtures, tm
     assert request == {"jsonrpc": "2.0", "id": "wheelgap-roots-1", "method": "roots/list"}
     assert reply["id"] == 1 and reply["result"]["isError"] is False
     assert reply["result"]["structuredContent"]["path"] == str((fixtures / "uvproj" / "uv.lock").resolve())
+
+
+@pytest.mark.parametrize("version", ["2024-11-05", "2025-06-18"])
+def test_first_relative_call_waits_for_delayed_roots(fake_pypi, fixtures, tmp_path, monkeypatch, version):
+    monkeypatch.chdir(tmp_path)
+    entered = threading.Event()
+    original = mcp.Server._call
+
+    def started(self, *args, **kwargs):
+        entered.set()
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(mcp.Server, "_call", started)
+    out = Recorder()
+
+    def delay():
+        assert entered.wait(10)
+        threading.Event().wait(0.05)  # the SDK's roots callback may finish after its first tools/call
+
+    message = init_with_roots()
+    message["params"]["protocolVersion"] = version
+    mcp.serve(
+        live(
+            message,
+            INITIALIZED,
+            call("check_lockfile", path="uvproj/uv.lock", python="3.13", targets=["linux-x86_64"]),
+            delay,
+            ping(2),
+            out.wait_for(lambda m: m.get("id") == 2),  # stdin remains responsive during the wait
+            roots_answer(fixtures),
+        ),
+        out,
+    )
+    reply = next(m for m in out.messages if m.get("id") == 1)
+    assert reply["result"]["isError"] is False
+    data = json.loads(reply["result"]["content"][0]["text"])
+    assert data["path"] == str((fixtures / "uvproj" / "uv.lock").resolve())
+
+
+def test_roots_timeout_is_noted_and_a_late_answer_is_used(fake_pypi, fixtures, tmp_path, monkeypatch):
+    monkeypatch.chdir(fixtures)
+    monkeypatch.setattr(mcp, "_ROOTS_WAIT_SECONDS", 0.01)
+    out = Recorder()
+    mcp.serve(
+        live(
+            init_with_roots(),
+            INITIALIZED,
+            call("check_lockfile", path="uvproj", python="3.13"),
+            out.wait_for(lambda m: m.get("id") == 1),  # a silent client doesn't hold the call forever
+            roots_answer(fixtures),
+            call("check_lockfile", 2, path="uvproj", python="3.13"),
+        ),
+        out,
+    )
+    first, second = [m["result"]["structuredContent"] for m in out.messages if m.get("id") in (1, 2)]
+    assert first["path"] == second["path"] == str((fixtures / "uvproj").resolve())
+    assert any("roots/list did not answer within 0.01 s" in note for note in first["notes"])
+    assert not any("roots/list" in note for note in second["notes"])
+
+
+def test_roots_timeout_waits_once_per_request(fake_pypi, fixtures, monkeypatch):
+    # A client that never answers roots/list costs the wait once; later calls fall back at once, with the note.
+    monkeypatch.chdir(fixtures)
+    monkeypatch.setattr(mcp, "_ROOTS_WAIT_SECONDS", 0.01)
+    waits = []
+    original_init = mcp.Server.__init__
+
+    def init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        wait_for = self._roots_changed.wait_for
+
+        def counted(*a, **k):
+            waits.append(1)
+            return wait_for(*a, **k)
+
+        self._roots_changed.wait_for = counted
+
+    monkeypatch.setattr(mcp.Server, "__init__", init)
+    out = Recorder()
+    mcp.serve(
+        live(
+            init_with_roots(),
+            INITIALIZED,
+            call("check_lockfile", path="uvproj", python="3.13"),
+            out.wait_for(lambda m: m.get("id") == 1),
+            call("check_lockfile", 2, path="uvproj", python="3.13"),
+            out.wait_for(lambda m: m.get("id") == 2),
+            call("list_targets", 3),
+            out.wait_for(lambda m: m.get("id") == 3),
+        ),
+        out,
+    )
+    results = [m["result"]["structuredContent"] for m in out.messages if m.get("id") in (1, 2)]
+    assert len(results) == 2 and len(waits) == 1
+    assert all(any("roots/list did not answer" in note for note in r["notes"]) for r in results)
+    # A call with no relative path gets no note about them.
+    (targets,) = [m["result"]["structuredContent"] for m in out.messages if m.get("id") == 3]
+    assert "roots/list" not in json.dumps(targets)
+
+
+@pytest.mark.parametrize("answer", [roots_answer(), {"jsonrpc": "2.0", "id": "wheelgap-roots-1", "error": {}}])
+def test_empty_or_failed_roots_answer_releases_the_wait(fake_pypi, fixtures, monkeypatch, answer):
+    monkeypatch.chdir(fixtures)
+    (_, _, reply) = run(init_with_roots(), INITIALIZED, call("check_lockfile", path="uvproj", python="3.13"), answer)
+    assert reply["result"]["isError"] is False
+    assert not any("roots/list" in note for note in reply["result"]["structuredContent"]["notes"])
+
+
+@pytest.mark.parametrize("kind", ["absolute", "no-path", "modern"])
+def test_calls_that_need_no_handshake_roots_do_not_wait(fake_pypi, fixtures, monkeypatch, kind):
+    sent = Recorder()
+
+    def send(message):
+        sent.write(json.dumps(message).encode())
+
+    server = mcp.Server(send)
+
+    def unexpected_wait(*args, **kwargs):
+        pytest.fail("this call must not wait for handshake roots")
+
+    monkeypatch.setattr(server._roots_changed, "wait_for", unexpected_wait)
+    server.handle(init_with_roots())
+    server.handle(INITIALIZED)
+    if kind == "absolute":
+        message = call("check_lockfile", path=str(fixtures / "uvproj"), python="3.13")
+    elif kind == "no-path":
+        message = call("list_targets")
+    else:
+        message = with_roots(modern_call("check_lockfile", path="uvproj", python="3.13"), roots_answer_for(fixtures))
+    try:
+        server.handle(message)
+        sent.wait_for(lambda m: m.get("id") == 1)()
+    finally:
+        server.close()
+    reply = next(m for m in sent.messages if m.get("id") == 1)
+    assert reply["result"]["isError"] is False
 
 
 def test_roots_list_changed_asks_again(fake_pypi, fixtures, tmp_path, monkeypatch):

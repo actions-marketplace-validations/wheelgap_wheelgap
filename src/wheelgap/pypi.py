@@ -17,6 +17,7 @@ import tarfile
 import threading
 import time
 import tomllib
+import unicodedata
 import urllib.error
 import urllib.request
 import zlib
@@ -371,7 +372,15 @@ def _windows_alias(part: str) -> bool:
     return part.endswith((".", " ")) or ":" in part
 
 
-SDIST_MAX_NAMES = 16 * 1024 * 1024  # bytes of member names kept, to check hard links against
+SDIST_MAX_NAMES = 16 * 1024 * 1024  # characters of retained names, including implied folders
+SDIST_MAX_NAME_COUNT = 100_000  # names kept in each of paths, files and links: bounds their overhead for short names
+
+
+def _fold_name(part: str) -> str:
+    """A name as the clash check compares it: case-folded, in NFD, without format characters (HFS+ ignores some)."""
+    if part.isascii():
+        return part.lower()
+    return "".join(c for c in unicodedata.normalize("NFD", part.casefold()) if unicodedata.category(c) != "Cf")
 
 
 def _root_pyproject(stream: _Limited) -> bytes | None:
@@ -388,12 +397,16 @@ def _root_pyproject(stream: _Limited) -> bytes | None:
       through a link, a device, or a member type pip doesn't know;
     - links together with non-ASCII names: macOS folds case and Unicode forms in ways a comparison here can't follow
       (ASCII lower-casing is exact, and no non-ASCII name folds to pyproject.toml);
+    - a path that is both a file and a folder (explicitly or by a deeper member), its names compared as macOS
+      would (see _fold_name), or a file named `.`: pip fails to unpack those;
+    - more than SDIST_MAX_NAME_COUNT names in any of the sets kept, or SDIST_MAX_NAMES characters of them;
     - a pyproject.toml that isn't one plain file named exactly `<top>/pyproject.toml`, with one content.
     The whole tar is read, but only that file is kept, and the names of earlier files (for hard links).
     """
     top: str | None = None
     links: set[str] = set()  # lower-cased paths of links seen so far
     files: set[str] = set()  # names of the files so far, as written, for hard links (tarfile looks them up)
+    paths: dict[str, bool] = {}  # folded paths (see _fold_name), including implied folders; True for a folder
     kept = 0
     has_link = non_ascii = tilde = False
     found: bytes | None = None
@@ -420,26 +433,43 @@ def _root_pyproject(stream: _Limited) -> bytes | None:
                 raise SdistRefused("a non-ASCII name next to pyproject.toml")
             if not parts and not member.isdir():
                 raise SdistRefused("a file in place of the top folder")
+            if parts and not member.isdir() and rest.rstrip("/").rsplit("/", 1)[-1] == ".":
+                raise SdistRefused("a file named `.`")  # pip opens the folder itself for writing
             lowered = [p.lower() for p in parts]
             if "pyproject.toml" in lowered[:-1]:
                 raise SdistRefused("a member under pyproject.toml")
             path = "/".join(lowered)
             if any("/".join(lowered[:i]) in links for i in range(1, len(parts) + 1)):
                 raise SdistRefused("a member written through a link")
+            # macOS folds case and Unicode forms and ignores some format characters, so the clash check uses a
+            # coarser key than `lowered`: on Linux that refuses a few sdists pip could unpack, never the reverse.
+            folded = [_fold_name(p) for p in parts]
+            for i in range(1, len(parts) + 1):
+                parent = "/".join(folded[:i])
+                folder = i < len(parts) or member.isdir()
+                if parent in paths and paths[parent] != folder:
+                    raise SdistRefused("a path is both a file and a folder")
+                if parent not in paths:
+                    paths[parent] = folder
+                    kept += len(parent)
+                    if kept > SDIST_MAX_NAMES or max(len(paths), len(files), len(links)) > SDIST_MAX_NAME_COUNT:
+                        raise SdistRefused("too many members")
             if member.issym() or member.islnk():
                 if _escapes(member, parts, lead):
                     raise SdistRefused("a link out of the sdist")
                 if member.islnk() and member.linkname.lstrip("/") not in files:
                     raise SdistRefused("a hard link to no earlier file of that name")
                 has_link = True
+                if path not in links:
+                    kept += len(path)
                 links.add(path)
             elif member.isdev():
                 raise SdistRefused("a device")
             elif member.isreg() and name not in files:
                 kept += len(name)
-                if kept > SDIST_MAX_NAMES:
-                    raise SdistRefused("too many members")
                 files.add(name)
+            if kept > SDIST_MAX_NAMES or max(len(paths), len(files), len(links)) > SDIST_MAX_NAME_COUNT:
+                raise SdistRefused("too many members")
             if has_link and (non_ascii or tilde):
                 raise SdistRefused("links with non-ASCII names or a `~`")
             if path != "pyproject.toml":

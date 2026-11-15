@@ -93,6 +93,7 @@ _ENVELOPE_KEYS = (
 )
 _SERVER_INFO_KEY = "io.modelcontextprotocol/serverInfo"
 _ROOTS_INPUT = "roots"  # our key for roots/list in a 2026 input_required result's inputRequests
+_ROOTS_WAIT_SECONDS = 2.0  # a legacy client may send its first call before answering roots/list
 _REQUESTED_LIMIT = 100  # how much of an unsupported version string an error repeats
 SERVER_INFO = {"name": "wheelgap", "version": __version__}
 CAPABILITIES = {"tools": {"listChanged": False}}
@@ -703,6 +704,8 @@ class Server:
         self._roots_request: str | None = None  # the id of our roots/list request still waiting for its answer
         self._roots_sent = 0
         self._roots: tuple[Path, ...] = ()
+        self._roots_changed = threading.Condition()  # guards roots while the worker waits; stdin keeps reading
+        self._roots_timed_out: str | None = None  # a roots/list request a call already waited out
 
     def close(self, wait: bool = True) -> None:
         """Wait for queued and running calls to send their results (or, with wait=False, drop the queued ones)."""
@@ -933,19 +936,21 @@ class Server:
 
     def _ask_for_roots(self) -> None:
         """Send roots/list if the client has roots. Its answer arrives on stdin like any other message and is read
-        by the same loop (see _roots_answer), so nothing waits for it: a client that never answers can't stall the
-        server, and a call handled before the answer resolves relative paths against the working directory, as
-        it would without roots. The worker only ever reads the tuple, which is replaced whole."""
+        by the same loop (see _roots_answer). Only relative-path calls on the worker wait for it, with a bound so
+        a client that never answers cannot stall the worker indefinitely."""
         if not self._client_roots or self._send is None:
             return
         self._roots_sent += 1
-        self._roots_request = f"wheelgap-roots-{self._roots_sent}"
+        with self._roots_changed:
+            self._roots_request = f"wheelgap-roots-{self._roots_sent}"
         self._send({"jsonrpc": "2.0", "id": self._roots_request, "method": "roots/list"})
 
     def _roots_answer(self, message: dict[str, Any]) -> None:
-        self._roots_request = None
-        result = message.get("result")
-        self._roots = _root_paths(result.get("roots") if isinstance(result, dict) else None)
+        with self._roots_changed:
+            self._roots_request = None
+            result = message.get("result")
+            self._roots = _root_paths(result.get("roots") if isinstance(result, dict) else None)
+            self._roots_changed.notify_all()
 
     def _initialize(self, params: dict[str, Any]) -> dict[str, Any]:
         capabilities = params.get("capabilities")
@@ -970,17 +975,41 @@ class Server:
         """A tool's result. version and roots are a 2026 request's own (with resultType and serverInfo in the
         result), or None for the handshake's."""
         if version is None:
-            return self._tool_result(name, arguments, self.protocol_version, self._roots, False)
+            notes: tuple[str, ...] = ()
+            with self._roots_changed:
+                relative = _relative_paths({"name": name, "arguments": arguments})
+                # Wait once per request: a client that never answers costs the bound once, not on every call.
+                if relative and self._roots_request not in (None, self._roots_timed_out):
+                    if not self._roots_changed.wait_for(
+                        lambda: self._roots_request is None, timeout=_ROOTS_WAIT_SECONDS
+                    ):
+                        # The request outstanding now: roots/list_changed may have sent a newer one meanwhile.
+                        self._roots_timed_out = self._roots_request
+                if relative and self._roots_request is not None and self._roots_request == self._roots_timed_out:
+                    notes = (
+                        f"roots/list did not answer within {_ROOTS_WAIT_SECONDS:g} s; relative paths use the last "
+                        "known roots and the server's working directory",
+                    )
+                roots = self._roots
+            return self._tool_result(name, arguments, self.protocol_version, roots, False, notes)
         return _complete(self._tool_result(name, arguments, version, roots or (), roots_only))
 
     def _tool_result(
-        self, name: str, arguments: dict[str, Any], version: str, roots: tuple[Path, ...], roots_only: bool
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        version: str,
+        roots: tuple[Path, ...],
+        roots_only: bool,
+        notes: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         token, only_token = _ROOTS.set(roots), _ROOTS_ONLY.set(roots_only)
         try:
             # wheelgap's own messages go to stderr already; this keeps any stray print off the protocol stream.
             with contextlib.redirect_stdout(sys.stderr):
                 data = _HANDLERS[name](arguments)
+            if notes:
+                data["notes"] = [*data.get("notes", []), *notes]
             text = json.dumps(data, indent=1)
         except (ToolError, TargetError, SourceError) as e:
             return {"content": [{"type": "text", "text": str(e)}], "isError": True}

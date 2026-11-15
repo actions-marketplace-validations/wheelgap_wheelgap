@@ -769,6 +769,14 @@ def test_load_build_age_and_keys(monkeypatch):
     assert cache.load_build(PYPI, "x", "1.0", "") is None
 
 
+def test_build_cache_ignores_answers_from_before_path_clash_checks():
+    good = {"requires": [], "backend": None, "backend_path": False, "build_script": False}
+    cache._save(f"build-v1  {PYPI}", "x", "1.0", "build", {"answer": good})
+    assert cache.load_build(PYPI, "x", "1.0", "") is None
+    cache.save_build(PYPI, "x", "1.0", "", good)
+    assert cache.load_build(PYPI, "x", "1.0", "") == {"answer": good}
+
+
 def test_a_bad_backend_in_the_cache_is_no_answer(fake_files):
     bad = {"requires": ["flit_core"], "backend": "x\n::error::y", "backend_path": False, "build_script": False}
     cache.save_build(PYPI, "x", "1.0", "ab" * 32, bad)
@@ -1115,6 +1123,74 @@ def test_too_many_names(tmp_path, fake_files, monkeypatch):
     monkeypatch.setattr(pypi, "SDIST_MAX_NAMES", 100)
     with pytest.raises(pypi.SdistRefused, match="too many"):
         fetch(fake_files, sdist(tmp_path, *[member(f"pkg-1.0/{i}", b"") for i in range(20)], PLAIN))
+
+
+@pytest.mark.parametrize("directory", ["a", "a/x", "a/b/x"])
+@pytest.mark.parametrize("file_first", [True, False])
+def test_file_folder_clash(tmp_path, fake_files, directory, file_first):
+    file = member("pkg-1.0/a", b"x")
+    folder = member(f"pkg-1.0/{directory}", kind=tarfile.DIRTYPE if directory == "a" else tarfile.REGTYPE)
+    members = [file, folder] if file_first else [folder, file]
+    data = sdist(tmp_path, PLAIN, *members)
+    with pytest.raises(pypi.SdistRefused, match="file.*folder"):
+        fetch(fake_files, data)
+
+    # pip is optional in the test environment; compare only these synthetic, local archives.
+    unpacking = pytest.importorskip("pip._internal.utils.unpacking")
+    with pytest.raises(OSError):  # FileExistsError, NotADirectoryError or IsADirectoryError; others on Windows
+        unpacking.untar_file(str(tmp_path / "pkg-1.0.tar.gz"), str(tmp_path / "unpacked"))
+
+
+@pytest.mark.parametrize("path", ["A", "./a", "a//"])
+def test_file_folder_clash_alias(tmp_path, fake_files, path):
+    with pytest.raises(pypi.SdistRefused, match="file.*folder"):
+        fetch(fake_files, sdist(tmp_path, PLAIN, member("pkg-1.0/a"), member(f"pkg-1.0/{path}/x")))
+
+
+@pytest.mark.parametrize(
+    "file, folder",
+    [
+        ("sub/\u00e9", "sub/e\u0301/x"),  # NFC and NFD: one name on macOS
+        ("sub/a\u200c", "sub/a/x"),  # HFS+ ignores U+200C
+        ("sub/\u00c9", "sub/\u00e9/x"),  # non-ASCII case
+    ],
+)
+def test_file_folder_clash_unicode_alias(tmp_path, fake_files, file, folder):
+    with pytest.raises(pypi.SdistRefused, match="file.*folder"):
+        fetch(fake_files, sdist(tmp_path, PLAIN, member(f"pkg-1.0/{file}"), member(f"pkg-1.0/{folder}")))
+
+
+def test_file_named_dot_is_refused(tmp_path, fake_files):
+    # `a/.` as a file: pip makes the folder `a`, then fails opening it for writing.
+    with pytest.raises(pypi.SdistRefused, match="named `.`"):
+        fetch(fake_files, sdist(tmp_path, PLAIN, member("pkg-1.0/a/.", b"x")))
+
+
+@pytest.mark.parametrize("kind", [tarfile.REGTYPE, tarfile.DIRTYPE, tarfile.SYMTYPE])
+def test_name_count_cap(tmp_path, fake_files, monkeypatch, kind):
+    monkeypatch.setattr(pypi, "SDIST_MAX_NAME_COUNT", 5)
+    members = [member(f"pkg-1.0/{i}", kind=kind, link="target" if kind == tarfile.SYMTYPE else "") for i in range(6)]
+    with pytest.raises(pypi.SdistRefused, match="too many"):
+        fetch(fake_files, sdist(tmp_path, PLAIN, *members))
+
+
+def test_name_count_cap_counts_each_file_once(tmp_path, fake_files, monkeypatch):
+    # A file is in both the paths and the hard-link names: five files are five names, not ten.
+    monkeypatch.setattr(pypi, "SDIST_MAX_NAME_COUNT", 5)
+    members = [member(f"pkg-1.0/{i}", b"") for i in range(4)]
+    assert fetch(fake_files, sdist(tmp_path, PLAIN, *members)) is not None
+
+
+def test_implied_folders_count_towards_cap(tmp_path, fake_files, monkeypatch):
+    monkeypatch.setattr(pypi, "SDIST_MAX_NAME_COUNT", 5)
+    with pytest.raises(pypi.SdistRefused, match="too many"):
+        fetch(fake_files, sdist(tmp_path, PLAIN, member("pkg-1.0/a/b/c/d/e/f")))
+
+
+def test_repeated_files_and_folders_are_not_clashes(tmp_path, fake_files):
+    folder = member("pkg-1.0/a", kind=tarfile.DIRTYPE)
+    file = member("pkg-1.0/a/x", b"x")
+    assert fetch(fake_files, sdist(tmp_path, PLAIN, file, folder, folder, file)) is not None
 
 
 def test_sdist_names_this_release():
