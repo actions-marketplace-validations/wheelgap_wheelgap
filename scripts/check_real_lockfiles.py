@@ -189,11 +189,11 @@ def _counts(kind: str, data: object, source: Source) -> list[tuple[str, int, int
             edges = _edges(source)
             out += [
                 ("dependencies", len(deps) + len(roots), len(edges)),
-                ("dependency markers", sum(map(_has_marker, deps + roots)), sum(bool(m) for _, _, m in edges)),
+                ("dependency markers", sum(map(_has_marker, deps + roots)), sum(bool(m) for _, _, m, _ in edges)),
                 (
                     "dependency versions",
                     sum(bool(_dict(d).get("version")) for d in deps),
-                    sum(bool(v) for _, v, _ in edges),
+                    sum(bool(v) for _, v, _, _ in edges),
                 ),
             ]
     elif kind == "poetry":
@@ -220,7 +220,7 @@ def _counts(kind: str, data: object, source: Source) -> list[tuple[str, int, int
             edges = _edges(source)
             out += [
                 ("dependencies", len(specs), len(edges)),
-                ("dependency markers", sum(map(_has_marker, specs)), sum(bool(m) for _, _, m in edges)),
+                ("dependency markers", sum(map(_has_marker, specs)), sum(bool(m) for _, _, m, _ in edges)),
             ]
     elif kind in ("pdm", "pipfile"):
         if kind == "pdm":
@@ -264,10 +264,10 @@ def _gated(source: Source, i: int, seen: frozenset[int] = frozenset()) -> bool:
     if source.edges is None:
         return False
     ways_in: list[tuple[int | None, str | None]] = [
-        (None, m) for n, _, m in source.root_edges if canonicalize_name(n) == pkg.key
+        (None, m) for n, _, m, _ in source.root_edges if canonicalize_name(n) == pkg.key
     ]
     for parent, edges in source.edges.items():
-        for n, v, m in edges:
+        for n, v, m, _ in edges:
             # uv pins the version on an edge only where a name has several; Poetry's is a constraint, not a pin.
             if canonicalize_name(n) == pkg.key and (v is None or v == pkg.version or source.kind == "poetry"):
                 ways_in.append((parent, m))
@@ -307,7 +307,7 @@ def inspect(path: Path, pinned: Path | None = None) -> Report:
             SpecifierSet(source.requires_python)
         except InvalidSpecifier:
             report.add(MISREAD, f"requires-python {safe(source.requires_python)} doesn't parse")
-    for name, _version, marker in _edges(source):
+    for name, _version, marker, _source in _edges(source):
         if problem := _marker_problem(marker, f"dependency on {safe(name)}"):
             report.add(MISREAD, problem)
     if kind == "poetry":

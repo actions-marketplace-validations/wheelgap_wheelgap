@@ -1519,3 +1519,130 @@ def test_pdm_lock_without_package_groups(tmp_path, capsys, fake_pypi):
     assert code == 1 and names == {"app-dep", "devonly"}
     assert main([str(tmp_path), "--no-dev"]) == 2
     assert "needs a pdm.lock with package groups" in capsys.readouterr().err
+
+
+_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+_PYPI = "https://pypi.org/simple"
+_FILES = "https://files.pythonhosted.org/packages"
+
+_CPU_EDGE = f'{{ name = "torch", version = "2.5.1", source = {{ registry = "{_CPU_INDEX}" }}'
+
+TWO_INDEX_TORCH_LOCK = f"""\
+version = 1
+
+[[package]]
+name = "app"
+version = "0.1.0"
+source = {{ editable = "." }}
+dependencies = [
+    {{ name = "cpu-extra", marker = "sys_platform == 'linux'" }},
+    {{ name = "torch", version = "2.5.1", source = {{ registry = "{_PYPI}" }}, marker = "sys_platform == 'darwin'" }},
+]
+
+[package.dev-dependencies]
+dev = [{{ name = "devtool" }}]
+
+[[package]]
+name = "cpu-extra"
+version = "1.0"
+source = {{ registry = "{_PYPI}" }}
+wheels = [{{ url = "{_FILES}/cpu_extra-1.0-py3-none-any.whl", hash = "sha256:00" }}]
+dependencies = [
+    {_CPU_EDGE}, marker = "sys_platform == 'linux'" }},
+]
+
+[[package]]
+name = "devtool"
+version = "1.0"
+source = {{ registry = "{_PYPI}" }}
+wheels = [{{ url = "{_FILES}/devtool-1.0-py3-none-any.whl", hash = "sha256:00" }}]
+
+[[package]]
+name = "torch"
+version = "2.5.1"
+source = {{ registry = "{_CPU_INDEX}" }}
+wheels = [{{ url = "{_CPU_INDEX}/torch-2.5.1-cp313-cp313-manylinux_2_17_x86_64.whl", hash = "sha256:00" }}]
+
+[[package]]
+name = "torch"
+version = "2.5.1"
+source = {{ registry = "{_PYPI}" }}
+wheels = [{{ url = "{_FILES}/torch-2.5.1-cp313-none-macosx_11_0_arm64.whl", hash = "sha256:00" }}]
+"""
+
+
+@pytest.mark.parametrize("flags", [[], ["--group", "dev"], ["--no-dev"]])
+def test_uv_two_index_same_version_exits_zero_with_and_without_group(tmp_path, capsys, fake_pypi, flags):
+    (tmp_path / "uv.lock").write_text(TWO_INDEX_TORCH_LOCK, encoding="utf-8")
+    code = main([str(tmp_path), *flags, "-p", "3.13", "-t", "linux-x86_64", "-t", "macos-arm64", "--json"])
+    assert code == 0
+    pkgs = json.loads(capsys.readouterr().out)["packages"]
+    torch_rows = [p for p in pkgs if p["name"] == "torch"]
+    assert [p["results"] for p in torch_rows] == [
+        {"linux-x86_64": "wheel", "macos-arm64": "n/a"},
+        {"linux-x86_64": "n/a", "macos-arm64": "wheel"},
+    ]
+    # When one index lacks a fitting wheel, --explain --json shows the true route only on its target.
+    gap_lock = TWO_INDEX_TORCH_LOCK.replace(
+        "torch-2.5.1-cp313-none-macosx_11_0_arm64.whl",
+        "torch-2.5.1-cp313-cp313-win_amd64.whl",
+    )
+    (tmp_path / "uv.lock").write_text(gap_lock, encoding="utf-8")
+    assert (
+        main([str(tmp_path), *flags, "-p", "3.13", "-t", "linux-x86_64", "-t", "macos-arm64", "--json", "--explain"])
+        == 1
+    )
+    gap_pkgs = json.loads(capsys.readouterr().out)["packages"]
+    gap_torch = [p for p in gap_pkgs if p["name"] == "torch"]
+    assert [(p["results"], p["via"]) for p in gap_torch] == [
+        ({"linux-x86_64": "wheel", "macos-arm64": "n/a"}, {}),
+        ({"linux-x86_64": "n/a", "macos-arm64": "missing"}, {"macos-arm64": ["app", "torch"]}),
+    ]
+    assert fake_pypi == []
+
+
+def test_uv_two_index_same_version_diff_agrees(tmp_path, capsys, fake_pypi):
+    from wheelgap.diff import main as diff_main
+
+    (tmp_path / "old").mkdir()
+    (tmp_path / "new").mkdir()
+    old_lock = tmp_path / "old" / "uv.lock"
+    new_lock = tmp_path / "new" / "uv.lock"
+    old_lock.write_text(
+        f"""\
+version = 1
+
+[[package]]
+name = "app"
+version = "0.1.0"
+source = {{ editable = "." }}
+dependencies = [{{ name = "torch", version = "2.5.0" }}]
+
+[[package]]
+name = "torch"
+version = "2.5.0"
+source = {{ registry = "{_PYPI}" }}
+wheels = [
+    {{ url = "{_FILES}/torch-2.5.0-cp313-cp313-manylinux_2_17_x86_64.whl", hash = "sha256:00" }},
+    {{ url = "{_FILES}/torch-2.5.0-cp313-none-macosx_11_0_arm64.whl", hash = "sha256:00" }},
+]
+""",
+        encoding="utf-8",
+    )
+    new_lock.write_text(TWO_INDEX_TORCH_LOCK, encoding="utf-8")
+    assert diff_main([str(old_lock), str(new_lock), "-p", "3.13", "-t", "linux-x86_64", "-t", "macos-arm64"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]
+
+    # If the PyPI torch entry drops its macOS wheel, diff flags macos-arm64 only.
+    broken = TWO_INDEX_TORCH_LOCK.replace(
+        "torch-2.5.1-cp313-none-macosx_11_0_arm64.whl",
+        "torch-2.5.1-cp313-cp313-win_amd64.whl",
+    )
+    new_lock.write_text(broken, encoding="utf-8")
+    assert diff_main([str(old_lock), str(new_lock), "-p", "3.13", "-t", "linux-x86_64", "-t", "macos-arm64"]) == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "torch 2.5.0 → 2.5.1",
+        "  macos-arm64: ✓ → ✗ missing",
+        "1 package got worse.",
+    ]
+    assert fake_pypi == []

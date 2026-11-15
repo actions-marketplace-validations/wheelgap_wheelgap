@@ -563,6 +563,32 @@ def marker_holds(
 Parent = int | str | None
 
 
+def _narrow_candidates(
+    source: Source,
+    candidates: list[int],
+    version: str | None,
+    edge_source: dict[str, object] | None,
+    *,
+    allow_range: bool = False,
+) -> list[int]:
+    """Narrow candidate package indices by version (and range for Poetry) and uv edge `source`."""
+    if version:
+        # uv edges carry an exact version; Poetry edges a range (numpy = ">=1.26").
+        matched = [i for i in candidates if source.packages[i].version == version]
+        if not matched and allow_range:
+            try:
+                spec = SpecifierSet(version)
+                matched = [i for i in candidates if _in_range(source.packages[i].version, spec)]
+            except InvalidSpecifier:  # Poetry's "*" or "^1.2": no narrowing
+                matched = []
+        candidates = matched or candidates  # retain conservative fallback for incomplete lock metadata
+    if edge_source is not None and source.uv_packages is not None:
+        uv_packages = source.uv_packages
+        sourced = [i for i in candidates if uv_packages[i].get("source") == edge_source]
+        candidates = sourced or candidates
+    return candidates
+
+
 def _uv_reachable(source: Source, target: Target, paths: dict[int, list[str]] | None = None) -> dict[int, Parent]:
     """Walk selected uv roots, re-visiting a package when another edge activates more extras."""
     selection = source.uv_selection
@@ -602,10 +628,12 @@ def _uv_reachable(source: Source, target: Target, paths: dict[int, list[str]] | 
         for dependency in dependencies:
             if not marker_holds(dependency.get("marker"), target, extras=extras, groups=groups):
                 continue
-            candidates = by_name.get(canonicalize_name(dependency["name"]), [])
-            if version := dependency.get("version"):
-                exact = [i for i in candidates if source.packages[i].version == version]
-                candidates = exact or candidates  # retain conservative fallback for incomplete lock metadata
+            candidates = _narrow_candidates(
+                source,
+                by_name.get(canonicalize_name(dependency["name"]), []),
+                dependency.get("version"),
+                dependency.get("source"),
+            )
             requested = frozenset(
                 canonicalize_name(extra) for extra in dependency.get("extra", dependency.get("extras", []))
             )
@@ -651,22 +679,16 @@ def reachable(source: Source, target: Target) -> dict[int, Parent]:
         by_name.setdefault(p.key, []).append(i)
 
     def follow(edge: Edge) -> list[int]:
-        name, version, marker = edge
+        name, version, marker, edge_source = edge
         if not marker_holds(marker, target):
             return []
-        candidates = by_name.get(canonicalize_name(name), [])
-        if version is not None:
-            # uv edges carry an exact version; Poetry edges a range (numpy = ">=1.26").
-            exact = [i for i in candidates if source.packages[i].version == version]
-            if exact:
-                return exact
-            try:
-                spec = SpecifierSet(version)
-                ranged = [i for i in candidates if _in_range(source.packages[i].version, spec)]
-            except InvalidSpecifier:  # Poetry's "*" or "^1.2": no narrowing
-                ranged = []
-            candidates = ranged or candidates
-        return candidates
+        return _narrow_candidates(
+            source,
+            by_name.get(canonicalize_name(name), []),
+            version,
+            edge_source,
+            allow_range=True,
+        )
 
     parents: dict[int, Parent] = dict.fromkeys(source.roots)
     queue: deque[int] = deque()

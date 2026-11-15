@@ -101,7 +101,7 @@ def test_real_lockfile_reads_cleanly(file):
     rows = check([source], script.TARGETS)
     assert sum(s is Status.NOT_NEEDED for r in rows for s in r.results.values()) == expect.na
     assert sum(p.markers is not None for p in source.packages) == expect.package_markers
-    assert sum(bool(m) for _, _, m in script._edges(source)) == expect.edge_markers
+    assert sum(bool(m) for _, _, m, _ in script._edges(source)) == expect.edge_markers
     assert {p.name: p.skip for p in source.packages if p.skip} == expect.skipped
     assert set(expect.known) <= {(p.key, p.version) for p in source.packages}
 

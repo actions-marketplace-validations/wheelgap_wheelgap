@@ -48,7 +48,7 @@ def graph(edges, root_edges=(), root_groups=None, roots=(0,)):
     packages = [Package(n, "1", files=[f"{n}-1.tar.gz"]) for n in names]
     for i in roots:
         packages[i].skip = "editable"
-    deps = {names.index(n): [(d, None, m) for d, m in out] for n, out in edges.items()}
+    deps = {names.index(n): [(d, None, m, None) for d, m in out] for n, out in edges.items()}
     return Source(
         "uv.lock", packages, edges=deps, roots=list(roots), root_edges=list(root_edges), root_groups=root_groups or {}
     )
@@ -84,7 +84,9 @@ def test_via_differs_per_target():
 
 def test_via_from_dependency_group():
     src = graph(
-        {"root": [], "tool": [("dep", None)], "dep": []}, root_edges=[("tool", None, None)], root_groups={0: "dev"}
+        {"root": [], "tool": [("dep", None)], "dep": []},
+        root_edges=[("tool", None, None, None)],
+        root_groups={0: "dev"},
     )
     (t,) = build_targets(["3.13"], ["linux-x86_64"])
     assert via(src, [t], "tool") == {t: ["(dev group)", "tool"]}
@@ -92,7 +94,7 @@ def test_via_from_dependency_group():
 
 
 def test_via_from_plain_requirement():
-    src = graph({"req": []}, root_edges=[("req", None, None)], roots=())
+    src = graph({"req": []}, root_edges=[("req", None, None, None)], roots=())
     (t,) = build_targets(["3.13"], ["linux-x86_64"])
     assert via(src, [t], "req") == {t: ["req"]}
 
@@ -113,12 +115,77 @@ def test_uv_version_disambiguation():
             Package("np", "1.0", files=["np-1.0.tar.gz"]),
             Package("np", "2.0", files=["np-2.0-py3-none-any.whl"]),
         ],
-        edges={0: [("np", "1.0", "python_version < '3.10'"), ("np", "2.0", "python_version >= '3.10'")], 1: [], 2: []},
+        edges={
+            0: [("np", "1.0", "python_version < '3.10'", None), ("np", "2.0", "python_version >= '3.10'", None)],
+            1: [],
+            2: [],
+        },
         roots=[0],
     )
     (t,) = build_targets(["3.13"], ["linux-x86_64"])
     rows = check([src], [t])
     assert [(r.package.version, r.results[t].value) for r in rows] == [("1.0", "n/a"), ("2.0", "wheel")]
+
+
+def test_uv_source_disambiguation(tmp_path):
+    cpu = "https://download.pytorch.org/whl/cpu"
+    pypi = "https://pypi.org/simple"
+    cpu_whl = "torch-2.5.1-cp313-cp313-manylinux_2_17_x86_64.whl"
+    mac_whl = "torch-2.5.1-cp313-none-macosx_11_0_arm64.whl"
+    (tmp_path / "uv.lock").write_text(
+        f"""
+version = 1
+
+[[package]]
+name = "app"
+version = "0.1.0"
+source = {{ editable = "." }}
+dependencies = [
+    {{ name = "linux-helper" }},
+    {{ name = "mac-helper" }},
+]
+
+[[package]]
+name = "linux-helper"
+version = "1.0"
+source = {{ registry = "{pypi}" }}
+wheels = [{{ url = "https://files.pythonhosted.org/packages/linux_helper-1.0-py3-none-any.whl", hash = "sha256:00" }}]
+dependencies = [
+    {{ name = "torch", version = "2.5.1", source = {{ registry = "{cpu}" }}, marker = "sys_platform == 'linux'" }},
+]
+
+[[package]]
+name = "mac-helper"
+version = "1.0"
+source = {{ registry = "{pypi}" }}
+wheels = [{{ url = "https://files.pythonhosted.org/packages/mac_helper-1.0-py3-none-any.whl", hash = "sha256:00" }}]
+dependencies = [
+    {{ name = "torch", version = "2.5.1", source = {{ registry = "{pypi}" }}, marker = "sys_platform == 'darwin'" }},
+]
+
+[[package]]
+name = "torch"
+version = "2.5.1"
+source = {{ registry = "{cpu}" }}
+wheels = [{{ url = "{cpu}/{cpu_whl}", hash = "sha256:00" }}]
+
+[[package]]
+name = "torch"
+version = "2.5.1"
+source = {{ registry = "{pypi}" }}
+wheels = [{{ url = "https://files.pythonhosted.org/packages/{mac_whl}", hash = "sha256:00" }}]
+""",
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path)])
+    lin, mac = build_targets(["3.13"], ["linux-x86_64", "macos-arm64"])
+    rows = [r for r in check([src], [lin, mac]) if r.package.name == "torch"]
+    assert [(r.package.registry, r.results[lin].value, r.results[mac].value) for r in rows] == [
+        (cpu, "wheel", "n/a"),
+        (pypi, "n/a", "wheel"),
+    ]
+    assert rows[0].via == {lin: ["app", "linux-helper", "torch"]}
+    assert rows[1].via == {mac: ["app", "mac-helper", "torch"]}
 
 
 def test_markers_on_packages(fixtures):
@@ -180,7 +247,9 @@ def test_pyodide_sdist_only_is_missing():
 
 def test_via_prefers_the_projects_own_dependency_over_a_group():
     # numpy is a runtime dependency of the project and also listed in the dev group.
-    src = graph({"app": [("numpy", None)], "numpy": []}, root_edges=[("numpy", None, None)], root_groups={0: "dev"})
+    src = graph(
+        {"app": [("numpy", None)], "numpy": []}, root_edges=[("numpy", None, None, None)], root_groups={0: "dev"}
+    )
     (t,) = build_targets(["3.13"], ["linux-x86_64"])
     assert via(src, [t], "numpy") == {t: ["app", "numpy"]}
 
@@ -188,7 +257,7 @@ def test_via_prefers_the_projects_own_dependency_over_a_group():
 def test_via_prefers_a_plain_requirement_over_a_group():
     src = graph(
         {"a": [("c", None)], "b": [("c", None)], "c": []},
-        root_edges=[("a", None, None), ("b", None, None)],
+        root_edges=[("a", None, None, None), ("b", None, None, None)],
         root_groups={0: "dev"},
         roots=(),
     )

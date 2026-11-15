@@ -41,8 +41,8 @@ def test_uv_lock(fixtures):
     ]
     assert pkgs["puresdist"].files == ["puresdist-1.0.tar.gz"]
     assert src.roots == [0]
-    assert ("winonly", None, "sys_platform == 'win32'") in src.edges[0]
-    assert ("devtool", None, None) in src.edges[0]
+    assert ("winonly", None, "sys_platform == 'win32'", None) in src.edges[0]
+    assert ("devtool", None, None, None) in src.edges[0]
 
 
 def test_uv_lock_dependency_group_names(tmp_path):
@@ -52,7 +52,7 @@ def test_uv_lock_dependency_group_names(tmp_path):
         encoding="utf-8",
     )
     (src,) = load_inputs([str(tmp_path)])
-    assert [name for name, _, _ in src.root_edges] == ["pytest", "sphinx", "app"]
+    assert [name for name, *_ in src.root_edges] == ["pytest", "sphinx", "app"]
     assert src.root_groups == {0: "dev", 1: "docs"}  # the plain requirement has no group
 
 
@@ -67,6 +67,7 @@ def test_uv_lock_dependency_group_names(tmp_path):
         ('{ name = "b", extra = "s3" }', "package a has a dependency 'b' with an `extra` that isn't a list of strings"),
         ('"b"', "package a has a dependency that isn't a table"),
         ('{ marker = "x" }', "package a has a dependency without a `name`"),
+        ('{ name = "b", source = "pypi" }', "package a has a dependency 'b' with a `source` that isn't a table"),
     ],
 )
 def test_uv_lock_dependency_edge_of_the_wrong_type_raises(tmp_path, edge, message):
@@ -134,7 +135,27 @@ def test_uv_lock_dependency_extra_may_be_a_list(tmp_path):
         encoding="utf-8",
     )
     (src,) = load_inputs([str(tmp_path)])
-    assert src.edges[0] == [("b", None, None)]
+    assert src.edges[0] == [("b", None, None, None)]
+
+
+def test_uv_lock_dependency_source_is_preserved(tmp_path):
+    cpu = "https://download.pytorch.org/whl/cpu"
+    (tmp_path / "uv.lock").write_text(
+        f"""
+version = 1
+
+[[package]]
+name = "app"
+version = "0.1.0"
+source = {{ editable = "." }}
+dependencies = [
+    {{ name = "torch", version = "2.5.1", source = {{ registry = "{cpu}" }}, marker = "sys_platform == 'linux'" }},
+]
+""",
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path)])
+    assert src.edges[0] == [("torch", "2.5.1", "sys_platform == 'linux'", {"registry": cpu})]
 
 
 def test_poetry_lock(fixtures):

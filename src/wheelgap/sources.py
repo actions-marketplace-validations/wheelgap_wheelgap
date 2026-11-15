@@ -101,8 +101,8 @@ def package_name(path: Path, name: object) -> str:
     return name
 
 
-# A dependency edge in a lockfile graph: (name, version or None, marker or None)
-Edge = tuple[str, str | None, str | None]
+# A dependency edge in a lockfile graph: (name, version or None, marker or None, source table or None)
+Edge = tuple[str, str | None, str | None, dict[str, object] | None]
 
 
 @dataclass(frozen=True)
@@ -257,7 +257,10 @@ def _uv_edge(path: Path, owner: str, d: object) -> Edge:
             raise SourceError(
                 f"{path.name}: {owner} has a dependency {d['name']!r} with an `{what}` that isn't a list of strings"
             )
-    return (d["name"], d.get("version"), d.get("marker"))
+    edge_source = d.get("source")
+    if edge_source is not None and not isinstance(edge_source, dict):
+        raise SourceError(f"{path.name}: {owner} has a dependency {d['name']!r} with a `source` that isn't a table")
+    return (d["name"], d.get("version"), d.get("marker"), edge_source)
 
 
 def _uv_edges(path: Path, p: dict) -> list[Edge]:
@@ -317,10 +320,8 @@ def parse_uv_lock(path: Path) -> Source:
     for name, group in manifest_groups.items():
         for d in group:
             source.root_groups[len(source.root_edges)] = name
-            source.root_edges.append((_uv_edge(path, "the manifest", d)[0], None, d.get("marker")))
-    source.root_edges.extend(
-        (_uv_edge(path, "the manifest", d)[0], None, d.get("marker")) for d in manifest.get("requirements", [])
-    )
+            source.root_edges.append(_uv_edge(path, "the manifest", d))
+    source.root_edges.extend(_uv_edge(path, "the manifest", d) for d in manifest.get("requirements", []))
     if not source.roots and not source.root_edges:
         source.edges = None  # no idea where the graph starts; treat every package as needed
     if isinstance(data.get("requires-python"), str):
@@ -677,7 +678,7 @@ def _poetry_edges(p: dict) -> list[Edge]:
         for s in spec if isinstance(spec, list) else [spec]:
             version = s.get("version") if isinstance(s, dict) else s
             marker = s.get("markers") if isinstance(s, dict) else None
-            out.append((name, version if isinstance(version, str) and version != "*" else None, marker))
+            out.append((name, version if isinstance(version, str) and version != "*" else None, marker, None))
     return out
 
 
@@ -745,7 +746,7 @@ def _graph_roots(pkgs: list[Package], edges: dict[int, list[Edge]]) -> list[int]
     for i, p in enumerate(pkgs):
         by_name.setdefault(p.key, []).append(i)
     succ = {
-        i: sorted({j for name, _, _ in edges.get(i, []) for j in by_name.get(canonicalize_name(name), [])})
+        i: sorted({j for name, *_ in edges.get(i, []) for j in by_name.get(canonicalize_name(name), [])})
         for i in range(len(pkgs))
     }
     comp = _components(len(pkgs), succ)
