@@ -10,7 +10,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import unquote, urlparse
+from urllib.parse import ParseResult, unquote, urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -206,13 +206,24 @@ def pythons_outside_lock(source: Source, targets: Iterable[Target], *, bounds_on
     return list(dict.fromkeys(out))
 
 
-def _filename(entry: dict) -> str | None:
+def _filename(entry: dict, origin: str, package: str) -> str | None:
+    url = entry.get("url")
+    parts: ParseResult | None = None
+    if isinstance(url, str):
+        # A lock URL that `urlparse` can't read (an unclosed IPv6 bracket) or whose host holds a space is a
+        # broken lock, even when the entry also records a file name: name the file and the package instead of
+        # letting ValueError escape. The URL isn't echoed back, since it may carry credentials.
+        try:
+            parts = urlparse(url)
+        except ValueError:
+            pass
+        if parts is None or any(c.isspace() for c in parts.netloc.rpartition("@")[2]):
+            raise SourceError(f"{origin}: package {package} has a file URL that can't be parsed")
     for k in ("filename", "file", "name"):
         if isinstance(entry.get(k), str) and entry[k].endswith((".whl", ".tar.gz", ".zip", ".tar.bz2", ".tgz")):
             return entry[k]
-    url = entry.get("url")
-    if isinstance(url, str):
-        return unquote(Path(urlparse(url).path).name)
+    if parts is not None:
+        return unquote(Path(parts.path).name)
     path = entry.get("path")
     if isinstance(path, str):
         return Path(path).name
@@ -305,9 +316,9 @@ def parse_uv_lock(path: Path) -> Source:
             pkg.skip = kind
         else:
             pkg.registry = src.get("registry")
-            files = [f for f in (_filename(w) for w in p.get("wheels", [])) if f]
+            files = [f for f in (_filename(w, path.name, pkg.name) for w in p.get("wheels", [])) if f]
             if p.get("sdist"):
-                files.append(_filename(p["sdist"]) or f"{p['name']}-{p.get('version')}.tar.gz")
+                files.append(_filename(p["sdist"], path.name, pkg.name) or f"{p['name']}-{p.get('version')}.tar.gz")
                 pkg.sdist_url, pkg.sdist_sha256 = _sdist_source(p["sdist"], "hash")
             pkg.files = files
         i = len(source.packages)
@@ -660,9 +671,9 @@ def parse_pylock(path: Path) -> Source:
         if any(k in p for k in ("vcs", "directory", "archive")) and "wheels" not in p and "sdist" not in p:
             pkg.skip = next(k for k in ("vcs", "directory", "archive") if k in p)
         else:
-            files = [f for f in (_filename(w) for w in p.get("wheels", [])) if f]
+            files = [f for f in (_filename(w, path.name, pkg.name) for w in p.get("wheels", [])) if f]
             if p.get("sdist"):
-                files.append(_filename(p["sdist"]) or f"{p['name']}-{p.get('version')}.tar.gz")
+                files.append(_filename(p["sdist"], path.name, pkg.name) or f"{p['name']}-{p.get('version')}.tar.gz")
                 pkg.sdist_url, pkg.sdist_sha256 = _sdist_source(p["sdist"], "hashes")
             pkg.files = files
         pkgs.append(pkg)
@@ -715,7 +726,9 @@ def parse_poetry_lock(path: Path) -> Source:
                 entries = legacy_files.get(p["name"])
             # No files recorded at all (old [metadata.hashes] locks): PyPI packages are looked up on the index,
             # packages from another index are skipped (fill_all).
-            pkg.files = None if entries is None else [f for f in (_filename(e) for e in entries) if f]
+            pkg.files = (
+                None if entries is None else [f for f in (_filename(e, path.name, pkg.name) for e in entries) if f]
+            )
         edges[len(pkgs)] = _poetry_edges(p)
         pkgs.append(pkg)
     # Lock files before 2.1 (all of Poetry 1.x) only record markers on dependency edges, not on
@@ -897,7 +910,7 @@ def parse_pdm_lock(path: Path) -> Source:
                             entries = value
                             break
             if entries is not None:
-                pkg.files = [f for f in (_filename(e) for e in entries) if f]
+                pkg.files = [f for f in (_filename(e, path.name, pkg.name) for e in entries) if f]
             # Not in either place: leave files as None so the PyPI lookup fills them in.
         _add_once(pkgs, seen, pkg)
     return Source(

@@ -29,6 +29,8 @@ from wheelgap.dockerfile import (
         ("python:3.11-slim-bullseye", ImageTarget("3.11", "linux-x86_64", glibc="2.31")),
         ("python:3.13.1-alpine3.22 AS runtime", ImageTarget("3.13", "musl-x86_64", musl="1.2")),
         ("docker.io/library/python:3.12", ImageTarget("3.12", "linux-x86_64", glibc="2.41")),
+        ("index.docker.io/library/python:3.13-alpine", ImageTarget("3.13", "musl-x86_64", musl="1.2")),
+        ("index.docker.io/python:3.13-alpine", ImageTarget("3.13", "musl-x86_64", musl="1.2")),
         ("--platform= python:3.13", ImageTarget("3.13", "linux-x86_64", glibc="2.41")),  # empty value: the default
         ("-- python:3.13", ImageTarget("3.13", "linux-x86_64", glibc="2.41")),  # BuildKit drops a bare --
         ("--platform=linux/arm64 -- python:3.13-alpine", ImageTarget("3.13", "musl-aarch64", musl="1.2")),
@@ -96,6 +98,7 @@ def test_parse_from(line, expected):
     ("line", "message"),
     [
         ("ubuntu:24.04", "only the official python images"),
+        ("Index.docker.io/library/python:3.13-alpine", "only the official python images"),
         ("python", "must start with a Python version"),
         ("python:latest", "must start with a Python version"),
         ("ghcr.io/astral-sh/uv:bookworm-slim", r"must specify a Python version like python3\.13-alpine"),
@@ -155,6 +158,12 @@ def test_last_from_takes_the_final_stage():
     )
     assert last_from(text) == "--platform=linux/arm64     python:3.13-alpine"  # joined as Docker joins
     assert parse_from(last_from(text)) == ImageTarget("3.13", "musl-aarch64", musl="1.2")
+
+
+def test_read_dockerfile_legacy_docker_hub_in_final_stage(tmp_path):
+    path = tmp_path / "Dockerfile"
+    path.write_text("FROM python:3.12 AS base\nFROM index.docker.io/library/python:3.13\n", encoding="utf-8")
+    assert read_dockerfile(path) == ImageTarget("3.13", "linux-x86_64", glibc="2.41")
 
 
 def test_no_from(tmp_path):

@@ -42,7 +42,16 @@ ARCHES = {
     "linux/i386": "i686",  # containerd normalises it to linux/386
 }
 WINDOWS_VARIANTS = ("windowsservercore", "nanoserver")
-IMAGE_NAMES = ("python", "library/python", "docker.io/library/python", "docker.io/python")
+# splitDockerDomain maps index.docker.io to docker.io before adding the official library/ prefix.
+# https://github.com/distribution/reference/blob/v0.6.0/normalize.go#L123-L170
+IMAGE_NAMES = (
+    "python",
+    "library/python",
+    "docker.io/library/python",
+    "docker.io/python",
+    "index.docker.io/library/python",
+    "index.docker.io/python",
+)
 UV_IMAGE = "ghcr.io/astral-sh/uv"
 UV_ARCHES = {"x86_64", "aarch64"}
 # Arches the official python images are published for, by Debian release (trixie and alpine have them all).

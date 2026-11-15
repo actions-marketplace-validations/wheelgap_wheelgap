@@ -826,6 +826,75 @@ def test_pylock_records_requires_python_and_index(tmp_path):
     assert src.requires_python == "==3.13.*" and src.packages[0].registry == "https://pypi.org/simple"
 
 
+def test_uv_lock_file_url_that_cannot_be_parsed_is_an_input_error(tmp_path):
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n\n[[package]]\nname = "b"\nversion = "1.0"\n'
+        'wheels = [{ url = "https://[files.pythonhosted.org/b-1.0-py3-none-any.whl" }]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match=r"uv\.lock.*package b.*can't be parsed"):
+        load_inputs([str(tmp_path)])
+
+
+def test_uv_lock_file_url_with_a_space_in_the_host_is_an_input_error(tmp_path):
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n\n[[package]]\nname = "b"\nversion = "1.0"\n'
+        'wheels = [{ url = "https://files pythonhosted.org/b-1.0-py3-none-any.whl" }]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match=r"uv\.lock.*package b.*can't be parsed"):
+        load_inputs([str(tmp_path)])
+
+
+def test_pylock_sdist_url_that_cannot_be_parsed_is_an_input_error(tmp_path):
+    (tmp_path / "pylock.toml").write_text(
+        'lock-version = "1.0"\n\n[[packages]]\nname = "b"\nversion = "1.0"\n'
+        'sdist = { url = "https://[files.pythonhosted.org/b-1.0.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match=r"pylock\.toml.*package b.*can't be parsed"):
+        load_inputs([str(tmp_path / "pylock.toml")])
+
+
+def test_pylock_sdist_url_that_cannot_be_parsed_is_an_input_error_even_with_a_name(tmp_path):
+    (tmp_path / "pylock.toml").write_text(
+        'lock-version = "1.0"\n\n[[packages]]\nname = "b"\nversion = "1.0"\n'
+        'sdist = { name = "b-1.0.tar.gz", url = "https://user:secret@[files.pythonhosted.org/b-1.0.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match=r"pylock\.toml.*package b.*can't be parsed") as e:
+        load_inputs([str(tmp_path / "pylock.toml")])
+    assert "secret" not in str(e.value)  # the URL may carry credentials, so it isn't echoed back
+
+
+def test_pdm_lock_file_url_that_cannot_be_parsed_is_an_input_error(tmp_path):
+    (tmp_path / "pdm.lock").write_text(
+        '[[package]]\nname = "b"\nversion = "1.0"\n'
+        'files = [{ url = "https://[files.pythonhosted.org/b-1.0-py3-none-any.whl", hash = "sha256:00" }]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match=r"pdm\.lock.*package b.*can't be parsed"):
+        load_inputs([str(tmp_path / "pdm.lock")])
+
+
+def test_uv_lock_file_urls_that_still_parse_keep_their_file_names(tmp_path):
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n\n[[package]]\nname = "b"\nversion = "1.0"\n'
+        "wheels = [\n"
+        '    { url = "https://files.example/b-1.0-py3-none-any.whl;x=1" },\n'  # URL parameters aren't the name
+        '    { url = "https://[::1]/b-1.0-cp313-cp313-win_amd64.whl" },\n'
+        '    { url = "https://user:p w@files.example/b-1.0-cp313-cp313-win_arm64.whl" },\n'
+        "]\n",
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path)])
+    assert src.packages[0].files == [
+        "b-1.0-py3-none-any.whl",
+        "b-1.0-cp313-cp313-win_amd64.whl",
+        "b-1.0-cp313-cp313-win_arm64.whl",
+    ]
+
+
 def test_pipfile_lock_non_string_version_raises(tmp_path):
     path = tmp_path / "Pipfile.lock"
     path.write_text(json.dumps({"default": {"requests": {"version": 2}}}), encoding="utf-8")
