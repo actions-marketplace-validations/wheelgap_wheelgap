@@ -45,6 +45,11 @@ def test_scan_defaults_include_python_315(fake_pypi, tmp_path, capsys):
         ("--workers", "-1", "must be a positive integer"),
         ("--top", "1.5", "must be a positive integer"),
         ("--workers", "abc", "must be a positive integer"),
+        ("--max-error-rate", "nan", "must be a number from 0 to 1"),
+        ("--max-error-rate", "inf", "must be a number from 0 to 1"),
+        ("--max-error-rate", "-0.1", "must be a number from 0 to 1"),
+        ("--max-error-rate", "1.5", "must be a number from 0 to 1"),
+        ("--max-error-rate", "abc", "must be a number from 0 to 1"),
         ("--python", " , ", "provide at least one Python version"),
         ("--python", "invalid", "can't parse Python version"),
     ],
@@ -54,6 +59,16 @@ def test_scan_rejects_invalid_arguments_before_loading_data(tmp_path, capsys, fl
         main([flag, value, "--top-packages", str(tmp_path / "missing.json")])
     assert error.value.code == 2
     assert message in capsys.readouterr().err
+
+
+def test_scan_accepts_a_zero_max_error_rate(fake_pypi, tmp_path):
+    top = write_top(tmp_path, ["purewheel"])
+    out = tmp_path / "coverage.json"
+    assert (
+        main(["--top", "1", "--python", "3.13", "--top-packages", str(top), "--out", str(out), "--max-error-rate", "0"])
+        == 0
+    )
+    assert json.loads(out.read_text())["lookup_errors"] == 0
 
 
 def test_scan_writes_the_tracker_data(fake_pypi, tmp_path, capsys):

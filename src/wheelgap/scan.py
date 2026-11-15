@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from collections import Counter
@@ -168,6 +169,16 @@ def positive_int(value: str) -> int:
     return number
 
 
+def fraction(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a number from 0 to 1") from None
+    if not math.isfinite(number) or not 0 <= number <= 1:
+        raise argparse.ArgumentTypeError("must be a number from 0 to 1")
+    return number
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="python -m wheelgap.scan", description=__doc__.splitlines()[0])
     p.add_argument(
@@ -186,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--max-error-rate",
-        type=float,
+        type=fraction,
         default=0.05,
         metavar="FRACTION",
         help="exit 1 without writing if more than this share of lookups fail (default: 0.05)",
