@@ -18,7 +18,7 @@ If the `wheelgap` MCP server is connected, prefer its tools to the command line:
 uvx wheelgap@latest -p 3.13 -t linux-aarch64,musl-aarch64 --json
 ```
 
-- **Input:** in the project directory, wheelgap finds `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `requirements.txt`, `requirements.lock` or `pixi.lock` (the first one present). Pass any other file by path, e.g. `uvx wheelgap@latest requirements-prod.txt …`. For `pixi.lock`, only the PyPI packages of one environment are checked (`--environment NAME`, default `default`); conda packages are `skipped`. A library with no lockfile: pass its `pyproject.toml` (direct dependencies only; add `--extra NAME` or `--all-extras`).
+- **Input:** in the project directory, wheelgap finds `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `requirements.txt`, `requirements.lock` or `pixi.lock` (the first one present). Pass any other file by path, e.g. `uvx wheelgap@latest requirements-prod.txt …`. For `pixi.lock`, only the PyPI packages of one environment are checked (`--environment NAME`, default `default`); conda packages are `skipped`. A library with no lockfile: pass its `pyproject.toml` (direct dependencies only; add `--extra NAME` or `--all-extras`). To ask whether `pip install NAME` works on a platform, pass the name with `--deps`, which also checks everything it installs, resolved per target from PyPI's metadata, and `--explain` names the path to each gap (`uvx wheelgap@latest mcp==2.3.0 --deps -p 3.14 -t win-arm64 --explain` gives `via: mcp → PyJWT → cryptography`). Pin a version for a name that's also a subcommand (`mcp`, `diff`). It isn't pip's resolver: where pip would backtrack it stops with an error, so use a lockfile then.
 - **Python (`-p`):** always pass the project's Python, from `.python-version`, `requires-python`, the CI matrix or the Dockerfile. Without `-p`, wheelgap uses `.python-version`, else the Python it runs on, which may be free-threaded (3.14t) and would report gaps an ordinary project doesn't have. Use `-p 3.14t` only to check free-threading readiness. To see what blocks a move to the newest CPython, check the project's Python next to it (`-p 3.13,next`; `next-t` for its free-threaded build): `blocking_newer_python` lists the packages with a gap only on the newer one.
 - **Platforms (`-t`):** use what the project ships to.
   - A Dockerfile: `uvx wheelgap@latest --dockerfile Dockerfile --json` takes both Python and platform from the final stage (global `ARG` defaults included).
@@ -40,7 +40,7 @@ uvx wheelgap@latest -p 3.13 -t linux-aarch64,musl-aarch64 --json
 
 1. Name the packages with gaps, per platform, with the reason from `--explain`, and which dependency pulls each in.
 2. Offer concrete fixes:
-   - pin a version that ships the wheel (`--explain --suggest` names the nearest newer release with one; `suggest` in `--json`);
+   - pin a version that ships the wheel (`--explain --suggest` names the nearest newer release with one, `suggest` in `--json`; when no newer release has one, it names the last older one that did, `last_with_wheel`);
    - use a `-slim` Debian base instead of Alpine;
    - add build dependencies to the Dockerfile on purpose (`--explain --build-info` says what each source build needs, such as a Rust toolchain or CMake; it downloads sdists);
    - `--fail-on missing` to accept source builds in CI.

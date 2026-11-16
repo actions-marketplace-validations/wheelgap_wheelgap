@@ -2,6 +2,87 @@
 
 Practical ways to check your project's dependencies with wheelgap.
 
+## tox
+
+Add a dedicated environment to `tox.ini` in the directory containing `uv.lock`:
+
+```ini
+[testenv:wheels]
+skip_install = true
+deps = wheelgap
+commands = wheelgap uv.lock {posargs}
+```
+
+Set your deployment targets in `pyproject.toml` using the
+[wheelgap configuration table](configuration.md):
+
+```toml
+[tool.wheelgap]
+python = ["3.13"]
+targets = ["linux-x86_64", "linux-aarch64"]
+```
+
+Run `tox -e wheels` to check the lockfile without installing the project or its
+dependencies. Pass extra options after `--`, for example
+`tox -e wheels -- --explain` to show why individual wheels were rejected. A gap
+that fails wheelgap's configured policy also fails the tox environment.
+
+## nox
+
+Add this session to `noxfile.py` next to `uv.lock`:
+
+```python
+import nox
+
+
+@nox.session
+def wheels(session):
+    session.install("wheelgap")
+    session.run("wheelgap", "uv.lock", *session.posargs)
+```
+
+With Nox running on Python 3.11 or newer, run `nox -s wheels` from the project
+directory. The session installs wheelgap in its own environment and reads the
+deployment Python version and targets from the same
+[`[tool.wheelgap]` table](configuration.md) shown in the tox recipe. Pass extra
+options after `--`, for example `nox -s wheels -- --explain`. A gap that fails
+wheelgap's configured policy also fails the nox session.
+
+## Renovate
+
+Save this as `.github/workflows/wheelgap.yml` in a project that commits its
+`uv.lock`:
+
+```yaml
+name: Wheel coverage
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  wheels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: wheelgap/wheelgap@v0.11.0
+        with:
+          args: uv.lock -p 3.13 -t linux-x86_64,musl-aarch64
+          compare-to: base
+```
+
+The job runs on Renovate's and other pull requests. It compares the merged
+lockfile with the pull request's base and fails when a dependency update drops
+a wheel for one of the configured targets. Mark the `wheels` check as required
+for the target branch if you want it to block Renovate automerge.
+
+Replace the targets with the ones you deploy, or set them in
+[`[tool.wheelgap]`](configuration.md) and shorten `args` to `uv.lock`.
+Keep the pull request's default merge checkout so [`compare-to: base`](ci.md#compare-to)
+can find the base lockfile. `fetch-depth: 0` fetches the base branch with it, which a private repository needs
+with `persist-credentials: false`.
+
 ## Multi-arch images
 
 Check both architectures before building an image for AMD64 and ARM64. This
@@ -67,8 +148,9 @@ winonly
 ```
 
 This reports wheel availability, not whether a package is safe to use without
-the GIL. A package listed because its result is `unknown` couldn't be looked up;
-its `error` field in the JSON says why.
+the GIL — see [Wheels on free-threaded Python](free-threading.md). A package
+listed because its result is `unknown` couldn't be looked up; its `error`
+field in the JSON says why.
 
 ## Monorepos with separate lockfiles
 
@@ -107,6 +189,69 @@ The loop stops at the first failing check and exits with its code, so later
 lockfiles aren't checked and a later successful check can't hide an earlier gap
 or input error.
 
+## README badge
+
+**After 0.11.0.** [`--badge PATH`](cli.md#badge) writes a [shields.io endpoint](https://shields.io/badges/endpoint-badge)
+file saying how many of your targets have wheels for everything (`8/8 targets`). Publish it from CI, even when the
+check fails, and point a badge at it. With GitHub Pages:
+
+```yaml
+name: wheels badge
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  badge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: mkdir -p badge && uvx wheelgap uv.lock --badge badge/wheels.json || true  # the badge shows gaps
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./badge
+          keep_files: true
+```
+
+`|| true` keeps a gap from failing this job; your usual wheelgap check still fails on it.
+
+Then add the badge to your README:
+
+```markdown
+![wheels](https://img.shields.io/endpoint?url=https://OWNER.github.io/REPO/wheels.json)
+```
+
+Any host that serves the file over HTTPS works the same way, such as a gist's raw URL.
+
+## Will `pip install X` work on my platform?
+
+To check a package's whole dependency tree without installing it, have
+[uv](https://docs.astral.sh/uv/) resolve the tree for every platform, then check the result:
+
+```bash
+echo mcp | uv pip compile --universal --python-version 3.14 - -o requirements.txt
+wheelgap requirements.txt -p 3.14 -t win-arm64
+```
+
+- `echo mcp |` feeds the requirements to compile on standard input (`-`); name
+  any package or pin, one per line. `--python-version 3.14` is the Python uv
+  resolves for, and `-p 3.14` the one wheelgap checks; keep them the same.
+- `--universal` keeps the environment markers in the compiled file, so each
+  target gets its own resolved set: a dependency pip installs only on Windows
+  shows `–` (n/a) on the Linux targets instead of a false gap. Without it,
+  `uv pip compile` resolves for the machine it runs on.
+- On 15 November 2026 this finds `cryptography 50.0.2` (`● source`) under
+  `mcp`: `pip install mcp` on Windows on ARM compiles it. Resolved versions
+  change over time, so yours may differ.
+
+For a quick check without writing a file, `wheelgap mcp==2.3.0 --deps -p 3.14 -t win-arm64` resolves the tree itself
+from PyPI's metadata (see [`--deps`](cli.md#deps)); pin the version, since `wheelgap mcp` on its own starts the MCP
+server. It uses wheelgap's own resolver rather than the one pip runs; a
+compiled file like the one above gives the resolution a real resolver picked.
+
 ## Using wheelgap from an agent or script
 
 A coding agent or a script should read wheelgap's exit code and its `--json`
@@ -119,7 +264,7 @@ uvx wheelgap@latest uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --json > wheel
 - `uvx wheelgap@latest` runs the newest release from PyPI. Plain
   `uvx wheelgap` can run an older one: uv uses a version installed with
   `uv tool install` unless a version is requested, and may reuse one from its
-  cache. Pin a release, such as `uvx wheelgap@0.10.0`, when the result must not
+  cache. Pin a release, such as `uvx wheelgap@0.11.0`, when the result must not
   change between runs, and check `--help` on the same command for the flags
   that release has. `pipx run wheelgap` works too.
 - Always pass `-p` and `-t`. Without them, the Python comes from

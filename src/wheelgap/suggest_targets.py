@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NoReturn
 
-from .dockerfile import DockerfileError, final_from, read_dockerfile
+from .dockerfile import DockerfileError, ImageTarget, final_from, parse_image, read_dockerfile
 from .targets import DISTROS, PLATFORMS
 
 
@@ -132,6 +132,8 @@ def _runner_os(label: str) -> tuple[str | None, str | None]:
 _ARCHITECTURES = {
     ("linux-x86_64", "x64"): "linux-x86_64",
     ("linux-aarch64", "arm64"): "linux-aarch64",
+    ("musl-x86_64", "x64"): "musl-x86_64",
+    ("musl-aarch64", "arm64"): "musl-aarch64",
     ("win-amd64", "x64"): "win-amd64",
     ("win-amd64", "x86"): "win32",
     ("win-arm64", "arm64"): "win-arm64",
@@ -924,6 +926,174 @@ def _arch(setup: _Setup) -> _Arch:
         return e
 
 
+def _image_sources(
+    image: ImageTarget, written: str, platform: str | None = None, runner_cpu: bool = False
+) -> tuple[str, str]:
+    """The (target, Python) source notes for an image written as a Dockerfile FROM or a job's container."""
+    notes = []
+    if runner_cpu and platform:
+        # Actions pulls the image for this CPU; a Dockerfile's explicit --platform already appears in its source line.
+        notes.append(f"read as {platform}, the runner's CPU")
+    elif not platform and not image.platform.startswith("win"):
+        notes.append("no --platform: read as linux/amd64")
+    if image.glibc or image.musl:
+        notes.append(f"glibc {image.glibc}" if image.glibc else f"musl {image.musl}")
+    detail = written + (f" ({', '.join(notes)})" if notes else "")
+    return detail, written
+
+
+# The CPU of every GitHub-hosted runner wheelgap knows, from runner_target's table. A container job pulls its image
+# without forcing a platform, so Actions runs the image's build for the runner's CPU (a job on ubuntu-24.04-arm runs
+# python:3.13-alpine's aarch64 build). Windows containers can only run on a Windows host, so they need no platform.
+_RUNNER_PLATFORM = {
+    "linux-x86_64": "linux/amd64",
+    "linux-aarch64": "linux/arm64",
+}
+
+
+def _container_image(job: _Node) -> tuple[str, _Scalar] | None:
+    """The image a job runs in, or None when it has no `container:`.
+
+    A job in a container runs in that image pulled for the runner's CPU, so its runner's OS and libc say nothing about
+    its target. `container:` may be a literal image string or a mapping whose only key is a literal `image:`; anything
+    else (an expression, a value that isn't a single scalar, or a mapping with `options:` that could change the
+    platform, `services:` sidecars, or any other key) is refused rather than guessed.
+    """
+    container = job.get("container")
+    if container is None:
+        return None
+    node = container
+    if container.value is None and container.children:
+        for child in container.children:
+            if child.key != "image":
+                raise _Unsure(f"container: {child.key} isn't read", child.line)
+        image = container.get("image")
+        assert image is not None  # the loop above left only an image: key
+        node = image
+    value = _scalar(node)
+    if "${{" in value.text:
+        raise _Unsure(f"container: {value.text} is an expression", node.line)
+    return value.plain_text(), value
+
+
+def _container_platform(job: _Node, image: ImageTarget, line: int) -> str:
+    """The platform a container job's image is pulled for, from its runner's label.
+
+    GitHub Actions only supports job containers on Linux runners. A runner wheelgap can't resolve (an expression, a
+    matrix, an unknown label) or a non-Linux runner, as well as a Windows container image, stays under "Couldn't read"
+    rather than being guessed.
+    """
+    runs_on = job.get("runs-on")
+    if runs_on is None:
+        raise _Unsure("no runs-on line, so GitHub wouldn't run the container job", job.line)
+    if runs_on.children or isinstance(runs_on.value, list):
+        raise _Unsure(f"runs-on {runs_on.raw or 'with a group or labels'} isn't a single label", runs_on.line)
+    label = _scalar(runs_on)
+    if m := _MATRIX_REF_RE.fullmatch(label.text):
+        raise _Unsure(f"runs-on: matrix.{m.group(1)} isn't a single label", runs_on.line)
+    if "${{" in label.text:
+        raise _Unsure(f"runs-on: {label.text} is an expression", runs_on.line)
+    try:
+        text = label.plain_text()
+    except _Unsure as e:
+        raise _Unsure(f"runs-on: {e.reason}", e.line) from None
+    target = runner_target(text)
+    if target is None:
+        raise _Unsure(f"{text} isn't a GitHub-hosted runner wheelgap knows", label.line)
+    if not target.startswith("linux-"):
+        raise _Unsure(f"job containers only run on Linux runners, not {text}", label.line)
+    if text.lower() == "ubuntu-slim":
+        raise _Unsure("ubuntu-slim runs in a container itself, so it can't run a job container", label.line)
+    if image.platform.startswith("win"):
+        raise _Unsure("container: Windows container images aren't supported on GitHub Actions Linux runners", line)
+    return _RUNNER_PLATFORM[target]
+
+
+def _container_libc(job: _Node) -> str | None:
+    """ "musl" or "glibc" for a job's readable literal `container:` image, "unknown" for a `container:` whose image
+    can't be read (_read_job reports why), or None for a job without one. setup-python has no musl builds, so it can't
+    install a Python in a musl image, and in an unknown one it may not either."""
+    if "container" not in {c.key for c in job.children}:
+        return None
+    try:
+        found = _container_image(job)
+        if found is None:
+            return None
+        return "musl" if parse_image(found[0]).musl else "glibc"
+    except (_Unsure, DockerfileError):
+        return "unknown"
+
+
+def _picks_python(setup: _Setup) -> bool:
+    """Whether a setup step picks the job's interpreter (as _job_archs counts it)."""
+    return setup.setup_python or bool({"python-version", "python-arch"} & setup.inputs.keys())
+
+
+def _refuse_services(job: _Node) -> None:
+    """`services:` sits beside `container:` at the job level (or inside it in older, invalid layouts). GitHub's
+    service containers aren't read, so refuse the job's target rather than guess from the image (#270)."""
+    if (services := job.get("services")) is not None:
+        raise _Unsure("services isn't read", services.line)
+    container = job.get("container")
+    if container is not None and (services := container.get("services")) is not None:
+        raise _Unsure("container: services isn't read", services.line)
+
+
+def _container_target(job: _Node, image: str, line: int) -> tuple[ImageTarget, str]:
+    """A container job's image, read for the platform Actions pulls it on (the runner's CPU)."""
+    try:
+        parsed = parse_image(image)
+    except DockerfileError as e:
+        raise _Unsure(f"container: {str(e).removesuffix(', pass -p/-t instead')}", line) from None
+    platform = _container_platform(job, parsed, line)
+    try:
+        return parse_image(image, platform), platform
+    except DockerfileError as e:
+        raise _Unsure(f"container: {str(e).removesuffix(', pass -p/-t instead')}", line) from None
+
+
+def _job_archs(setups: list[_Setup]) -> list[str | None | tuple[str, int]]:
+    # Each step that picks an interpreter adds its architecture; a setup-uv step without a Python picks none.
+    pickers = [s for s in setups if _picks_python(s)]
+    archs = list(dict.fromkeys(_arch(s) for s in pickers)) or [None]
+    if unread := next((a for a in archs if isinstance(a, _Unsure)), None):
+        raise _Unsure(f"{unread.reason}, so the job's target isn't read", unread.line)
+    return [a for a in archs if not isinstance(a, _Unsure)]
+
+
+def _apply_arch(
+    combo: dict[str, _Scalar],
+    arch: str | None | tuple[str, int],
+    target: str,
+    detail: str,
+    where_label: str,
+    line: int,
+    path: str,
+    *,
+    glibc: str | None = None,
+    musl: str | None = None,
+    macos: str | None = None,
+) -> Found | tuple[int | None, str]:
+    if isinstance(arch, tuple):
+        # A combination without the key (or with '') gives setup-python '', so the target's own.
+        value = combo.get(arch[0])
+        try:
+            chosen = value.plain_text() if value is not None else None
+        except _Unsure as e:
+            return (e.line, e.reason)
+        if chosen:
+            detail += f", architecture: {chosen} (matrix)"
+        chosen = chosen or None
+    else:
+        chosen = arch
+        if chosen is not None:
+            detail += f", architecture: {chosen}"
+    mapped = target if chosen is None else _ARCHITECTURES.get((target, chosen))
+    if mapped is None:
+        return (line, f"setup-python's architecture: {chosen} on {where_label} isn't read")
+    return Found(mapped, path, line, detail, glibc=glibc, musl=musl, macos=macos)
+
+
 def _read_job(job: _Node, path: str, out: Suggestions) -> None:
     def unsure(e: _Unsure) -> None:
         out.unreadable.append(Unreadable(path, e.line, f"job {job.key}: {e.reason}"))
@@ -940,6 +1110,14 @@ def _read_job(job: _Node, path: str, out: Suggestions) -> None:
         unsure(_Unsure(e.reason + " (neither its runner nor its Python is read)", e.line))
         return
 
+    # setup-python has no musl builds, so in an Alpine image its step fails and the job never runs: neither its
+    # Python nor the job's target (nor the image's Python) is suggested; the job is refused below.
+    libc = _container_libc(job)
+    musl_setup_python = libc == "musl" and any(s.setup_python for s in setups)
+    if libc in ("musl", "unknown"):
+        # In an image that can't be read, setup-python may fail too (the image may be musl), so its Python isn't
+        # suggested either; the job itself is refused below for its unreadable container.
+        setups = [s for s in setups if not s.setup_python]
     for setup in setups:
         try:
             _read_python(job, setup, path, out)
@@ -947,70 +1125,100 @@ def _read_job(job: _Node, path: str, out: Suggestions) -> None:
             unsure(e)
 
     try:
-        runs_on = job.get("runs-on")
-        if runs_on is None:
-            if job.get("uses") is None:  # a reusable workflow call has no runs-on of its own
-                raise _Unsure("no runs-on line", job.line)
-            return
-        if (container := job.get("container")) is not None:
-            raise _Unsure("runs in a container, whose platform isn't read", container.line)
-        if runs_on.children or isinstance(runs_on.value, list):
-            raise _Unsure(f"runs-on {runs_on.raw or 'with a group or labels'} isn't a single label", runs_on.line)
-        # Each step that picks an interpreter adds its architecture; a setup-uv step without a Python picks none.
-        pickers = [s for s in setups if s.setup_python or {"python-version", "python-arch"} & s.inputs.keys()]
-        archs = list(dict.fromkeys(_arch(s) for s in pickers)) or [None]
-        if unread := next((a for a in archs if isinstance(a, _Unsure)), None):
-            raise _Unsure(f"{unread.reason}, so the job's target isn't read", unread.line)
-        label_node = _scalar(runs_on)
-        label_key = m.group(1) if (m := _MATRIX_REF_RE.fullmatch(label_node.text)) else None
-        if label_key is None and "${{" in label_node.text:
-            raise _Unsure(f"runs-on: {label_node.text} is an expression", runs_on.line)
-        combos: list[dict[str, _Scalar]] = [{}]
-        if label_key is not None or any(isinstance(a, tuple) for a in archs):
-            # Each matrix combination runs its own runner with its own architecture.
-            combos, line = _matrix(job, runs_on)
-            if not combos:
-                raise _Unsure("the matrix is empty", line)
-        # Everything is worked out before anything is reported, so a refusal partway through the matrix leaves no
-        # targets behind and the result doesn't depend on the matrix's order.
         found: set[Found] = set()
         refused: set[tuple[int | None, str]] = set()
-        for combo in combos:
-            if label_key is None:
-                label_value, source = label_node, f"runs-on: {label_node.text}"
-            elif label_key in combo:
-                label_value = combo[label_key]
-                source = f"runs-on: {label_value.text} (matrix.{label_key}, line {runs_on.line})"
-            else:
-                raise _Unsure(f"matrix.{label_key} isn't set in every matrix combination", runs_on.line)
-            try:
-                label = label_value.plain_text()
-            except _Unsure as e:
-                refused.add((e.line, e.reason))
-                continue
-            if (target := runner_target(label)) is None:
-                refused.add((label_value.line, f"{label} isn't a GitHub-hosted runner wheelgap knows"))
-                continue
-            glibc, macos = _runner_os(label)
-            for arch in archs:
-                detail = source
-                if isinstance(arch, tuple):
-                    # A combination without the key (or with '') gives setup-python '', so the runner's own.
-                    value = combo.get(arch[0])
-                    try:
-                        arch = value.plain_text() if value is not None else None
-                    except _Unsure as e:
-                        refused.add((e.line, e.reason))
-                        continue
-                    detail += f", architecture: {arch} (matrix)" if arch else ""
-                    arch = arch or None
-                elif arch is not None:
-                    detail += f", architecture: {arch}"
-                mapped = target if arch is None else _ARCHITECTURES.get((target, str(arch)))
-                if mapped is None:
-                    refused.add((label_value.line, f"setup-python's architecture: {arch} on {label} isn't read"))
+        if "container" in {c.key for c in job.children}:
+            container = _container_image(job)
+            assert container is not None  # the key is present, so _container_image reads it or refuses the job
+            image, image_node = container
+            _refuse_services(job)
+            if musl_setup_python:
+                raise _Unsure(
+                    f"setup-python has no musl builds, so it can't install a Python in {image}", image_node.line
+                )
+            parsed, platform = _container_target(job, image, image_node.line)
+            source = f"container: {image}"
+            detail, python_source = _image_sources(parsed, source, platform, runner_cpu=True)
+            if not any(_picks_python(s) for s in setups):
+                # A step that picks the interpreter puts its own Python first on PATH, as on a runner.
+                out.pythons.append(Found(parsed.python, path, image_node.line, python_source))
+            archs = _job_archs(setups)
+            combos: list[dict[str, _Scalar]] = [{}]
+            if any(isinstance(a, tuple) for a in archs):
+                combos, line = _matrix(job, job.get("container") or job)
+                if not combos:
+                    raise _Unsure("the matrix is empty", line)
+            for combo in combos:
+                for arch in archs:
+                    result = _apply_arch(
+                        combo,
+                        arch,
+                        parsed.platform,
+                        detail,
+                        f"{source} ({platform})",
+                        image_node.line,
+                        path,
+                        glibc=parsed.glibc,
+                        musl=parsed.musl,
+                    )
+                    if isinstance(result, Found):
+                        found.add(result)
+                    else:
+                        refused.add(result)
+        else:
+            runs_on = job.get("runs-on")
+            if runs_on is None:
+                if job.get("uses") is None:  # a reusable workflow call has no runs-on of its own
+                    raise _Unsure("no runs-on line", job.line)
+                return
+            if runs_on.children or isinstance(runs_on.value, list):
+                raise _Unsure(f"runs-on {runs_on.raw or 'with a group or labels'} isn't a single label", runs_on.line)
+            archs = _job_archs(setups)
+            label_node = _scalar(runs_on)
+            label_key = m.group(1) if (m := _MATRIX_REF_RE.fullmatch(label_node.text)) else None
+            if label_key is None and "${{" in label_node.text:
+                raise _Unsure(f"runs-on: {label_node.text} is an expression", runs_on.line)
+            combos = [{}]
+            if label_key is not None or any(isinstance(a, tuple) for a in archs):
+                # Each matrix combination runs its own runner with its own architecture.
+                combos, line = _matrix(job, runs_on)
+                if not combos:
+                    raise _Unsure("the matrix is empty", line)
+            # Everything is worked out before anything is reported, so a refusal partway through the matrix leaves no
+            # targets behind and the result doesn't depend on the matrix's order.
+            for combo in combos:
+                if label_key is None:
+                    label_value, source = label_node, f"runs-on: {label_node.text}"
+                elif label_key in combo:
+                    label_value = combo[label_key]
+                    source = f"runs-on: {label_value.text} (matrix.{label_key}, line {runs_on.line})"
+                else:
+                    raise _Unsure(f"matrix.{label_key} isn't set in every matrix combination", runs_on.line)
+                try:
+                    label = label_value.plain_text()
+                except _Unsure as e:
+                    refused.add((e.line, e.reason))
                     continue
-                found.add(Found(mapped, path, label_value.line, detail, glibc=glibc, macos=macos))
+                if (target := runner_target(label)) is None:
+                    refused.add((label_value.line, f"{label} isn't a GitHub-hosted runner wheelgap knows"))
+                    continue
+                glibc, macos = _runner_os(label)
+                for arch in archs:
+                    result = _apply_arch(
+                        combo,
+                        arch,
+                        target,
+                        source,
+                        label,
+                        label_value.line,
+                        path,
+                        glibc=glibc,
+                        macos=macos,
+                    )
+                    if isinstance(result, Found):
+                        found.add(result)
+                    else:
+                        refused.add(result)
         order = list(PLATFORMS)
         for f in sorted(found, key=lambda f: (f.line, order.index(f.value), f.source)):
             if f not in out.targets:
@@ -1145,14 +1353,9 @@ def read_docker(path: Path, name: str, out: Suggestions) -> None:
         out.unreadable.append(Unreadable(name, None, f"couldn't read the file ({e.strerror or e})"))
         return
     source = f"FROM {f'--platform={platform} ' if platform else ''}{base}"
-    notes = []
-    if not platform and not image.platform.startswith("win"):
-        notes.append("no --platform: read as linux/amd64")
-    if image.glibc or image.musl:
-        notes.append(f"glibc {image.glibc}" if image.glibc else f"musl {image.musl}")
-    detail = source + (f" ({', '.join(notes)})" if notes else "")
+    detail, python_source = _image_sources(image, source, platform)
     out.targets.append(Found(image.platform, name, line, detail, image.glibc, image.musl))
-    out.pythons.append(Found(image.python, name, line, source))
+    out.pythons.append(Found(image.python, name, line, python_source))
 
 
 def suggest(folder: Path) -> Suggestions:

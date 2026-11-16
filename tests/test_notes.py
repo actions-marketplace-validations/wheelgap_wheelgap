@@ -650,13 +650,15 @@ def test_no_cache_saves_nothing(capsys, tmp_path, tracker):
 
 def test_cached_notes_are_checked_again(capsys, tmp_path, tracker):
     cache.save_notes(notes.TRACKER, "pkg", [note(text="::error::from a tampered cache"), note(text="Cached.")])
+    cache.save_lab(notes.TRACKER, "pkg", [])
     pkg = explain_json(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64")["pkg"]
     assert [n["text"] for n in pkg["notes"]] == ["Cached."] and tracker.calls == []
 
 
 def test_only_normalized_names_are_looked_up(tracker):
-    found, cut = notes.lookup(["../../evil", "Pkg", "a.b", "-x", "ok-name"], read_cache=False, write_cache=False)
+    found, built, cut = notes.lookup(["../../evil", "Pkg", "a.b", "-x", "ok-name"], read_cache=False, write_cache=False)
     assert tracker.calls == [f"{notes.TRACKER}/ok-name.json"] and found == {"ok-name": []} and cut is None
+    assert built == {"ok-name": []}
 
 
 def test_notes_needs_explain(capsys, tmp_path):
@@ -847,6 +849,7 @@ def test_pylock_without_index_never_even_online(capsys, tmp_path, tracker, fake_
 
 def test_cached_notes_are_capped_too(capsys, tmp_path, tracker):
     cache.save_notes(notes.TRACKER, "pkg", [note(text=f"Note {i}.") for i in range(25)])
+    cache.save_lab(notes.TRACKER, "pkg", [])
     pkg = explain_json(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64")["pkg"]
     assert len(pkg["notes"]) == 20 and tracker.calls == []
 
@@ -872,3 +875,330 @@ def test_pixi_lock_never(capsys, fixtures, tracker, fake_pypi):
     code, out, _ = run(capsys, str(fixtures / "pixiproj"), "-p", "3.13", "-t", "linux-aarch64", "--explain", "--notes")
     assert code == 1 and "fastlib 2.0.0 on linux-aarch64" in out
     assert tracker.calls == []
+
+
+# The build lab (the package file's `builds`): whether a release with no wheel for a target builds from its sdist on
+# GitHub's runners, and imports.
+BUILD = {
+    "target": "3.14 win-arm64",
+    "version": "1.0",
+    "outcome": "built",
+    "seconds": 87,
+    "wheel": "cp314-cp314-win_arm64",
+    "extensions": 3,
+    "import": "ok",
+    "gil": None,
+    "reason": None,
+    "excerpt": "",
+    "toolchains": ["cl", "cmake"],
+    "runner": "windows-11-arm",
+    "python": "3.14.2",
+    "date": "2026-11-15",
+}
+FT = {"target": "3.14t win-arm64", "wheel": "cp314-cp314t-win_arm64", "python": "3.14.2t", "gil": "kept-off"}
+FAILED = {"outcome": "failed", "wheel": None, "extensions": None, "import": None, "reason": "needs a Rust toolchain"}
+LAB = "pkg 1.0 on win-arm64: build lab (2026-11-15, windows-11-arm, Python 3.14.2): "
+
+
+def build(**changes) -> dict:
+    return {**BUILD, **changes}
+
+
+def lab_run(capsys, tmp_path, *argv):
+    code, out, err = run(capsys, uv_lock(tmp_path), "-p", "3.14", "-t", "win-arm64", *argv, "--explain", "--notes")
+    assert code == 1 and not err
+    return out
+
+
+def test_build_lab_result_shown_for_the_checked_release_and_target(capsys, tmp_path, tracker):
+    tracker.add("pkg", note(platforms=["win-arm64"]), builds=[build()])
+    out = lab_run(capsys, tmp_path)
+    # After the package's notes, styled like them: once per source cell it speaks for.
+    assert f"\n{LAB}builds from source in 87 s and imports\n\n" in out
+    assert out.index(HEAD) < out.index(LAB)
+    assert tracker.calls == [f"{notes.TRACKER}/pkg.json"]  # the same file as the notes: no other request
+
+    pkg = explain_json(capsys, uv_lock(tmp_path), "-p", "3.14", "-t", "win-arm64")["pkg"]
+    assert pkg["build_lab"] == {"win-arm64": {**BUILD, "verdict": "builds from source in 87 s and imports"}}
+
+
+@pytest.mark.parametrize(
+    "changes, verdict",
+    [
+        ({}, "builds from source in 87 s and imports"),
+        ({"seconds": 89}, "builds from source in 89 s and imports"),
+        ({"seconds": 90}, "builds from source in 2 min and imports"),
+        ({"seconds": 1500}, "builds from source in 25 min and imports"),
+        ({"seconds": 150}, "builds from source in 3 min and imports"),  # as the tracker site says it
+        ({**FT}, "builds from source in 87 s and imports, GIL stays off"),
+        ({**FT, "gil": "re-enabled"}, "builds in 87 s, but importing it turns the GIL back on"),
+        (
+            {"wheel": "py3-none-any", "extensions": 0},
+            (
+                "builds in 87 s as pure Python, with no compiled extension module "
+                "(if it has an optional one, that was skipped)"
+            ),
+        ),
+        ({"extensions": 0}, "builds in 87 s, but with no compiled extension module"),
+        ({**FT, "extensions": 0, "gil": None}, "builds in 87 s, but with no compiled extension module"),
+        ({"import": "failed"}, "builds in 87 s, but doesn't import"),
+        ({**FT, "import": "failed", "gil": None}, "builds in 87 s, but doesn't import"),
+        ({"import": "deps-failed"}, "builds in 87 s, but its dependencies don't install"),
+        ({**FAILED}, "fails to build: needs a Rust toolchain"),
+        ({**FAILED, "reason": "compile error", "excerpt": "error: C2065"}, "fails to build: compile error"),
+        ({**FAILED, "reason": "other"}, "fails to build"),
+        (
+            {**FAILED, "reason": "unsupported platform"},
+            "the package doesn't support this platform (its own build says so)",
+        ),
+        ({**FAILED, "outcome": "timeout", "reason": None, "seconds": 2400}, "didn't finish building in 40 min"),
+    ],
+)
+def test_build_lab_verdicts(capsys, tmp_path, tracker, changes, verdict):
+    result = build(**changes)
+    tracker.add("pkg", builds=[result])
+    python = "3.14t" if result["target"].startswith("3.14t") else "3.14"
+    code, out, err = run(capsys, uv_lock(tmp_path), "-p", python, "-t", "win-arm64", "--explain", "--notes")
+    assert code == 1 and not err
+    where = f"({result['date']}, {result['runner']}, Python {result['python']})"
+    assert f"pkg 1.0 on win-arm64: build lab {where}: {verdict}\n" in out
+    assert out.count("build lab") == 1
+    pkg = explain_json(capsys, uv_lock(tmp_path), "-p", python, "-t", "win-arm64")["pkg"]
+    assert pkg["build_lab"] == {"win-arm64": {**result, "verdict": verdict}}
+
+
+def test_build_lab_never_calls_a_wheel_without_extensions_a_working_build(capsys, tmp_path, tracker):
+    for wheel in ("py3-none-any", "cp314-cp314-win_arm64"):
+        tracker.add("pkg", builds=[build(wheel=wheel, extensions=0)])
+        out = lab_run(capsys, tmp_path, "--no-cache")
+        assert LAB in out and "builds from source" not in out and "and imports" not in out
+
+
+@pytest.mark.parametrize("version", ["1.1", "0.9", "1.0.0", "1.0.post1", "v1.0"])
+def test_build_lab_result_for_another_release_shows_nothing(capsys, tmp_path, tracker, version):
+    tracker.add("pkg", note(platforms=["win-arm64"]), builds=[build(version=version)])
+    out = lab_run(capsys, tmp_path)
+    assert HEAD in out and "build lab" not in out  # it says nothing about the checked release
+    assert explain_json(capsys, uv_lock(tmp_path), "-p", "3.14", "-t", "win-arm64")["pkg"]["build_lab"] == {}
+
+
+@pytest.mark.parametrize(
+    "python, platform, target",
+    [
+        ("3.14", "win-arm64", "3.14t win-arm64"),  # the free-threaded build says nothing about the regular one
+        ("3.14t", "win-arm64", "3.14 win-arm64"),
+        ("3.14", "win-amd64", "3.14 win-arm64"),
+        ("3.13", "win-arm64", "3.14 win-arm64"),
+        ("3.14", "musl-aarch64", "3.14 linux-aarch64"),
+    ],
+)
+def test_build_lab_result_for_another_target_shows_nothing(capsys, tmp_path, tracker, python, platform, target):
+    py = target.split()[0]
+    tracker.add("pkg", builds=[build(target=target, python=f"{py.rstrip('t')}.2{'t' * py.endswith('t')}", gil=None)])
+    folder = uv_lock(tmp_path)
+    code, out, err = run(capsys, folder, "-p", python, "-t", platform, "--explain", "--notes")
+    assert code == 1 and not err and "build lab" not in out
+    assert explain_json(capsys, folder, "-p", python, "-t", platform)["pkg"]["build_lab"] == {}
+
+
+def test_build_lab_results_by_target_with_several_pythons(capsys, tmp_path, tracker):
+    ft = build(**FT, seconds=200)
+    tracker.add("pkg", builds=[build(), ft, build(target="3.14t linux-x86_64", python="3.14.0t", gil="re-enabled")])
+    folder = uv_lock(tmp_path)
+    code, out, err = run(capsys, folder, "-p", "3.14,3.14t", "-t", "win-arm64", "--explain", "--notes")
+    assert code == 1 and not err
+    assert (
+        "pkg 1.0 on 3.14 win-arm64: build lab (2026-11-15, windows-11-arm, Python 3.14.2): "
+        "builds from source in 87 s and imports\n"
+        "pkg 1.0 on 3.14t win-arm64: build lab (2026-11-15, windows-11-arm, Python 3.14.2t): "
+        "builds from source in 3 min and imports, GIL stays off\n\n"
+    ) in out
+    assert "linux-x86_64" not in out  # not a checked target
+    pkg = explain_json(capsys, folder, "-p", "3.14,3.14t", "-t", "win-arm64")["pkg"]
+    assert list(pkg["build_lab"]) == ["3.14 win-arm64", "3.14t win-arm64"]
+    assert pkg["build_lab"]["3.14t win-arm64"]["verdict"] == "builds from source in 3 min and imports, GIL stays off"
+
+
+def test_build_lab_only_for_source_cells(capsys, tmp_path, tracker):
+    tracker.add("pkg", builds=[build()])
+    folder = uv_lock(tmp_path)
+    args = ("-p", "3.14", "-t", "win-arm64,linux-x86_64", "--ignore", "pkg:win-arm64")
+    code, out, err = run(capsys, folder, *args, "--explain", "--notes")
+    assert code == 1 and not err and "build lab" not in out  # win-arm64 is ignored, so not explained
+    assert explain_json(capsys, folder, *args)["pkg"]["build_lab"] == {}
+
+
+def test_build_lab_needs_a_known_version():
+    from wheelgap.targets import Target
+
+    (result,) = notes.parse_builds({"schema": 1, "name": "pkg", "builds": [build()]}, "pkg")
+    target = Target(3, 14, False, "win-arm64")
+    assert result.covers(target, "1.0") and not result.covers(target, None) and not result.covers(target, "1.0.0")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {**BUILD, "extra": 1},
+        {k: v for k, v in BUILD.items() if k != "date"},
+        {k: v for k, v in BUILD.items() if k != "import"} | {"imported": "ok"},
+        "not an object",
+        None,
+        build(target="3.14 win_arm64"),
+        build(target="3.14 ios-arm64"),
+        build(target="3.14 pyodide"),
+        build(target="3.14  win-arm64"),
+        build(target="win-arm64"),
+        build(version=""),
+        build(version=1.0),
+        build(version="1.0 "),
+        build(outcome="built?"),
+        build(outcome=None),
+        build(wheel="cp314-cp314-linux_x86_64"),  # a wheel for another platform than the target's
+        build(wheel="cp314-cp314-win_amd64"),
+        build(runner="ubuntu-24.04"),  # a runner that can't build for win-arm64
+        build(runner="windows-2025"),  # an x86-64 Windows runner
+        build(seconds=86400),  # longer than the lab ever runs a build
+        build(seconds=True),
+        build(seconds=-1),
+        build(seconds=87.0),
+        build(seconds="87"),
+        build(seconds=10**9),
+        build(wheel=None),
+        build(wheel="cp314-cp314-win_arm64\n"),
+        build(wheel="py3-none-any", extensions=2),  # a pure Python wheel can't hold an extension module
+        build(extensions=None),
+        build(extensions=-1),
+        build(extensions=False),
+        build(**{"import": None}),
+        build(**{"import": "maybe"}),
+        build(gil="kept-off"),  # not a free-threaded target
+        build(**FT, extensions=0),  # no extension module: the GIL wasn't checked
+        build(**{**FT, "import": "failed"}),  # didn't import: the GIL wasn't checked
+        build(**{**FT, "gil": None}),  # a free-threaded build that imported has its GIL checked
+        build(**{**FT, "gil": "off"}),
+        build(**FAILED, gil="kept-off"),
+        build(reason="other"),  # built: no reason
+        build(**{**FAILED, "reason": None}),
+        build(**{**FAILED, "reason": "needs coffee"}),
+        build(**{**FAILED, "wheel": "cp314-cp314-win_arm64"}),
+        build(**{**FAILED, "extensions": 0}),
+        build(**{**FAILED, "import": "failed"}),
+        build(outcome="timeout", reason="other", wheel=None, extensions=None, **{"import": None}),
+        build(excerpt="x" * 401),
+        build(excerpt="caf\u00e9"),
+        build(excerpt="line\nbreak"),
+        build(excerpt="\x1b[31mred"),
+        build(excerpt="##[error]injected"),  # the legacy workflow command form; "::" is fine (see below)
+        build(excerpt="see ##[error]injected"),
+        build(excerpt=None),
+        build(toolchains=["gcc", "gcc"]),
+        build(toolchains=["clang"]),
+        build(toolchains="gcc"),
+        build(runner="windows 11"),
+        build(runner="::error::x"),
+        build(runner=""),
+        build(runner="r" * 65),
+        build(python="3.14"),
+        build(python="3.14.2t"),  # a free-threaded Python for the regular target
+        build(python="3.13.9"),  # another Python than the target's
+        build(python="3.14.2\u200b"),
+        build(date="2026-02-30"),
+        build(date="2026-11-15T00:00:00"),
+        build(date=None),
+    ],
+)
+def test_malformed_build_lab_result_is_dropped_and_notes_still_show(capsys, tmp_path, tracker, bad):
+    other = build(**FT)  # a good result for another target, which still shows
+    tracker.add("pkg", note(platforms=["win-arm64"]), builds=[bad, other])
+    folder = uv_lock(tmp_path)
+    code, out, err = run(capsys, folder, "-p", "3.14,3.14t", "-t", "win-arm64", "--explain", "--notes")
+    assert code == 1 and not err
+    assert HEAD in out and "pkg 1.0 on 3.14t win-arm64: build lab" in out
+    assert "pkg 1.0 on 3.14 win-arm64: build lab" not in out  # dropped whole, never shown in part
+    pkg = explain_json(capsys, folder, "-p", "3.14,3.14t", "-t", "win-arm64")["pkg"]
+    assert list(pkg["build_lab"]) == ["3.14t win-arm64"] and len(pkg["notes"]) == 1
+
+
+def test_two_build_lab_results_for_one_target_are_both_dropped(capsys, tmp_path, tracker):
+    tracker.add("pkg", builds=[build(), build(seconds=5), build(**FT)])
+    folder = uv_lock(tmp_path)
+    pkg = explain_json(capsys, folder, "-p", "3.14,3.14t", "-t", "win-arm64")["pkg"]
+    assert list(pkg["build_lab"]) == ["3.14t win-arm64"]  # which of the two would be a guess
+
+
+@pytest.mark.parametrize("builds", [{"3.14 win-arm64": BUILD}, "built", 1])
+def test_builds_that_arent_a_list_leave_the_notes(capsys, tmp_path, tracker, builds):
+    tracker.add("pkg", note(platforms=["win-arm64"]), builds=builds)
+    out = lab_run(capsys, tmp_path)
+    assert HEAD in out and "build lab" not in out
+    pkg = explain_json(capsys, uv_lock(tmp_path), "-p", "3.14", "-t", "win-arm64")["pkg"]
+    assert pkg["build_lab"] == {} and len(pkg["notes"]) == 1
+
+
+@pytest.mark.parametrize("bad_notes", [{"note": NOTE}, "notes", [note(text="::error::x")]])
+def test_malformed_notes_leave_the_build_lab_results(capsys, tmp_path, tracker, bad_notes):
+    tracker.add("pkg", builds=[build()])
+    tracker.files["pkg"]["notes"] = bad_notes
+    out = lab_run(capsys, tmp_path)
+    assert f"{LAB}builds from source in 87 s and imports" in out and HEAD not in out
+
+
+def test_package_file_without_builds_has_no_results(capsys, tmp_path, tracker):
+    tracker.add("pkg", note(platforms=["win-arm64"]))  # published before the build lab
+    assert "builds" not in tracker.files["pkg"]
+    out = lab_run(capsys, tmp_path)
+    assert HEAD in out and "build lab" not in out
+    pkg = explain_json(capsys, uv_lock(tmp_path), "-p", "3.14", "-t", "win-arm64")["pkg"]
+    assert pkg["build_lab"] == {} and len(pkg["notes"]) == 1
+    assert len(tracker.calls) == 1  # cached as no results, like a 404
+
+
+def test_build_lab_needs_notes(capsys, tmp_path, tracker):
+    tracker.add("pkg", builds=[build()])
+    code, out, _ = run(capsys, uv_lock(tmp_path), "-p", "3.14", "-t", "win-arm64", "--explain")
+    assert code == 1 and "build lab" not in out and tracker.calls == []
+    code, out, _ = run(capsys, uv_lock(tmp_path), "-p", "3.14", "-t", "win-arm64", "--explain", "--json")
+    assert json.loads(out)["packages"][0]["build_lab"] == {}
+
+
+def test_build_lab_results_are_cached_and_checked_again(capsys, tmp_path, tracker):
+    tracker.add("pkg", builds=[build()])
+    for _ in range(2):
+        assert LAB in lab_run(capsys, tmp_path)
+    assert len(tracker.calls) == 1
+    cache.save_lab(notes.TRACKER, "pkg", [build(runner="::error::tampered"), build(**FT)])
+    pkg = explain_json(capsys, uv_lock(tmp_path), "-p", "3.14,3.14t", "-t", "win-arm64")["pkg"]
+    assert list(pkg["build_lab"]) == ["3.14t win-arm64"] and len(tracker.calls) == 1
+
+
+def test_notes_cached_before_the_build_lab_are_looked_up_again(capsys, tmp_path, tracker):
+    cache.save_notes(notes.TRACKER, "pkg", [note(platforms=["win-arm64"])])  # what 0.10.0 saved
+    tracker.add("pkg", note(platforms=["win-arm64"]), builds=[build()])
+    out = lab_run(capsys, tmp_path)
+    assert HEAD in out and LAB in out and len(tracker.calls) == 1
+
+
+def test_markdown_shows_build_lab_results(capsys, tmp_path, tracker):
+    tracker.add("pkg", builds=[build()])
+    code, out, err = run(
+        capsys, uv_lock(tmp_path), "-p", "3.14", "-t", "win-arm64", "--explain", "--notes", "--markdown"
+    )
+    assert code == 1 and not err
+    assert f"\n{LAB}builds from source in 87 s and imports\n" in out.split("```")[1]
+
+
+@pytest.mark.parametrize(
+    "excerpt",
+    [
+        "error: no member named 'x' in 'std::vector<int>::iterator'",
+        "error: '::size_t' has not been declared",
+        "error[E0599]: no function `<T as Foo>::bar`",
+    ],
+)
+def test_a_compile_error_with_cpp_or_rust_paths_is_kept(excerpt):
+    # Real compiler errors are full of "::"; dropping them would hide exactly the failures the lab exists to report.
+    raw = build(**FAILED, excerpt=excerpt)
+    (result,) = notes.parse_builds({"schema": 1, "name": "pkg", "builds": [raw]}, "pkg")
+    assert result.excerpt == excerpt
+    assert result.reason == "needs a Rust toolchain"

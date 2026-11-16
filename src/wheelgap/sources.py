@@ -14,8 +14,15 @@ from urllib.parse import ParseResult, unquote, urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
-from packaging.utils import canonicalize_name, canonicalize_version
-from packaging.version import Version
+from packaging.utils import (
+    InvalidSdistFilename,
+    InvalidWheelFilename,
+    canonicalize_name,
+    canonicalize_version,
+    parse_sdist_filename,
+    parse_wheel_filename,
+)
+from packaging.version import InvalidVersion, Version
 
 if TYPE_CHECKING:
     from .targets import Target
@@ -74,9 +81,11 @@ class Package:
     resolutions: dict[str, Package] = field(default_factory=dict)
     # Files of a pinned release whose Requires-Python excludes the target Python, mapped to their --explain reason.
     requires_python_rejected: dict[str, str] = field(default_factory=dict)
-    # pip requirements.txt --no-binary / --only-binary policy for this package.
+    # Distribution selection policy from requirements files or uv project configuration.
     no_binary: bool = False
     only_binary: bool = False
+    # The relevant uv setting(s), used to explain a gap caused by the configured policy.
+    install_policy: str | None = None
 
     @property
     def key(self) -> str:
@@ -173,6 +182,24 @@ class Source:
     pypi_only: bool = False
     # A project directory with pixi.lock as well as the lockfile that was picked: the pixi.lock, for a note.
     passed_over: Path | None = None
+    # Requirements for --deps to resolve: package names on the command line, selected pyproject.toml
+    # requirements, or a requirements file's requirement lines.
+    specs: list[str] = field(default_factory=list)
+    # A requirements file that looks like pip-compile output (--hash lines or `# via` comments): already
+    # pinned, so --deps has nothing to resolve.
+    compiled: bool = False
+    # A requirements file's -c constraints as clean index specifiers (key -> specifiers), for --deps to seed.
+    constraint_specs: dict[str, set[str]] = field(default_factory=dict)
+    # A requirements file's constraint problems (a marker, a non-index constraint, conflicting pins): the
+    # resolved package gets the error, as the requirement's own row does without --deps.
+    constraint_errors: dict[str, str] = field(default_factory=dict)
+    # A requirements file's constraints --deps can't apply the way pip does (a marker, a URL, an error): it refuses.
+    deps_blockers: list[str] = field(default_factory=list)
+    # A requirements file's --no-binary/--only-binary policy, applied to the resolved packages too.
+    format_control: _FormatControl | None = None
+    # --deps (deps.py): per target, the packages installed and the dependency path to each, keyed by index into
+    # `packages`. check() uses it in place of a lockfile's graph.
+    deps_paths: dict[Target, dict[int, list[str]]] | None = None
 
 
 def pythons_outside_lock(source: Source, targets: Iterable[Target], *, bounds_only: bool = True) -> list[str]:
@@ -274,6 +301,40 @@ def _uv_edge(path: Path, owner: str, d: object) -> Edge:
     return (d["name"], d.get("version"), d.get("marker"), edge_source)
 
 
+# A uv manifest writes source provenance as flat keys, unlike package dependency edges.
+# Keep the normalised table on the manifest entry too: --group/--no-dev walks those
+# entries directly, while the default graph walks root_edges.
+_UV_MANIFEST_SOURCE_KEYS = {
+    "index": "registry",
+    "path": "path",
+    "url": "url",
+    "git": "git",
+    "editable": "editable",
+    "directory": "directory",
+    "virtual": "virtual",
+}
+
+
+def _uv_manifest_edge(path: Path, d: object) -> Edge:
+    name, version, marker, source = _uv_edge(path, "the manifest", d)
+    assert isinstance(d, dict)
+    flat_source: dict[str, object] = {}
+    for key, kind in _UV_MANIFEST_SOURCE_KEYS.items():
+        if key not in d:
+            continue
+        value = d[key]
+        if not isinstance(value, str):
+            reason = f"the manifest has a dependency {name!r} with a `{key}` that isn't a string"
+            raise SourceError(f"{path.name}: {reason}")
+        flat_source[kind] = value
+    if len(flat_source) > 1 or (flat_source and source is not None):
+        raise SourceError(f"{path.name}: the manifest has a dependency {name!r} with conflicting sources")
+    if flat_source:
+        source = flat_source
+        d["source"] = source
+    return name, version, marker, source
+
+
 def _uv_edges(path: Path, p: dict) -> list[Edge]:
     """A uv.lock package's dependency edges, from `dependencies` and the two tables of groups."""
     owner = f"package {p.get('name')}"
@@ -289,6 +350,62 @@ def _uv_edges(path: Path, p: dict) -> list[Edge]:
             raise SourceError(f"{path.name}: {owner} has a group of dependencies that isn't a list")
         out.extend(_uv_edge(path, owner, d) for d in group)
     return out
+
+
+def _uv_build_restrictions(path: Path, source: Source) -> None:
+    """Apply uv's project-level build and wheel restrictions to index packages in a lockfile.
+
+    uv.toml takes precedence over [tool.uv] in pyproject.toml when both are present.
+    uv's pip-only [tool.uv.pip] options do not apply to uv sync.
+    """
+    config_path = path.with_name("uv.toml")
+    standalone = config_path.is_file()
+    if not standalone:
+        config_path = path.with_name("pyproject.toml")
+        if not config_path.is_file():
+            return
+    try:
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise SourceError(f"{config_path}: invalid TOML: {exc}") from None
+    setting_table = "uv.toml" if standalone else "[tool.uv]"
+    tool = data.get("tool", {})
+    if not isinstance(tool, dict):
+        raise SourceError(f"{config_path}: [tool] must be a table")
+    uv = data if standalone else tool.get("uv", {})
+    if not isinstance(uv, dict):
+        raise SourceError(f"{config_path}: {setting_table} must be a table")
+
+    for key in ("no-build", "no-binary"):
+        if not isinstance(uv.get(key, False), bool):
+            raise SourceError(f"{config_path}: {setting_table} {key} must be a boolean")
+
+    selected: dict[str, set[str]] = {}
+    for key in ("no-build-package", "no-binary-package"):
+        values = uv.get(key, [])
+        if not isinstance(values, list) or not all(isinstance(name, str) for name in values):
+            raise SourceError(f"{config_path}: {setting_table} {key} must be a list of strings")
+        if any(not _NAME_RE.fullmatch(name) for name in values):
+            raise SourceError(f"{config_path}: {setting_table} {key} must contain valid package names")
+        selected[key] = {canonicalize_name(name) for name in values}
+
+    for pkg in source.packages:
+        if pkg.skip:  # uv may build first-party/editable dependencies; wheelgap skips these.
+            continue
+        restrictions = []
+        if uv.get("no-build"):
+            pkg.only_binary = True
+            restrictions.append(f"{setting_table} no-build")
+        elif pkg.key in selected["no-build-package"]:
+            pkg.only_binary = True
+            restrictions.append(f"{setting_table} no-build-package")
+        if uv.get("no-binary"):
+            pkg.no_binary = True
+            restrictions.append(f"{setting_table} no-binary")
+        elif pkg.key in selected["no-binary-package"]:
+            pkg.no_binary = True
+            restrictions.append(f"{setting_table} no-binary-package")
+        pkg.install_policy = ", ".join(restrictions) or None
 
 
 def parse_uv_lock(path: Path) -> Source:
@@ -328,11 +445,12 @@ def parse_uv_lock(path: Path) -> Source:
         # (directory = "libs/x") is reached through its dependents' edges and their markers instead.
         if (kind in ("editable", "virtual") and src.get(kind) == ".") or pkg.key in members:
             source.roots.append(i)
+    _uv_build_restrictions(path, source)
     for name, group in manifest_groups.items():
         for d in group:
             source.root_groups[len(source.root_edges)] = name
-            source.root_edges.append(_uv_edge(path, "the manifest", d))
-    source.root_edges.extend(_uv_edge(path, "the manifest", d) for d in manifest.get("requirements", []))
+            source.root_edges.append(_uv_manifest_edge(path, d))
+    source.root_edges.extend(_uv_manifest_edge(path, d) for d in manifest.get("requirements", []))
     if not source.roots and not source.root_edges:
         source.edges = None  # no idea where the graph starts; treat every package as needed
     if isinstance(data.get("requires-python"), str):
@@ -1047,8 +1165,7 @@ def _nearby_config_names_an_index(path: Path) -> bool:
 
 
 def parse_pyproject(path: Path) -> Source:
-    """A library's direct dependencies: [project] dependencies, read as requirement lines. Their own
-    dependencies aren't known without a lockfile, so they aren't checked."""
+    """Read a library's [project] dependencies as requirement lines."""
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as e:
@@ -1107,6 +1224,7 @@ def parse_pyproject(path: Path) -> Source:
         pkg = requirement_to_package(line, path.name)
         if pkg.key != source.pyproject_name:
             source.packages.append(pkg)
+            source.specs.append(line)
             continue
         # `myproject[extra]` in its own dependencies: installing the project installs that extra too.
         self_extras.extend(_self_reference_extras(source, line, Requirement(line)))
@@ -1168,6 +1286,8 @@ def _add_extras(source: Source, wanted: list[str]) -> None:
                 wanted.extend(_self_reference_extras(source, line, req))
                 continue
             pkg = requirement_to_package(line, source.label)
+            if line not in source.specs:
+                source.specs.append(line)
             if pkg not in source.packages:  # also in another extra or in dependencies: one row
                 source.packages.append(pkg)
 
@@ -1193,6 +1313,7 @@ _COMMENT_RE = re.compile(r"\s#")
 _FULL_LINE_COMMENT_RE = re.compile(r"^\s*#")
 _INCLUDE_RE = re.compile(r"^(?:-r|--requirement)(?:\s+|=)?(\S.*)$")
 _CONSTRAINT_RE = re.compile(r"^(?:-c(?:\s+|=)?|--constraint(?:\s+|=))(\S.*)$")
+_VIA_COMMENT_RE = re.compile(r"^#\s*via\b")
 
 
 # pip options that point at an index or a folder of distributions other than PyPI's (or turn PyPI off).
@@ -1328,10 +1449,22 @@ def parse_requirements(path: Path) -> Source:
     seen: dict[bool, set[Path]] = {False: set(), True: set()}  # requirement files, constraint files
     index_options: list[str] = []
     format_control = _FormatControl()
-    pkgs = _read_requirements(path, seen, constraints, index_options=index_options, format_control=format_control)
+    req_lines: list[str] = []
+    compiler_signs: list[str] = []
+    pkgs = _read_requirements(
+        path,
+        seen,
+        constraints,
+        index_options=index_options,
+        format_control=format_control,
+        req_lines=req_lines,
+        compiler_signs=compiler_signs,
+    )
     by_name: dict[str, list[Package]] = {}
     for entry in constraints:
         by_name.setdefault(entry.key, []).append(entry)
+    constraint_specs: dict[str, set[str]] = {}
+    constraint_errors: dict[str, str] = {}
     for pkg in pkgs:
         if pkg.skip or pkg.version or not (entries := by_name.get(pkg.key)):
             continue
@@ -1349,11 +1482,36 @@ def parse_requirements(path: Path) -> Source:
             for entry in entries:
                 spec &= SpecifierSet(entry.spec or "")
             pkg.spec = str(spec) or None
+        if pkg.error:
+            constraint_errors[pkg.key] = pkg.error
+    # A constraint on a package the file doesn't require only ever counts as a transitive dep's specifier,
+    # which --deps sees; a constraint the file already called out as broken is left to constraint_errors.
+    deps_blockers: list[str] = []
+    for entry in constraints:
+        # pip applies these only on some targets, or installs from elsewhere; --deps can't follow that yet.
+        if entry.markers:
+            deps_blockers.append(f"the constraint on {entry.name} has a marker")
+        elif entry.skip:
+            deps_blockers.append(f"the constraint on {entry.name} isn't an index release ({entry.skip})")
+        if entry.markers or entry.skip or entry.key in constraint_errors:
+            continue
+        # A bare name constrains nothing; a version or range does.
+        if specifier := f"=={entry.version}" if entry.version else entry.spec:
+            constraint_specs.setdefault(entry.key, set()).add(specifier)
     for pkg in pkgs:
         if not pkg.skip:
             pkg.no_binary, pkg.only_binary = format_control.policy(pkg.key)
     return Source(
-        path.name, pkgs, requirements=True, pypi_only=not index_options and not _nearby_config_names_an_index(path)
+        path.name,
+        pkgs,
+        requirements=True,
+        pypi_only=not index_options and not _nearby_config_names_an_index(path),
+        specs=req_lines,
+        compiled="hash" in compiler_signs,  # hash mode makes pip refuse anything unpinned: the file is complete
+        constraint_specs=constraint_specs,
+        constraint_errors=constraint_errors,
+        format_control=format_control,
+        deps_blockers=deps_blockers + [f"{key}: {error}" for key, error in constraint_errors.items()],
     )
 
 
@@ -1364,10 +1522,14 @@ def _read_requirements(
     constraint: bool = False,
     index_options: list[str] | None = None,
     format_control: _FormatControl | None = None,
+    req_lines: list[str] | None = None,
+    compiler_signs: list[str] | None = None,
     stack: dict[bool, set[Path]] | None = None,
 ) -> list[Package]:
     """`index_options` collects the lines that may point pip at another index: index options (--index-url,
-    --extra-index-url, --find-links, --no-index), includes that aren't read, and abbreviated include options."""
+    --extra-index-url, --find-links, --no-index), includes that aren't read, and abbreviated include options.
+    `req_lines` collects requirement lines that aren't constraints, for --deps; `compiler_signs` notes the
+    `--hash` options and `# via` comments that mark pip-compile output."""
     path = path.resolve()
     if stack is None:
         stack = {False: set(), True: set()}
@@ -1382,6 +1544,8 @@ def _read_requirements(
         # utf-8-sig: a byte order mark (Windows editors) mustn't hide an option on the first line.
         lines = _join_continued_lines(path.read_text(encoding="utf-8-sig"))
         for raw in lines:
+            if compiler_signs is not None and _VIA_COMMENT_RE.match(raw.lstrip()):
+                compiler_signs.append("via")  # pip-compile writes "# via <name>" comment lines
             line = _COMMENT_RE.split(raw, 1)[0].strip()  # " # note" or "<TAB># note"
             if not line or line.startswith("#"):
                 continue
@@ -1397,7 +1561,7 @@ def _read_requirements(
                 # Unread, it may name an index, so the input isn't PyPI-only.
                 if "://" not in target and "${" not in target:
                     _read_requirements(
-                        path.parent / target, seen, constraints, True, index_options, format_control, stack
+                        path.parent / target, seen, constraints, True, index_options, format_control, stack=stack
                     )
                 elif not already_seen and index_options is not None:
                     index_options.append(line)
@@ -1411,6 +1575,8 @@ def _read_requirements(
                         constraint,
                         index_options,
                         format_control,
+                        req_lines,
+                        compiler_signs,
                         stack,
                     )
                 )
@@ -1427,6 +1593,8 @@ def _read_requirements(
             if already_seen:
                 continue
             tokens = line.split()
+            if compiler_signs is not None and any(t == "--hash" or t.startswith("--hash=") for t in tokens):
+                compiler_signs.append("hash")
             # Drop --hash=sha256:... and "--hash sha256:..." (option and value as two tokens).
             line = " ".join(
                 t for k, t in enumerate(tokens) if not t.startswith("--hash") and (k == 0 or tokens[k - 1] != "--hash")
@@ -1442,6 +1610,8 @@ def _read_requirements(
                 append(Package(name, None, skip="url", origin=path.name))
                 continue
             append(requirement_to_package(line, path.name))
+            if req_lines is not None and not constraint:
+                req_lines.append(line)
     finally:
         stack[constraint].remove(path)
     return pkgs
@@ -1930,6 +2100,40 @@ def _has_project_table(pyproject: Path) -> bool:
         return False
 
 
+def parse_dist(path: Path) -> Source:
+    """`--dist DIR`: the wheels and sdist of one release about to be uploaded (`python -m build`, `uv build`).
+    Name and version come from the filenames; a folder that mixes projects or versions is refused."""
+    from .check import SDIST_SUFFIXES  # sources.py is imported by check.py
+
+    try:
+        filenames = sorted(entry.name for entry in path.iterdir())
+    except OSError as e:
+        raise SourceError(f"--dist: {path}: {e.strerror or e}") from e
+    files: list[str] = []
+    names: dict[str, str] = {}
+    versions: set[Version] = set()
+    for filename in filenames:
+        try:
+            if filename.endswith(".whl"):
+                name, version, *_ = parse_wheel_filename(filename)
+            elif filename.endswith(SDIST_SUFFIXES):
+                name, version = parse_sdist_filename(filename)
+            else:
+                continue
+        except (InvalidWheelFilename, InvalidSdistFilename, InvalidVersion):
+            continue  # not a distribution filename: left out, as pip's own upload would
+        names.setdefault(str(canonicalize_name(name)), str(name))
+        versions.add(version)
+        files.append(filename)
+    if not files:
+        raise SourceError(f"--dist: {path}: no wheels or sdists")
+    if len(names) > 1 or len(versions) > 1:
+        raise SourceError(f"--dist: {path}: files for more than one project or version; build into an empty dist/")
+    display = next(iter(names.values()))
+    pkg = Package(display, str(next(iter(versions))), files=files, origin=path.name)
+    return Source(path.name, [pkg])
+
+
 def load_inputs(inputs: list[str], environment: str | None = None) -> list[Source]:
     """Each input is a file, a directory (lockfile auto-detected) or a requirement like 'numpy==2.3.4'.
     `environment` picks the pixi.lock environment; with no pixi.lock input it's an error."""
@@ -1949,6 +2153,7 @@ def load_inputs(inputs: list[str], environment: str | None = None) -> list[Sourc
             raise SourceError(f"{item}: no such file")
         else:
             adhoc.packages.append(requirement_to_package(item, "command line"))
+            adhoc.specs.append(item)
     if adhoc.packages:
         sources.append(adhoc)
     if environment is not None and not any(s.kind == "pixi" for s in sources):

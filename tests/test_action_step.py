@@ -46,9 +46,17 @@ env | grep -q {TOKEN} && echo pipx >> "$LEAK_FILE"
 [ -n "${{PIPX_INJECT:-}}" ] && printf '::error::pwned\\nnote ##[warning]x\\r::add-mask::y\\n' >&2
 shift 4  # run --spec PATH wheelgap
 exec "$PYTHON_REAL" -c '
+import os
 import sys
 from wheelgap import pypi
-def offline(*args, **kwargs):
+def offline(url, *args, **kwargs):
+    with open(os.environ["PYPI_LOG"], "a", encoding="utf-8") as log:
+        print(url, file=log)
+    if os.environ.get("STUB_RELEASES") and url == "https://pypi.org/pypi/armlib/json":
+        return {{"releases": {{"1.6.0": [
+            {{"filename": "armlib-1.6.0-cp313-cp313-musllinux_1_2_aarch64.whl"}},
+            {{"filename": "armlib-1.6.0-cp313-cp313-manylinux_2_17_x86_64.whl"}},
+        ]}}}}
     raise AssertionError("network")
 pypi.fetch_json = offline
 from wheelgap.cli import main
@@ -131,6 +139,7 @@ def run(origin, tmp_path):
             "PYTHON_REAL": sys.executable,
             "LEAK_FILE": str(out / "leaks"),
             "GH_LOG": str(out / "gh.log"),
+            "PYPI_LOG": str(out / "pypi.log"),
             "RUNNER_TEMP": str(out),
             "GITHUB_ACTION_PATH": str(ROOT),
             "GITHUB_OUTPUT": str(out / "output"),
@@ -165,6 +174,7 @@ def run(origin, tmp_path):
             "summary": read("summary"),
             "output": read("output"),
             "gh": read("gh.log").splitlines(),
+            "pypi": read("pypi.log").splitlines(),
             "hosts": set(read("gh.log.host").splitlines()),
             "body": json.loads(read("gh.log.body"))["body"] if read("gh.log.body") else None,
             "work": work,
@@ -196,6 +206,29 @@ def test_a_worse_pull_request_fails_and_gets_one_comment(run, origin):
     assert writes(r) == ["api -X POST repos/o/r/issues/7/comments"]
     assert r["body"].startswith(MARK + "\n") and r["body"].endswith(r["summary"])
     assert "::error::the response" not in r["log"]
+
+
+@pytest.mark.parametrize("previous", [False, True])
+def test_comment_suggests_a_newer_release_when_posting_or_updating(run, previous):
+    listing = json.dumps([mine(9, MARK + "\nOld body")]) if previous else "[]"
+    r = run(WHEELGAP_COMMENT="true", STUB_RELEASES="1", GH_COMMENTS=listing)
+    assert r["code"] == 1, r["log"]
+    assert r["pypi"] == ["https://pypi.org/pypi/armlib/json"]
+    suggestion = "armlib 1.5.0 -> 1.6.0 has wheels for musl-aarch64"
+    body = html.unescape(r["body"])
+    assert body.count(suggestion) == 1
+    assert body.index("<code>armlib</code>") < body.index(suggestion) < body.index("<code>nativeext</code>")
+    assert suggestion not in html.unescape(r["summary"])
+    assert writes(r) == [
+        "api -X PATCH repos/o/r/issues/comments/9" if previous else "api -X POST repos/o/r/issues/7/comments"
+    ]
+
+
+def test_summary_only_does_not_request_suggestions(run):
+    r = run(STUB_RELEASES="1", _WHEELGAP_ACTION_SUGGEST="1")
+    assert r["code"] == 1, r["log"]
+    assert r["pypi"] == []
+    assert r["body"] is None
 
 
 def test_the_shallow_checkout_fetches_the_base(run, origin):

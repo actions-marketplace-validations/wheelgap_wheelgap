@@ -622,3 +622,22 @@ def test_diff_git_ref_brings_the_pyproject_along(fake_pypi, tmp_path, monkeypatc
     monkeypatch.chdir(tmp_path)
     assert main(["HEAD:poetry.lock", "poetry.lock", *TARGET]) == 0
     assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]
+
+
+@needs_git
+def test_diff_git_ref_brings_uv_toml_along(fake_pypi, tmp_path, monkeypatch, capsys):
+    # uv.toml's no-build makes an sdist-only package missing on both sides; left behind, the old side would say
+    # source and the new one missing, which isn't a change.
+    git("init", "-q", cwd=tmp_path)
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\nrequires-python = ">=3.11"\n\n[[package]]\nname = "puresdist"\nversion = "1.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.pythonhosted.org/packages/puresdist-1.0.tar.gz", hash = "sha256:00" }\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "uv.toml").write_text("no-build = true\n", encoding="utf-8")
+    git("add", "uv.lock", "uv.toml", cwd=tmp_path)
+    git("commit", "-q", "-m", "lock", cwd=tmp_path)
+    monkeypatch.chdir(tmp_path)
+    assert main(["HEAD:uv.lock", "uv.lock", *TARGET]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]

@@ -178,6 +178,12 @@ built on (bullseye for 3.10 and 3.11, bookworm for 3.12 and 3.13, trixie for 3.1
 (`3.16-rc-slim`) keeps the `--glibc` default, and one older than 3.10 is an error. Pin `-bookworm` or `-trixie` for an
 answer that doesn't move. A Dockerfile wheelgap can't read the way Docker does is an error, not a guess.
 
+A global `ARG` used in the final stage's `FROM` (`ARG PYTHON_VERSION=3.12` then `FROM python:${PYTHON_VERSION}-slim`)
+is read from its default, with a note. **After 0.11.0**, when the build picks the value
+(`docker build --build-arg PYTHON_VERSION=3.13 .`), pass the same [`--build-arg`](cli.md#build-arg): it replaces the
+default, and gives a value to an ARG with none, so the platform needn't be spelled out again with `-t`. The note says
+which values came from `--build-arg` and which were defaults.
+
 ## Suggest targets from your CI and Dockerfiles {#suggest-targets}
 
 `wheelgap --suggest-targets [DIR]` (default: the current directory) reads the platforms and Pythons the project already
@@ -226,6 +232,18 @@ The snippet combines every job in every workflow, including lint, release and bo
     - setup-python's `freethreaded: true`, which adds the `t` (free-threading starts at 3.13, so `3.12t` is refused).
     - setup-python's `architecture`, where it's certain: `x86` on x64 Windows is `win32`, and `x64` on Apple silicon is
       `macos-x86_64` (Rosetta). It can come from a literal matrix, which pairs each runner with its own architecture.
+    - A job's `container:`, as a literal image string or a mapping (block or `{ image: ... }`) with only an `image:`
+      key. The image is read exactly as `--dockerfile` reads a `FROM`, so `container: python:3.13-alpine` on
+      `ubuntu-latest` suggests `musl-x86_64` and Python 3.13 (and `musl = "1.2"`) rather than the runner's target.
+      Actions pulls the image for the runner's CPU without forcing a platform, so the same image on
+      `ubuntu-24.04-arm` suggests `musl-aarch64` instead; a runner label that can't be resolved (a matrix, an
+      expression or an unknown label), a non-Linux runner (job containers only run on Linux), or a Windows container
+      image isn't guessed. A step that picks the job's Python (`setup-python`, or `setup-uv` with a
+      `python-version`) installs it into the image, so that Python is suggested instead of the image's own and the
+      image's libc still applies. `setup-python` has no musl builds, so in an Alpine image it's refused, and so is
+      `ubuntu-slim`, which runs in a container itself. Expressions, an `options:` that may
+      change the platform, `services:` (at the job level beside `container:`), and any other container shape are
+      listed under "Couldn't read".
     - Input names are case-insensitive, as Actions reads them (`Architecture: x86`). Step keys such as `uses` and `with`
       aren't.
 - **Runner labels.** [GitHub-hosted runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
@@ -237,6 +255,10 @@ The snippet combines every job in every workflow, including lint, release and bo
     - `windows-11-arm` → `win-arm64`.
     - `macos-latest`, `macos-14` and later, `xcode-*` and the `-xlarge` runners → `macos-arm64`.
     - `macos-13`, `macos-15-intel` and the `-large` runners → `macos-x86_64`.
+- **Container images**. A job's literal `container:` image names its own libc and Python, read as a Dockerfile's
+  `FROM` is, so the runner's target isn't read for that job; its CPU is, since Actions pulls the image's build for
+  that CPU (an ARM runner gets `musl-aarch64` from `python:3.13-alpine`). A setup step that picks a Python installs it
+  into the image, so the image's libc applies to that Python, which is the job's instead of the image's own.
 - **Runner versions.** A pinned label also names its glibc (`ubuntu-22.04` has 2.35, `ubuntu-24.04` 2.39) or its macOS
   version (`macos-14` is 14.0). A `-latest` label moves, so it names neither. `ubuntu-26.04` names none yet: GitHub's
   runner-images readme doesn't give its glibc.
@@ -285,7 +307,8 @@ and never guessed:
 - a job with a setup step whose `uses` can't be read, which sets an input twice, or which picks the Python under an
   `if:` (the step may not run);
 - self-hosted and other unknown runner labels;
-- a job that runs in a `container:`;
+- a `container:` that isn't a single literal image (an expression, an `options:` that may change the platform, or a
+  mapping with any other key), or a job-level `services:` beside it;
 - an unquoted `3.10` (YAML reads it as the number 3.1) or `0x10`;
 - `python-version-file`;
 - Dockerfile templates (`Dockerfile.j2`, `Dockerfile.template`), files or folders it can't open, and Dockerfiles

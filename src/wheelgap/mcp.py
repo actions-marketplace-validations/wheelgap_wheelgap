@@ -46,9 +46,11 @@ from contextvars import ContextVar
 from pathlib import Path, PurePath
 from typing import Any, BinaryIO
 
+from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
-from . import __version__, pypi
+from . import __version__, origin, pypi
+from . import suggest as release_suggest
 from .api import Result, check_package, make_targets, running_python
 from .check import EXPLAIN_LIMIT, Status
 from .dockerfile import DockerfileError, read_dockerfile
@@ -164,7 +166,15 @@ TOOLS: list[dict[str, Any]] = [
             "target's status, the targets with a gap, ok (true only if every target installs without building) and "
             "the libc and macOS versions assumed. With explain: true, also says why: rejected lists, for each "
             f"source or missing target, up to {EXPLAIN_LIMIT} wheels it can't use and the reason for each, closest "
-            "misses first (rejected_omitted counts any more), as wheelgap --json --explain does. " + _STATUS_HELP
+            "misses first (rejected_omitted counts any more), as wheelgap --json --explain does. With gaps, "
+            "last_with_wheel maps each gap target no newer release has a wheel for to the newest older release that "
+            "has one (a version to pin to), as --explain --suggest --json does; it's absent when nothing was looked "
+            "up. With dependencies: true, also checks everything the package installs, resolved for each target "
+            "from PyPI's metadata as wheelgap --deps does: dependency_gaps lists each other package in the tree with "
+            "a gap, with its results, gaps and via (the path from this package to it on each gap target), "
+            "dependencies_checked counts the other packages checked, and ok is true only if nothing in the tree has "
+            "a gap. A tree that can't be settled without a backtracking resolver is an error, as on the command "
+            "line. " + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -183,6 +193,11 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "boolean",
                     "description": "Also return rejected (and via, always empty for one package): why each source "
                     "or missing target can't use the published wheels. Default: false.",
+                },
+                "dependencies": {
+                    "type": "boolean",
+                    "description": "Also check everything the package installs (its dependency tree, resolved from "
+                    "PyPI for each target, as --deps does) and return dependency_gaps. Default: false.",
                 },
             },
             "required": ["name"],
@@ -219,6 +234,10 @@ TOOLS: list[dict[str, Any]] = [
                     "path is looked for in the client's roots if it shares them, else in the server's working "
                     "directory).",
                 },
+                "environment": {
+                    "type": "string",
+                    "description": "The pixi.lock environment to check. Default: default. Only for pixi.lock inputs.",
+                },
                 "python": _PYTHON_PROP
                 | {
                     "description": _PYTHON_PROP["description"] + " Default: [tool.wheelgap] python, then "
@@ -246,8 +265,9 @@ TOOLS: list[dict[str, Any]] = [
             "--dockerfile DOCKERFILE --json` does: the image's Python, platform (from FROM --platform, default "
             "linux/amd64) and glibc or musl version (python:3.13-alpine means musl) set the target. Use it before "
             "changing a FROM line, e.g. from -slim to -alpine or to --platform=linux/arm64. Returns what "
-            "check_lockfile returns, plus 'image': the python, platform, glibc and musl wheelgap read from the "
-            "Dockerfile. A Dockerfile wheelgap can't read the way Docker does is a tool error saying what to pass "
+            "check_lockfile returns, plus 'image': the python, platform, glibc, musl and build_args wheelgap read "
+            "from the Dockerfile (build_args maps the global ARGs used by FROM to their values). A Dockerfile "
+            "wheelgap can't read the way Docker does is a tool error saying what to pass "
             "instead. " + _STATUS_HELP
         ),
         "inputSchema": {
@@ -262,6 +282,12 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "Absolute path or file:// URI of the lockfile or project directory. Default: the "
                     "Dockerfile's folder.",
+                },
+                "build_args": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "The build's `--build-arg` values, e.g. {'PYTHON_VERSION': '3.13'}: each replaces "
+                    "the default of the global ARG it names, as in docker build.",
                 },
                 "targets": _TARGETS_PROP
                 | {
@@ -382,13 +408,33 @@ def _lock_spec(args: dict[str, Any]) -> str:
     return str(Path(spec).expanduser())
 
 
+def _last_with_wheel(result: Result) -> dict[str, str] | None:
+    """By gap target no newer release has a wheel for, the newest older release with one, as --suggest finds it
+    (`last_with_wheel` in --explain --suggest --json). None when nothing was looked up: no gap, no version, another
+    index (which may hold private names, so --suggest looks nothing up there either) or a failed lookup."""
+    if not result.version or not result.gaps or origin.other_index() is not None:
+        return None
+    keep = [t for t, s in result.statuses.items() if s is Status.WHEEL]
+    key = canonicalize_name(result.name)
+    found, _ = release_suggest.look_up_all({key: [(result.version, result.gaps, keep)]})
+    if key not in found:
+        return None
+    return {t.label(True): v for t, v in found[key][0].last.items()}
+
+
+def _flag(args: dict[str, Any], key: str) -> bool:
+    value = args.get(key)
+    if value is None:  # absent or null: like the other optional arguments
+        return False
+    if not isinstance(value, bool):
+        raise ToolError(f"'{key}' must be true or false")
+    return value
+
+
 def _check_package(args: dict[str, Any]) -> dict[str, Any]:
     _check_keys("check_package", args)
-    explain = args.get("explain")
-    if explain is None:  # absent or null: like the other optional arguments
-        explain = False
-    if not isinstance(explain, bool):
-        raise ToolError("'explain' must be true or false")
+    explain = _flag(args, "explain")
+    dependencies = _flag(args, "dependencies")
     name = (_string(args, "name", required=True) or "").strip()
     if not _NAME_RE.fullmatch(name):
         raise ToolError(f"{name!r} isn't a package name: pass the name alone, and an exact version as 'version'")
@@ -410,9 +456,22 @@ def _check_package(args: dict[str, Any]) -> dict[str, Any]:
         raise ToolError(f"{lock_spec}: {e}" if isinstance(e, UnicodeDecodeError) else str(e)) from e
     except OSError as e:  # a lock path that can't be read
         raise ToolError(f"{lock_spec}: {e.strerror or e}") from e
+    tree: list[Result] = []
     try:
-        result: Result = check_package(name, version, targets, pyodide_locks=locks)
-    except PyodideLockError as e:  # a lock for a Python no pyodide target uses
+        if dependencies:
+            tree = check_package(name, version, targets, pyodide_locks=locks, deps=True)
+            key = canonicalize_name(name)
+            asked = [r for r in tree if canonicalize_name(r.name) == key]
+            if not asked:
+                raise ToolError(f"{name}: the resolved tree doesn't include the package asked about")
+            # One Result per release picked; with several Pythons the package can resolve to more than one, and
+            # none of those is its own dependency.
+            result = asked[0]
+            tree = [r for r in tree if canonicalize_name(r.name) != key]
+        else:
+            result = check_package(name, version, targets, pyodide_locks=locks)
+            asked = [result]
+    except (PyodideLockError, SourceError) as e:  # a lock for a Python no pyodide target uses; an unsettled tree
         raise ToolError(str(e)) from e
     out: dict[str, Any] = result.to_dict(explain=explain)
     if explain:  # as many wheels per cell as --explain's text shows, so a reply stays small
@@ -422,9 +481,33 @@ def _check_package(args: dict[str, Any]) -> dict[str, Any]:
             if len(wheels) > EXPLAIN_LIMIT
         }
         out["rejected"] = {label: wheels[:EXPLAIN_LIMIT] for label, wheels in out["rejected"].items()}
-    out["ok"] = result.ok
-    out["gaps"] = [t.label(True) for t in result.gaps]
+    # With several Pythons the package can resolve to a release per Python: its rows together are its answer.
+    statuses: dict[Any, Status] = {}
+    for r in asked:
+        for t, s in r.statuses.items():
+            if s is not Status.NOT_NEEDED or t not in statuses:
+                statuses[t] = s
+    if len(asked) > 1:
+        out["results"] = {t.label(True): s.value for t, s in statuses.items()}
+        out["versions"] = sorted({r.version for r in asked if r.version})
+    out["ok"] = all(r.ok for r in asked) and all(r.ok for r in tree)
+    out["gaps"] = list(dict.fromkeys(t.label(True) for r in asked for t in r.gaps))
+    if dependencies:
+        out["dependencies_checked"] = len(tree)
+        out["dependency_gaps"] = [
+            {
+                "name": r.name,
+                "version": r.version,
+                "results": {t.label(True): s.value for t, s in r.statuses.items()},
+                "gaps": [t.label(True) for t in r.gaps],
+                "via": {t.label(True): list(path) for t, path in r.via.items()},
+            }
+            for r in tree
+            if not r.ok
+        ]
     out["targets"] = [t.label(True) for t in targets]
+    if (last := _last_with_wheel(result)) is not None:
+        out["last_with_wheel"] = last
     out["assumes"] = {
         "glibc": versions.get("glibc", DEFAULT_GLIBC),
         "musl": versions.get("musl", DEFAULT_MUSL),
@@ -440,9 +523,12 @@ def _check_lockfile(args: dict[str, Any]) -> dict[str, Any]:
     offline = args.get("offline")
     if offline is not None and not isinstance(offline, bool):
         raise ToolError("'offline' must be true or false")
+    environment = _string(args, "environment")
     path = _existing(raw)
     # --name=value forms, and -- before the path, so no value can be read as another option.
     argv = ["--json"]
+    if environment is not None:
+        argv.append(f"--environment={environment}")
     argv += [f"--python={p}" for p in _pythons(args)]
     argv += [f"--target={p}" for p in _platforms(args)]
     argv += [f"--{key}={value}" for key, value in _versions(args).items()]
@@ -461,14 +547,21 @@ def _check_dockerfile(args: dict[str, Any]) -> dict[str, Any]:
         raise ToolError(f"{args['dockerfile']}: is a directory (pass the Dockerfile itself)")
     raw = (_string(args, "path") or "").strip()
     path = _existing(raw) if raw else dockerfile.parent
+    build_args = args.get("build_args") or {}
+    if not isinstance(build_args, dict) or not all(isinstance(v, str) for v in build_args.values()):
+        raise ToolError("'build_args' must be an object of strings")
+    # As on the command line: an ARG name, so NAME=VALUE can't be split differently than it was read.
+    if bad := [k for k in build_args if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k, re.ASCII)]:
+        raise ToolError(f"'build_args' has a key that isn't an ARG name: {bad[0]!r}")
     try:
-        image = read_dockerfile(dockerfile)
+        image = read_dockerfile(dockerfile, build_args)
     except DockerfileError as e:  # wheelgap's message; its CLI advice, where it gives some, translated
         message = str(e).replace("pass -p/-t instead", "use check_lockfile with python and targets instead")
         raise ToolError(message) from e
     except OSError as e:  # a Dockerfile that can't be read
         raise ToolError(f"{args['dockerfile']}: {e.strerror or e}") from e
     argv = ["--json", f"--dockerfile={dockerfile}"]
+    argv += [f"--build-arg={name}={value}" for name, value in build_args.items()]
     argv += [f"--target={p}" for p in _platforms(args)]
     try:
         out = _run_cli(argv, path)
@@ -476,7 +569,23 @@ def _check_dockerfile(args: dict[str, Any]) -> dict[str, Any]:
         if raw or "no lockfile found" not in str(e):
             raise
         raise ToolError(f"{e} (pass 'path': the lockfile or project directory)") from e
-    out["image"] = {"python": image.python, "platform": image.platform, "glibc": image.glibc, "musl": image.musl}
+    out["image"] = {
+        "python": image.python,
+        "platform": image.platform,
+        "glibc": image.glibc,
+        "musl": image.musl,
+        "build_args": dict(image.build_args),
+    }
+    # The CLI flags cannot be passed to check_dockerfile: give the corresponding MCP tool advice instead.
+    out["notes"] = [
+        note.replace(
+            "pass --build-arg if the build sets one",
+            "pass build_args if the build sets --build-arg",
+        )
+        if "FROM uses the default of ARG " in note
+        else note
+        for note in out["notes"]
+    ]
     return out
 
 
@@ -515,7 +624,7 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
         try:
             # As in `wheelgap diff`: no offline mode, so a lock made for other Pythons is re-checked on the index
             # rather than compared on files it may be missing (which could cancel out and pass on a guess).
-            results, source = check_with_source(path, targets, online=False, offline=False)
+            results, source, _ = check_with_source(path, targets, online=False, offline=False)
         except OSError as e:  # a lockfile that can't be read
             raise ToolError(f"{path}: {e.strerror or e}") from e
         except SourceError:

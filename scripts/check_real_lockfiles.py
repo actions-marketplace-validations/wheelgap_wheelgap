@@ -22,7 +22,12 @@ What it finds falls in three kinds:
     (`marker` and `markers`, `wheels` and `wheel`), so a renamed key shows up here.
   - Poetry's lock-version says the lock has a dependency graph (before 2.1) and wheelgap didn't use it, or the
     other way round.
-  - Far fewer wheels per package than in the pinned copy.
+  - A uv.lock, or a Poetry lock before 2.1, with several packages and no dependency graph read (its root not found,
+    say, or `[package.dependencies]` renamed).
+  - A top-level requires-python (uv.lock, pylock.toml) other than the one wheelgap read.
+  - Against the pinned copy, far fewer wheels, sdists, dependency edges or markers per package, a far smaller share
+    of `n/a` cells, or no requires-python where the copy has one. A key renamed to a name the raw counts don't know
+    loses these without changing a count.
   - A package is `n/a` on every target (CPython 3.8 to the newest, on every `-t all` platform) and nothing on its
     way in has a marker: its markers or the dependency graph were misread.
   - A package is `unknown` on some target.
@@ -31,8 +36,10 @@ What it finds falls in three kinds:
   - A format version the tests don't cover yet (KNOWN_FORMATS).
   - A package wheelgap skips for a reason other than being a local project (a git or URL dependency, say), or one
     with an empty list of files.
-- **warning** (doesn't fail): a package is `n/a` on every target, but only through markers, e.g. on
-  `implementation_name == 'pypy'` or an old Python: probably right, but worth a look.
+- **warning** (doesn't fail):
+  - A package is `n/a` on every target, but only through markers, e.g. on `implementation_name == 'pypy'` or an
+    old Python: probably right, but worth a look.
+  - The live poetry.lock has moved to a format with no dependency graph while its pinned copy has one.
 
 Each lockfile gets a line, `ok`, `warn` or `FAIL`, with its format version, and each finding is printed under it.
 Text from the lockfile is printed with repr() and without backticks, so it can't start a line or close the job
@@ -62,7 +69,7 @@ from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel
 from packaging.version import InvalidVersion, Version
 
 import wheelgap
-from wheelgap.check import SDIST_SUFFIXES, Status, check
+from wheelgap.check import SDIST_SUFFIXES, Status, _uv_source_matches, check
 from wheelgap.sources import Edge, Package, Source, load_file
 
 CORPUS = Path(__file__).parents[1] / "tests" / "fixtures" / "real"
@@ -83,8 +90,13 @@ KNOWN_FORMATS: dict[str, dict[str, set]] = {
 }
 MARKER_KEYS = ("marker", "markers")
 WHEEL_KEYS = ("wheels", "wheel")
-# A live file with fewer than this share of the pinned copy's wheels per package has lost its wheels.
-WHEEL_DROP = 0.5
+# A live file with less than this share of the pinned copy's wheels (or sdists, edges, markers) per package, or of
+# its share of `n/a` cells, has lost them.
+DROP = 0.5
+# Graphs (uv.lock, Poetry before 2.1) with at least this many packages to check should have some dependency edges.
+GRAPH_MIN = 2
+EDGES = "dependency edges per package"
+NA_SHARE = "of cells n/a"  # the one _profile entry that is a share, printed as a percentage
 MAX_BYTES = 5_000_000
 ATTEMPTS = 3
 
@@ -266,11 +278,16 @@ def _gated(source: Source, i: int, seen: frozenset[int] = frozenset()) -> bool:
     ways_in: list[tuple[int | None, str | None]] = [
         (None, m) for n, _, m, _ in source.root_edges if canonicalize_name(n) == pkg.key
     ]
+    uv = source.uv_packages
     for parent, edges in source.edges.items():
-        for n, v, m, _ in edges:
+        for n, v, m, s in edges:
             # uv pins the version on an edge only where a name has several; Poetry's is a constraint, not a pin.
-            if canonicalize_name(n) == pkg.key and (v is None or v == pkg.version or source.kind == "poetry"):
-                ways_in.append((parent, m))
+            if canonicalize_name(n) != pkg.key or not (v is None or v == pkg.version or source.kind == "poetry"):
+                continue
+            # uv also names the source where one name and version come from several indexes, as check.py matches.
+            if s is not None and uv is not None and not _uv_source_matches(uv[i], s):
+                continue
+            ways_in.append((parent, m))
     return bool(ways_in) and all(
         m or (p is not None and p not in seen and _gated(source, p, seen | {i})) for p, m in ways_in
     )
@@ -288,7 +305,7 @@ def _marker_problem(marker: object, where: str) -> str | None:
 
 def inspect(path: Path, pinned: Path | None = None) -> Report:
     """Read one lockfile as wheelgap does, and report what wheelgap would get wrong. With `pinned` (a copy of the same
-    project's lockfile that reads cleanly), also compare its wheels per package with that copy's."""
+    project's lockfile that reads cleanly), also compare what it read per package with that copy (_profile)."""
     report = Report()
     try:
         source = load_file(path)
@@ -310,6 +327,7 @@ def inspect(path: Path, pinned: Path | None = None) -> Report:
     for name, _version, marker, _source in _edges(source):
         if problem := _marker_problem(marker, f"dependency on {safe(name)}"):
             report.add(MISREAD, problem)
+    graph = kind == "uv"  # whether wheelgap should have walked a dependency graph
     if kind == "poetry":
         lock_version = str(_dict(_dict(data).get("metadata")).get("lock-version", "2.1"))
         graph = tuple(int(x) for x in lock_version.split(".") if x.isdigit()) < (2, 1)
@@ -322,6 +340,16 @@ def inspect(path: Path, pinned: Path | None = None) -> Report:
     for what, raw, read in _counts(kind, data, source):
         if raw != read:
             report.add(MISREAD, f"the file has {raw} {what}, but wheelgap read {read}")
+    checked = [p for p in source.packages if not p.skip]
+    if graph and len(checked) >= GRAPH_MIN and not _edges(source):
+        report.add(MISREAD, f"{len(checked)} packages, but wheelgap read no dependency graph")
+    if kind in ("uv", "pylock"):
+        raw_requires = _dict(data).get("requires-python")
+        if raw_requires != source.requires_python:
+            report.add(
+                MISREAD,
+                f"the file's requires-python is {safe(raw_requires)}, but wheelgap read {safe(source.requires_python)}",
+            )
     for pkg in source.packages:
         label = f"{safe(pkg.name)} {safe(pkg.version)}"
         if pkg.skip:
@@ -356,11 +384,25 @@ def inspect(path: Path, pinned: Path | None = None) -> Report:
                     report.add(MISREAD, f"{label}: wheel name {safe(f)} doesn't parse")
             elif not f.endswith(SDIST_SUFFIXES):
                 report.add(MISREAD, f"{label}: {safe(f)} is neither a wheel nor an sdist")
-    if pinned is not None and kind in RECORDS_FILES:
-        live, before = _wheel_rate(source), _wheel_rate(load_file(pinned))
-        if before and live < WHEEL_DROP * before:
-            report.add(MISREAD, f"{live:.1f} wheels per package, down from {before:.1f} in the pinned copy")
-    for row in check([source], TARGETS):
+    rows = check([source], TARGETS)
+    if pinned is not None:
+        copy = load_file(pinned)
+        before = _profile(copy, check([copy], TARGETS))
+        for what, live in _profile(source, rows).items():
+            if what == EDGES and not graph:
+                continue  # a format with no graph (Poetry 2.1 and later), so no edges to lose
+            if before[what] and live < DROP * before[what]:
+                shown = (f"{v:.0%}" if what == NA_SHARE else f"{v:.1f}" for v in (live, before[what]))
+                report.add(MISREAD, f"{next(shown)} {what}, down from {next(shown)} in the pinned copy")
+        if kind == "poetry" and not graph and copy.edges is not None:
+            report.add(
+                WARNING,
+                f"{report.format}, with no dependency graph: refreshing the pinned copy would lose the corpus's "
+                "Poetry 1.x lock (pick another project for it)",
+            )
+        if copy.requires_python and not source.requires_python:
+            report.add(MISREAD, f"no requires-python read, but the pinned copy has {safe(copy.requires_python)}")
+    for row in rows:
         label = f"{safe(row.package.name)} {safe(row.package.version)}"
         if not row.needed:
             i = next(j for j, p in enumerate(source.packages) if p is row.package)
@@ -373,9 +415,20 @@ def inspect(path: Path, pinned: Path | None = None) -> Report:
     return report
 
 
-def _wheel_rate(source: Source) -> float:
+def _profile(source: Source, rows: list) -> dict[str, float]:
+    """What a lockfile read, per package checked, for comparing a live file with its pinned copy."""
     pkgs = [p for p in source.packages if not p.skip]
-    return sum(f.endswith(".whl") for f in _files(pkgs)) / len(pkgs) if pkgs else 0.0
+    files = _files(pkgs)
+    edges = _edges(source)
+    cells = [s for row in rows for s in row.results.values()]
+    n = len(pkgs) or 1
+    return {
+        "wheels per package": sum(f.endswith(".whl") for f in files) / n,
+        "sdists per package": sum(not f.endswith(".whl") for f in files) / n,
+        EDGES: len(edges) / n,
+        "markers per package": (sum(p.markers is not None for p in pkgs) + sum(bool(e[2]) for e in edges)) / n,
+        NA_SHARE: sum(s is Status.NOT_NEEDED for s in cells) / (len(cells) or 1),
+    }
 
 
 class Gone(Exception):

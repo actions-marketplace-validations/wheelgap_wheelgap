@@ -10,9 +10,12 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import FAKE_INDEX
 
+from wheelgap import suggest
 from wheelgap.check import CELL
 from wheelgap.diff import main as diff_main
+from wheelgap.pypi import DEFAULT_INDEX
 
 ROOT = Path(__file__).parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "actioncompare"
@@ -78,6 +81,75 @@ def test_fixtures_report_the_dropped_platform_and_the_new_gap(fake_pypi, capsys)
         "<td><code>musl-aarch64</code></td><td>(new) → ● source</td></tr>",
         "</table>",
     ]
+
+
+@pytest.mark.parametrize(
+    ("release", "suggestion"),
+    [
+        ("1.6.0", "armlib 1.5.0 -> 1.6.0 has wheels for musl-aarch64"),
+        ("1.4.0", "armlib 1.5.0: no newer release has a wheel for musl-aarch64; the last one that did is 1.4.0"),
+        (None, None),  # 404 leaves the affected package's entry alone.
+    ],
+)
+def test_comment_suggests_only_worsened_packages(monkeypatch, fake_pypi, capsys, release, suggestion):
+    monkeypatch.setenv("_WHEELGAP_ACTION_SUGGEST", "1")
+    if release:
+        monkeypatch.setitem(
+            FAKE_INDEX,
+            "armlib",
+            {
+                release: [
+                    f"armlib-{release}-cp313-cp313-musllinux_1_2_aarch64.whl",
+                    f"armlib-{release}-cp313-cp313-manylinux_2_17_x86_64.whl",
+                ],
+            },
+        )
+        if release == "1.6.0":  # 1.5.1 restores musl but drops the glibc wheel.
+            monkeypatch.setitem(FAKE_INDEX["armlib"], "1.5.1", ["armlib-1.5.1-cp313-cp313-musllinux_1_2_aarch64.whl"])
+    old, new = [str(FIXTURES / side / "uv.lock") for side in ("base", "head")]
+    assert diff_main([old, new, *ARGS, "--json"]) == 1
+    assert fake_pypi == [f"{DEFAULT_INDEX}/armlib/json"]
+    data = json.loads(capsys.readouterr().out)
+    assert data["worse"][0].get("suggestions") == ([suggestion] if suggestion else None)
+    assert data["new"][0].get("suggestions") is None
+
+
+def test_comment_suggestions_keep_names_from_private_base_local(monkeypatch, fake_pypi, capsys, tmp_path):
+    monkeypatch.setenv("_WHEELGAP_ACTION_SUGGEST", "1")
+    old = tmp_path / "uv.lock"
+    base = (FIXTURES / "base" / "uv.lock").read_text(encoding="utf-8")
+    old.write_text(
+        base.replace("https://pypi.org/simple", "https://private.example.invalid/simple", 1),
+        encoding="utf-8",
+    )
+    assert diff_main([str(old), str(FIXTURES / "head" / "uv.lock"), *ARGS, "--json"]) == 1
+    assert fake_pypi == []
+    data = json.loads(capsys.readouterr().out)
+    assert data["worse"][0]["name"] == "armlib"
+    assert "suggestions" not in data["worse"][0]
+
+
+def test_an_unexpected_lookup_failure_keeps_the_diff_result(monkeypatch, fake_pypi, capsys):
+    def fail(*args, **kwargs):
+        raise RuntimeError("lookup failed")
+
+    monkeypatch.setenv("_WHEELGAP_ACTION_SUGGEST", "1")
+    monkeypatch.setattr(suggest, "look_up_all", fail)
+    old, new = [str(FIXTURES / side / "uv.lock") for side in ("base", "head")]
+    assert diff_main([old, new, *ARGS, "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    assert data["worse"][0]["name"] == "armlib"
+    assert "suggestions" not in data["worse"][0]
+
+
+def test_optional_suggestions_never_displace_comparison_rows():
+    worse = worse_entry()
+    worse["suggestions"] = ["a" * 900]
+    data = diff_report(worse=[worse], new=[new_entry()])
+    args = (data, "", "uv.lock", "main")
+    assert ac.report(*args, budget=650, suggestions=True) == ac.report(*args, budget=650)
+    assert "<code>nativeext</code>" in ac.report(*args, budget=650, suggestions=True)
+    assert worse["suggestions"][0] in ac.report(*args, suggestions=True)
 
 
 def test_nothing_worse(fake_pypi, capsys):

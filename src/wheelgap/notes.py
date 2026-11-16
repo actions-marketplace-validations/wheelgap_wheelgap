@@ -5,6 +5,10 @@ publishes them in each package's file, https://wheelgap.github.io/tracker/data/p
 https://github.com/wheelgap/tracker/blob/main/notes/README.md). They come from a public repository, so they're
 untrusted: a note that isn't exactly in the published format is dropped whole, never shown in part.
 
+The same file has the tracker's build lab results (`builds`): whether a release with no wheel for a target built from
+its sdist on a GitHub runner, and whether it then imported. They're read just as strictly (see Build), apart from the
+notes, so a malformed one never hides a note, nor a malformed note a result.
+
 Looking a package up sends its name to wheelgap.github.io, so the CLI only asks for packages that are positively PyPI's
 (see may_send), only with --notes (or notes = true), and never with --offline, --index-url or a WHEELGAP_INDEX_URL
 mirror (origin.other_index). The lookups are
@@ -21,6 +25,7 @@ import re
 import threading
 import time
 import urllib.error
+from collections import Counter
 from collections.abc import Collection
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -69,6 +74,48 @@ _NAME = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*", re.ASCII)
 _COMMAND = re.compile(r"(?<![\w:])::")
 _PYTHON = re.compile(r"^3\.\d+t?$", re.ASCII)
 _KEYS = frozenset({"platforms", "kind", "text", "links", "versions", "updated"})
+# The build lab's results, as scripts/build_lab.py in https://github.com/wheelgap/tracker writes and checks them.
+BUILD_KEYS = frozenset(
+    {
+        *("target", "version", "outcome", "seconds", "wheel", "extensions", "import", "gil", "reason", "excerpt"),
+        *("toolchains", "runner", "python", "date"),
+    }
+)
+OUTCOMES = frozenset({"built", "failed", "timeout"})
+IMPORTS = frozenset({"ok", "failed", "deps-failed"})
+GIL = frozenset({"kept-off", "re-enabled"})
+REASONS = frozenset(
+    {
+        *("needs OpenSSL", "needs a Rust toolchain", "needs a C/C++ compiler", "needs CMake", "needs a system library"),
+        *("build dependency failed", "unsupported platform", "compile error", "other"),
+    }
+)
+TOOLCHAINS = frozenset({"rustc", "cargo", "gcc", "cl", "cmake"})
+MAX_BUILDS = 40  # per package; any more are dropped
+MAX_EXCERPT = 400  # characters
+MAX_SECONDS = 2 * 60 * 60  # the lab stops a build at 40 minutes; a little room in case that grows
+MAX_EXTENSIONS = 10_000
+_BUILD_TARGET = re.compile(r"(3\.[0-9]{1,2}t?) ([a-z0-9_-]+)", re.ASCII)
+_BUILD_VERSION = re.compile(r"[0-9][0-9A-Za-z.+!_-]{0,39}", re.ASCII)
+_BUILD_PYTHON = re.compile(r"3\.[0-9]{1,2}\.[0-9]{1,3}t?", re.ASCII)
+_WHEEL_TAG = re.compile(r"[a-z0-9_.]{1,40}-[a-z0-9_.]{1,40}-[a-z0-9_.]{1,80}", re.ASCII)
+# For each platform the lab can build on: the wheel platform tags a build for it can have (pure Python wheels are
+# checked apart), and the runner family and CPU that can run it. A result whose wheel or runner is for another
+# platform is dropped, as the tracker's own merge check drops it.
+_LAB_PLATFORMS: dict[str, tuple[re.Pattern[str], re.Pattern[str]]] = {
+    "linux-x86_64": (re.compile(r"(?:many)?linux[_0-9]*_x86_64"), re.compile(r"ubuntu-(?!.*arm)[a-z0-9.-]+")),
+    "linux-aarch64": (re.compile(r"(?:many)?linux[_0-9]*_aarch64"), re.compile(r"ubuntu-[a-z0-9.-]*arm[a-z0-9.-]*")),
+    "musl-x86_64": (re.compile(r"(?:musl)?linux[_0-9]*_x86_64"), re.compile(r"ubuntu-(?!.*arm)[a-z0-9.-]+")),
+    "musl-aarch64": (re.compile(r"(?:musl)?linux[_0-9]*_aarch64"), re.compile(r"ubuntu-[a-z0-9.-]*arm[a-z0-9.-]*")),
+    "win-amd64": (re.compile(r"win_amd64"), re.compile(r"windows-(?!.*arm)[a-z0-9.-]+")),
+    "win-arm64": (re.compile(r"win_arm64"), re.compile(r"windows-[a-z0-9.-]*arm[a-z0-9.-]*")),
+    "macos-arm64": (re.compile(r"macosx_[0-9_]+_(?:arm64|universal2)"), re.compile(r"macos-[a-z0-9.-]+")),
+    "macos-x86_64": (
+        re.compile(r"macosx_[0-9_]+_(?:x86_64|universal2)"),
+        re.compile(r"macos-[a-z0-9.-]+-intel|macos-1[0-3][a-z0-9.-]*"),
+    ),
+}
+_RUNNER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?", re.ASCII)
 
 
 @dataclass(frozen=True)
@@ -113,6 +160,166 @@ class Note:
         if self.python is not None:
             out["python"] = list(self.python)
         return out
+
+
+def _minutes(seconds: int) -> str:
+    # Half a minute rounds up, as JavaScript's Math.round does on the tracker site, so both say the same.
+    return f"{seconds} s" if seconds < 90 else f"{(seconds + 30) // 60} min"
+
+
+@dataclass(frozen=True)
+class Build:
+    """One build lab result: the tracker built `version` from its sdist for `target` (a tracker label, such as
+    "3.14t win-arm64") on GitHub's `runner`, then installed and imported it. A dated observation on that runner, not
+    a promise about another machine."""
+
+    target: str
+    version: str
+    outcome: str  # built, failed or timeout
+    seconds: int
+    wheel: str | None  # the built wheel's tag, only when built
+    extensions: int | None  # compiled extension modules in it, only when built
+    imported: str | None  # ok, failed or deps-failed, only when built
+    gil: str | None  # kept-off or re-enabled: a free-threaded build with an extension module that imported
+    reason: str | None  # why it failed (REASONS), only when failed
+    excerpt: str
+    toolchains: tuple[str, ...]
+    runner: str
+    python: str  # the full version it built with, such as 3.14.2t
+    date: str  # YYYY-MM-DD
+
+    def covers(self, target: Target, version: str | None) -> bool:
+        """Whether this is a result for exactly this target and release: one for another release says nothing about
+        the checked one."""
+        return version is not None and self.version == version and self.target == f"{target.python} {target.platform}"
+
+    def verdict(self) -> str:
+        """What the result means, in the tracker site's words. A wheel with no extension module is never a compiled
+        build that works."""
+        took = _minutes(self.seconds)
+        if self.outcome == "timeout":
+            return f"didn't finish building in {took}"
+        if self.outcome == "failed":
+            if self.reason == "unsupported platform":
+                return "the package doesn't support this platform (its own build says so)"
+            return "fails to build" if self.reason == "other" else f"fails to build: {self.reason}"
+        if self.imported == "deps-failed":
+            return f"builds in {took}, but its dependencies don't install"
+        if self.imported != "ok":
+            return f"builds in {took}, but doesn't import"
+        if self.extensions == 0:
+            if self.wheel is not None and self.wheel.endswith("-none-any"):
+                # The lab can't tell a pure-Python package from an optional extension that was skipped.
+                return (
+                    f"builds in {took} as pure Python, with no compiled extension module "
+                    "(if it has an optional one, that was skipped)"
+                )
+            return f"builds in {took}, but with no compiled extension module"
+        if self.gil == "re-enabled":
+            return f"builds in {took}, but importing it turns the GIL back on"
+        return f"builds from source in {took} and imports" + (", GIL stays off" if self.gil == "kept-off" else "")
+
+    def as_json(self) -> dict:
+        return {
+            "target": self.target,
+            "version": self.version,
+            "outcome": self.outcome,
+            "seconds": self.seconds,
+            "wheel": self.wheel,
+            "extensions": self.extensions,
+            "import": self.imported,
+            "gil": self.gil,
+            "reason": self.reason,
+            "excerpt": self.excerpt,
+            "toolchains": list(self.toolchains),
+            "runner": self.runner,
+            "python": self.python,
+            "date": self.date,
+        }
+
+
+def _int(value: object, top: int) -> bool:
+    return type(value) is int and 0 <= value <= top  # not a bool
+
+
+def _build(raw: object) -> Build | None:
+    """A published build lab result, or None if it isn't exactly in the format (build_lab.py's merge check, read
+    again here: the file comes from a public repository)."""
+    if not isinstance(raw, dict) or set(raw) != BUILD_KEYS:
+        return None
+    target, version, outcome, seconds = raw["target"], raw["version"], raw["outcome"], raw["seconds"]
+    wheel, extensions, imported, gil, reason = raw["wheel"], raw["extensions"], raw["import"], raw["gil"], raw["reason"]
+    excerpt, toolchains, runner, python = raw["excerpt"], raw["toolchains"], raw["runner"], raw["python"]
+    if not isinstance(target, str) or not (m := _BUILD_TARGET.fullmatch(target)):
+        return None
+    target_python, platform = m.groups()
+    if platform not in PLATFORMS or platform == "pyodide":  # the lab only builds where an installer can
+        return None
+    if not isinstance(version, str) or not _BUILD_VERSION.fullmatch(version) or not _date(raw["date"]):
+        return None
+    if not isinstance(python, str) or not _BUILD_PYTHON.fullmatch(python):
+        return None
+    if python.endswith("t") != target_python.endswith("t") or not python.startswith(target_python.rstrip("t") + "."):
+        return None  # built with another Python than the target's
+    if not isinstance(runner, str) or not _RUNNER.fullmatch(runner) or platform not in _LAB_PLATFORMS:
+        return None
+    wheel_platform, runner_family = _LAB_PLATFORMS[platform]
+    if not runner_family.fullmatch(runner):
+        return None  # a runner that can't build for this platform
+    if not isinstance(outcome, str) or outcome not in OUTCOMES or not _int(seconds, MAX_SECONDS):
+        return None
+    if outcome == "built":
+        if not isinstance(wheel, str) or not _WHEEL_TAG.fullmatch(wheel):
+            return None
+        if not (wheel.endswith("-none-any") or wheel_platform.fullmatch(wheel.split("-", 2)[2])):
+            return None  # a wheel for another platform says nothing about this one
+        if not _int(extensions, MAX_EXTENSIONS) or (extensions and wheel.endswith("-any")):
+            return None
+        if not isinstance(imported, str) or imported not in IMPORTS:
+            return None
+    elif wheel is not None or extensions is not None or imported is not None:
+        return None
+    # The GIL is checked exactly when a free-threaded build with an extension module imported.
+    checked = outcome == "built" and imported == "ok" and target_python.endswith("t") and bool(extensions)
+    if (gil is not None) != checked or (gil is not None and not (isinstance(gil, str) and gil in GIL)):
+        return None
+    if (reason is not None) != (outcome == "failed") or (
+        reason is not None and not (isinstance(reason, str) and reason in REASONS)
+    ):
+        return None
+    if not isinstance(excerpt, str) or len(excerpt) > MAX_EXCERPT or not all(32 <= ord(c) < 127 for c in excerpt):
+        return None
+    # Compile errors are full of C++ and Rust's "::" (std::vector), so only the legacy "##[" form is refused here:
+    # the excerpt is never printed in the text or Markdown output, and in --json it's inside a JSON string.
+    if "##[" in excerpt:
+        return None
+    if not isinstance(toolchains, list) or not all(isinstance(t, str) and t in TOOLCHAINS for t in toolchains):
+        return None
+    if len(set(toolchains)) != len(toolchains):
+        return None
+    return Build(
+        target,
+        version,
+        outcome,
+        seconds,
+        wheel,
+        extensions,
+        imported,
+        gil,
+        reason,
+        excerpt,
+        tuple(toolchains),
+        runner,
+        python,
+        raw["date"],
+    )
+
+
+def _builds(raw: list) -> list[Build]:
+    """The well-formed results, at most one per target: when a target has two, neither is kept."""
+    found = [b for b in map(_build, raw[:MAX_BUILDS]) if b is not None]
+    count = Counter(b.target for b in found)
+    return [b for b in found if count[b.target] == 1]
 
 
 def _line(value: object) -> bool:
@@ -188,6 +395,19 @@ def parse(data: object, name: str) -> list[Note] | None:
     return [n for n in map(_note, raw[:MAX_NOTES]) if n is not None]
 
 
+def parse_builds(data: object, name: str) -> list[Build] | None:
+    """The build lab results in a package file, or None if the file isn't one for `name` in a schema this version
+    reads. Read apart from parse(), so a malformed `builds` never hides the notes, nor the other way round."""
+    if not isinstance(data, dict) or type(data.get("schema")) is not int or data["schema"] != SCHEMA:
+        return None
+    if data.get("name") != name:
+        return None
+    raw = data.get("builds", [])  # files published before the build lab have none
+    if not isinstance(raw, list):
+        return None
+    return _builds(raw)
+
+
 def may_send(pkg: Package, source: Source, private: Collection[str] = frozenset()) -> bool:
     """Whether the package's name may go to the tracker: origin.known_pypi (the rule --conda-forge uses too), with
     one narrowing. known_pypi trusts a pypi.org registry from any lock, but notes take it only from uv.lock and
@@ -213,22 +433,27 @@ def _timed_out(e: BaseException) -> bool:
 
 def lookup(
     names: list[str], read_cache: bool = True, write_cache: bool = True
-) -> tuple[dict[str, list[Note]], str | None]:
-    """Each name's notes, keyed by name, for the names that could be looked up (a 404 is no notes); and why the
-    lookups were cut short, if they were: TIMED_OUT (the deadline, or a request's timeout) or UNREACHABLE (no
-    connection: DNS, TLS, refused). Nothing here raises: a lookup that fails just leaves its name out."""
+) -> tuple[dict[str, list[Note]], dict[str, list[Build]], str | None]:
+    """Each name's notes and build lab results, keyed by name, for the names that could be looked up (a 404 is
+    none); and why the lookups were cut short, if they were: TIMED_OUT (the deadline, or a request's timeout) or
+    UNREACHABLE (no connection: DNS, TLS, refused). Nothing here raises: a lookup that fails just leaves its name
+    out."""
     found: dict[str, list[Note]] = {}
+    built: dict[str, list[Build]] = {}
     todo = []
     for name in dict.fromkeys(names):
         if not _NAME.fullmatch(name):
             continue
         cached = cache.load_notes(TRACKER, name) if read_cache else None
-        if cached is not None:
+        cached_builds = cache.load_lab(TRACKER, name) if read_cache else None
+        # Both, or it's asked again: an entry saved before the build lab has notes only.
+        if cached is not None and cached_builds is not None:
             found[name] = [n for n in map(_note, cached[:MAX_NOTES]) if n is not None]  # checked again
+            built[name] = _builds(cached_builds)  # checked again
         else:
             todo.append(name)
     if not todo:
-        return found, None
+        return found, built, None
 
     work: queue.SimpleQueue[str] = queue.SimpleQueue()
     for name in todo:
@@ -273,5 +498,10 @@ def lookup(
             found[name] = notes
             if write_cache:
                 cache.save_notes(TRACKER, name, [n.as_json() for n in notes])
+        builds = parse_builds(data, name)
+        if builds is not None:
+            built[name] = builds
+            if write_cache:
+                cache.save_lab(TRACKER, name, [b.as_json() for b in builds])
     stop.set()
-    return found, cut
+    return found, built, cut

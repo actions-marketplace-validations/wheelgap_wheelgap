@@ -232,6 +232,104 @@ def test_base_stage_global_arg_default_is_used(tmp_path):
     assert image.build_args == (("PY", "3.12"),)
 
 
+@pytest.mark.parametrize(
+    ("dockerfile", "build_args", "python"),
+    [
+        ("ARG PY=3.12\nFROM python:${PY}-slim\n", {"PY": "3.13"}, "3.13"),  # replaces the default
+        ("ARG PY\nFROM python:${PY}-slim\n", {"PY": "3.14"}, "3.14"),  # fills an ARG with none
+        ("ARG PY=3.12\nFROM python:${PY}-slim\n", {}, "3.12"),
+    ],
+)
+def test_build_arg_sets_the_global_arg(tmp_path, dockerfile, build_args, python):
+    path = tmp_path / "Dockerfile"
+    path.write_text(dockerfile, encoding="utf-8")
+    image = read_dockerfile(path, build_args)
+    assert image == ImageTarget(python, "linux-x86_64", glibc="2.41")
+    assert image.build_args == (("PY", python),)
+    assert image.given_args == frozenset(build_args)
+
+
+def test_build_arg_no_global_arg_declares_is_ignored(tmp_path):
+    # Docker uses a --build-arg in FROM only for an ARG declared before the first FROM.
+    path = tmp_path / "Dockerfile"
+    path.write_text("FROM python:3.13-slim\nARG PY=3.12\n", encoding="utf-8")
+    image = read_dockerfile(path, {"PY": "3.11"})
+    assert image == ImageTarget("3.13", "linux-x86_64", glibc="2.41")
+    assert image.undeclared_args == ("PY",)
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [
+        ("3.1$X", r"--build-arg PY=3\.1\$X: values with quotes, escapes or \$ aren't supported"),
+        ('"3.13"', '--build-arg PY="3.13": values with quotes'),
+        ("", "--build-arg PY is empty"),
+    ],
+)
+def test_build_arg_values_follow_the_rules_for_defaults(tmp_path, value, error):
+    path = tmp_path / "Dockerfile"
+    path.write_text("ARG PY=3.12\nFROM python:${PY}-slim\n", encoding="utf-8")
+    with pytest.raises(DockerfileError, match=error):
+        read_dockerfile(path, {"PY": value})
+
+
+def test_cli_build_arg_picks_the_image_and_says_where_values_came_from(tmp_path, capsys, fake_pypi):
+    path = tmp_path / "Dockerfile"
+    path.write_text("ARG PY=3.12\nARG DISTRO=slim\nFROM python:${PY}-${DISTRO}\n", encoding="utf-8")
+    main(["purewheel", "--dockerfile", str(path), "--build-arg", "PY=3.13", "--build-arg", "NOPE=1", "--json"])
+    captured = capsys.readouterr()
+    assert [(t["python"], t["platform"]) for t in json.loads(captured.out)["targets"]] == [("3.13", "linux-x86_64")]
+    assert f"wheelgap: note: {path}: FROM uses --build-arg PY=3.13\n" in captured.err
+    assert f"{path}: FROM uses the default of ARG DISTRO=slim; pass --build-arg if the build sets one" in captured.err
+    assert "no ARG NOPE before the first FROM" in captured.err
+
+
+@pytest.mark.parametrize(
+    ("argv", "error"),
+    [
+        (["--build-arg", "PY=3.13"], "--build-arg only sets the ARGs of --dockerfile"),
+        (["--dockerfile", "Dockerfile", "--build-arg", "PY"], "--build-arg PY: expected NAME=VALUE"),
+        (["--dockerfile", "Dockerfile", "--build-arg", "1PY=3"], "--build-arg 1PY=3: expected NAME=VALUE"),
+    ],
+)
+def test_cli_build_arg_usage_errors(capsys, argv, error):
+    with pytest.raises(SystemExit) as exc:
+        main(["purewheel", *argv])
+    assert exc.value.code == 2
+    assert error in capsys.readouterr().err
+
+
+AUTOMATIC = [
+    "BUILDPLATFORM", "BUILDOS", "BUILDOSVERSION", "BUILDARCH", "BUILDVARIANT",
+    "TARGETPLATFORM", "TARGETOS", "TARGETOSVERSION", "TARGETARCH", "TARGETVARIANT", "TARGETSTAGE",
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("name", AUTOMATIC)
+def test_automatic_platform_arg_with_a_default_uses_the_default(tmp_path, name):
+    # BuildKit sets these from the platforms, then a global ARG's default replaces its value (#332).
+    path = tmp_path / "Dockerfile"
+    path.write_text(f"ARG {name}=3.12\nFROM python:${{{name}}}-slim\n", encoding="utf-8")
+    image = read_dockerfile(path)
+    assert image == ImageTarget("3.12", "linux-x86_64", glibc="2.41")
+    assert image.build_args == ((name, "3.12"),)
+
+
+def test_automatic_targetarch_default_picks_the_platform(tmp_path):
+    path = tmp_path / "Dockerfile"
+    path.write_text("ARG TARGETARCH=arm64\nFROM --platform=linux/${TARGETARCH} python:3.13-slim\n", encoding="utf-8")
+    assert read_dockerfile(path) == ImageTarget("3.13", "linux-aarch64", glibc="2.41")
+
+
+@pytest.mark.parametrize("name", AUTOMATIC)
+def test_automatic_platform_arg_without_a_default_is_set_by_the_build(tmp_path, name):
+    # With no default, the ARG keeps the value BuildKit set for the build, which wheelgap can't know.
+    path = tmp_path / "Dockerfile"
+    path.write_text(f"ARG {name}\nFROM --platform=${name} python:3.13\n", encoding="utf-8")
+    with pytest.raises(DockerfileError, match=f": ARG {name} has no default: {name} is set by the build, pass -p/-t"):
+        read_dockerfile(path)
+
+
 def test_read_dockerfile_expands_a_global_arg_default_in_platform(tmp_path):
     path = tmp_path / "Dockerfile"
     path.write_text("ARG ARCH=linux/arm64\nFROM --platform=${ARCH} python:3.13-alpine AS runtime\n", encoding="utf-8")
@@ -903,3 +1001,11 @@ def test_dockerfile_that_is_not_utf8_is_a_clear_error(tmp_path):
     path.write_bytes(b"FROM --platform=linux/arm64\xa0python:3.13\n")  # cp1252: Docker would read 0xa0 as a space
     with pytest.raises(DockerfileError, match="not UTF-8 \\(byte 0xa0 at offset 27\\), pass -p/-t instead"):
         read_dockerfile(path)
+
+
+def test_a_build_arg_doesnt_make_a_non_ascii_arg_readable(tmp_path):
+    # Docker splits ARG on any Unicode space: this line declares A and B, so a value for A can't settle B.
+    path = tmp_path / "Dockerfile"
+    path.write_text("ARG B=3.12\nARG A=1\u00a0B=3.13\nFROM python:${B}-slim\n", encoding="utf-8")
+    with pytest.raises(DockerfileError, match="non-ASCII characters in an ARG aren't supported"):
+        read_dockerfile(path, {"A": "3"})

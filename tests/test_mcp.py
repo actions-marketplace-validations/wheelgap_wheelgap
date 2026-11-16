@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from conftest import FAKE_INDEX
+from test_deps import index  # noqa: F401  (the fake PyPI --deps resolves against)
 
 from wheelgap import __version__, mcp
 
@@ -110,7 +111,42 @@ def test_check_package(fake_pypi):
     assert data["gaps"] == ["3.13 linux-aarch64"]
     assert data["version"] == "311"
     assert data["assumes"] == {"glibc": "2.36", "musl": "1.2", "macos": "14.0"}
-    assert fake_pypi == ["https://pypi.org/pypi/winonly/json"]
+    assert data["last_with_wheel"] == {}
+    # The second request reads the older releases for last_with_wheel, as --suggest does.
+    assert fake_pypi == ["https://pypi.org/pypi/winonly/json"] * 2
+
+
+WHEELSTOPPED = {
+    "1.0": ["wheelstopped-1.0-cp313-cp313-win_arm64.whl", "wheelstopped-1.0.tar.gz"],
+    "1.1": ["wheelstopped-1.1-cp313-cp313-win_arm64.whl", "wheelstopped-1.1.tar.gz"],
+    "1.2": ["wheelstopped-1.2.tar.gz"],
+    "2.0": ["wheelstopped-2.0.tar.gz"],
+}
+
+
+def test_check_package_names_the_last_older_release_with_a_wheel(fake_pypi, monkeypatch):
+    # As --explain --suggest --json does: by gap target no newer release has a wheel for, the newest older one with one.
+    monkeypatch.setitem(FAKE_INDEX, "wheelstopped", WHEELSTOPPED)
+    targets = ["win-arm64", "linux-riscv64"]
+    (_, reply) = run(init(), call("check_package", name="wheelstopped", python="3.13", targets=targets))
+    data = reply["result"]["structuredContent"]
+    assert data["version"] == "2.0"
+    assert data["gaps"] == ["3.13 win-arm64", "3.13 linux-riscv64"]
+    assert data["last_with_wheel"] == {"3.13 win-arm64": "1.1"}
+
+
+def test_check_package_looks_up_older_releases_only_for_gaps_on_pypi(fake_pypi, monkeypatch):
+    monkeypatch.setitem(FAKE_INDEX, "wheelstopped", WHEELSTOPPED)
+    (_, reply) = run(init(), call("check_package", name="purewheel", python="3.13", targets=["linux-x86_64"]))
+    assert "last_with_wheel" not in reply["result"]["structuredContent"]  # no gap, so nothing to look up
+    assert fake_pypi == ["https://pypi.org/pypi/purewheel/json"]
+    # Another index may hold private names next to PyPI's, so --suggest's rule applies: nothing is looked up.
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://mirror.example/pypi")
+    fake_pypi.clear()
+    (_, reply) = run(init(), call("check_package", name="wheelstopped", python="3.13", targets=["win-arm64"]))
+    assert reply["result"]["structuredContent"]["gaps"] == ["3.13 win-arm64"]
+    assert "last_with_wheel" not in reply["result"]["structuredContent"]
+    assert fake_pypi == ["https://mirror.example/pypi/wheelstopped/json"]
 
 
 def test_check_package_pin_respects_requires_python_per_target(fake_pypi):
@@ -175,7 +211,7 @@ def test_check_package_without_explain_has_no_explain_keys(fake_pypi, extra):
     (_, reply) = run(init(), call("check_package", name="nowheels", python="3.13", targets=["linux-x86_64"], **extra))
     data = reply["result"]["structuredContent"]
     assert data["results"] == {"3.13 linux-x86_64": "source"}
-    assert set(data) == {"name", "version", "error", "results", "ok", "gaps", "targets", "assumes"}
+    assert set(data) == {"name", "version", "error", "results", "ok", "gaps", "targets", "assumes", "last_with_wheel"}
 
 
 def test_check_package_explain_caps_rejected_wheels(fake_pypi, monkeypatch):
@@ -198,6 +234,49 @@ def test_check_package_explain_caps_rejected_wheels(fake_pypi, monkeypatch):
     )
     data = reply["result"]["structuredContent"]
     assert (data["rejected"], data["rejected_omitted"]) == ({"3.13 linux-x86_64": []}, {})  # an sdist only
+
+
+@pytest.mark.usefixtures("index")
+def test_check_package_dependencies_checks_the_tree():
+    # As --deps does: app needs lib[crypto], whose crypt has no Windows ARM wheel; winonly is only on Windows.
+    targets = ["win-arm64", "linux-x86_64"]
+    (_, reply) = run(init(), call("check_package", name="app", version="1.0", python="3.14", targets=targets))
+    data = reply["result"]["structuredContent"]
+    assert data["ok"] is True  # app itself has a wheel everywhere
+    assert "dependency_gaps" not in data and "dependencies_checked" not in data
+    (_, reply) = run(
+        init(), call("check_package", name="app", version="1.0", python="3.14", targets=targets, dependencies=True)
+    )
+    data = reply["result"]["structuredContent"]
+    assert (data["name"], data["gaps"]) == ("app", [])  # the top-level fields stay app's own
+    assert data["ok"] is False  # but ok covers the tree
+    assert data["dependencies_checked"] == 3  # lib, crypt and winonly
+    assert data["dependency_gaps"] == [
+        {
+            "name": "crypt",
+            "version": "1.0",
+            "results": {"3.14 win-arm64": "source", "3.14 linux-x86_64": "wheel"},
+            "gaps": ["3.14 win-arm64"],
+            "via": {"3.14 win-arm64": ["app", "lib", "crypt"]},
+        }
+    ]
+
+
+@pytest.mark.usefixtures("index")
+def test_check_package_dependencies_ok_when_the_tree_is_clean():
+    arguments = {"name": "plain", "version": "1.0", "python": "3.14", "targets": ["win-arm64"], "dependencies": True}
+    (_, reply) = run(init(), call("check_package", **arguments))
+    data = reply["result"]["structuredContent"]
+    assert (data["ok"], data["dependencies_checked"], data["dependency_gaps"]) == (True, 2, [])  # lib and winonly
+
+
+@pytest.mark.usefixtures("index")
+def test_check_package_dependencies_must_be_a_boolean():
+    (_, reply) = run(init(), call("check_package", name="x", python="3.14", targets=["win-arm64"], dependencies=None))
+    assert "error" not in reply and reply["result"].get("isError") is not True  # null is the default, false
+    (_, reply) = run(init(), call("check_package", name="x", python="3.14", targets=["win-arm64"], dependencies="yes"))
+    assert reply["result"]["isError"] is True
+    assert reply["result"]["content"][0]["text"].endswith("'dependencies' must be true or false")
 
 
 def test_structured_content_only_from_2025_06_18(fake_pypi):
@@ -261,6 +340,39 @@ def test_check_lockfile_lists_skipped_packages(fake_pypi, fixtures):
     )
     data = reply["result"]["structuredContent"]
     assert {s["name"]: s["reason"] for s in data["skipped"]} == {"demo": "editable", "gitdep": "git"}
+
+
+@pytest.mark.parametrize("environment", [None, "default", "test"])
+def test_check_lockfile_pixi_environment(fake_pypi, fixtures, environment):
+    args = {} if environment is None else {"environment": environment}
+    (_, reply) = run(
+        init(),
+        call("check_lockfile", path=str(fixtures / "pixiproj"), python="3.13", targets=["linux-x86_64"], **args),
+    )
+    assert reply["result"]["isError"] is False
+    data = reply["result"]["structuredContent"]
+    if environment == "test":
+        assert data["packages"] == 1
+        assert {g["name"]: g["results"] for g in data["gaps"]} == {"nowheels": {"3.13 linux-x86_64": "source"}}
+        assert fake_pypi == ["https://pypi.org/pypi/nowheels/0.9/json"]
+    else:
+        assert data["packages"] == 2 and data["gaps"] == []
+
+
+@pytest.mark.parametrize(
+    ("environment", "message"),
+    [
+        ("docs", "no environment 'docs' (it has: default, test)"),
+        ("", "--environment needs a name"),
+        (42, "'environment' must be a string"),
+        (["test"], "'environment' must be a string"),
+    ],
+)
+def test_check_lockfile_pixi_environment_errors(fake_pypi, fixtures, environment, message):
+    (_, reply) = run(init(), call("check_lockfile", path=str(fixtures / "pixiproj"), environment=environment))
+    assert reply["result"]["isError"] is True
+    assert message in reply["result"]["content"][0]["text"]
+    assert not fake_pypi
 
 
 def test_check_lockfile_uses_project_config_and_arguments_win(fake_pypi, fixtures):
@@ -423,11 +535,77 @@ def test_check_dockerfile_alpine_image_gives_musl_targets(fake_pypi, tmp_path, f
     dockerfile = dockerfile_project(tmp_path, fixtures, "FROM python:3.12 AS build\nFROM python:3.13-alpine\n")
     (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile)))
     data = reply["result"]["structuredContent"]
-    assert data["image"] == {"python": "3.13", "platform": "musl-x86_64", "glibc": None, "musl": "1.2"}
+    assert data["image"] == {
+        "python": "3.13",
+        "platform": "musl-x86_64",
+        "glibc": None,
+        "musl": "1.2",
+        "build_args": {},
+    }
     assert data["targets"] == ["3.13 musl-x86_64"]
     assert data["path"] == str(tmp_path.resolve())  # default: the Dockerfile's folder
     assert {g["name"] for g in data["gaps"]} >= {"nativeext", "puresdist"}
     assert {s["name"] for s in data["skipped"]} == {"demo", "gitdep"}
+
+
+@pytest.mark.parametrize(
+    ("dockerfile_text", "defaults", "expected_python"),
+    [
+        ("ARG PYTHON_VERSION=3.12\nFROM python:${PYTHON_VERSION}-slim\n", {"PYTHON_VERSION": "3.12"}, "3.12"),
+        (
+            "ARG PYTHON_VERSION=3.13\nARG DISTRO=alpine\nFROM python:${PYTHON_VERSION}-${DISTRO}\n",
+            {"PYTHON_VERSION": "3.13", "DISTRO": "alpine"},
+            "3.13",
+        ),
+    ],
+)
+def test_check_dockerfile_reports_used_arg_defaults(
+    fake_pypi, tmp_path, fixtures, dockerfile_text, defaults, expected_python
+):
+    dockerfile = dockerfile_project(tmp_path, fixtures, dockerfile_text)
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile)))
+    assert not reply["result"].get("isError")
+    data = reply["result"]["structuredContent"]
+    assert data["image"]["build_args"] == defaults
+    assert data["image"]["python"] == expected_python
+    assert all("-p/-t" not in note for note in data["notes"])
+    for name, value in defaults.items():
+        assert any(f"FROM uses the default of ARG {name}={value}" in note for note in data["notes"])
+    assert any("pass build_args if the build sets --build-arg" in note for note in data["notes"])
+
+
+def test_check_dockerfile_build_args_replace_the_defaults(fake_pypi, tmp_path, fixtures):
+    dockerfile = dockerfile_project(tmp_path, fixtures, "ARG PY=3.12\nARG DISTRO\nFROM python:${PY}-${DISTRO}\n")
+    build_args = {"PY": "3.13", "DISTRO": "alpine"}
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), build_args=build_args))
+    data = reply["result"]["structuredContent"]
+    assert data["image"]["build_args"] == build_args
+    assert data["image"]["platform"] == "musl-x86_64"
+    assert data["targets"] == ["3.13 musl-x86_64"]
+    assert all("-p/-t" not in note and "default of ARG" not in note for note in data["notes"])
+
+
+def test_check_dockerfile_build_args_must_be_strings(tmp_path, fixtures):
+    dockerfile = dockerfile_project(tmp_path, fixtures, "FROM python:3.13-slim\n")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), build_args={"PY": 3}))
+    assert reply["result"]["isError"]
+    assert "'build_args' must be an object of strings" in reply["result"]["content"][0]["text"]
+
+
+@pytest.mark.parametrize("key", ["PY=3", "", "1PY", "P Y"])
+def test_check_dockerfile_build_args_keys_must_be_arg_names(tmp_path, fixtures, key):
+    # A key with "=" would be split differently when it's passed on as --build-arg NAME=VALUE.
+    dockerfile = dockerfile_project(tmp_path, fixtures, "ARG PY=3.12\nFROM python:${PY}-slim\n")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), build_args={key: ".13"}))
+    assert reply["result"]["isError"]
+    assert "'build_args' has a key that isn't an ARG name" in reply["result"]["content"][0]["text"]
+
+
+def test_check_dockerfile_ignores_unused_arg_defaults(fake_pypi, tmp_path, fixtures):
+    dockerfile = dockerfile_project(tmp_path, fixtures, "ARG UNUSED=3.12\nFROM python:3.13-slim\n")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile)))
+    assert reply["result"]["structuredContent"]["image"]["build_args"] == {}
+    assert not any("FROM uses the default of ARG" in note for note in reply["result"]["structuredContent"]["notes"])
 
 
 def test_check_dockerfile_matches_the_cli(fake_pypi, tmp_path, fixtures, capsys):
@@ -1867,3 +2045,27 @@ def test_a_malformed_roots_capability_still_counts(declared, asks, tmp_path, mon
     message["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = {"roots": declared}
     (reply,) = run(message)
     assert (reply["result"]["resultType"] == "input_required") == asks
+
+
+@pytest.mark.usefixtures("index")
+def test_check_package_dependencies_counts_every_release_of_the_package_asked_about(monkeypatch):
+    # split resolves to 1.0 on 3.14 (a Windows ARM wheel) and to 2.0 on 3.15 (Linux only: a source build there).
+    import test_deps
+
+    monkeypatch.setitem(
+        test_deps.INDEX,
+        "split",
+        {
+            "1.0": test_deps.release(files=(test_deps.WIN_ARM,)),
+            "2.0": test_deps.release(files=(test_deps.LINUX,), requires_python=">=3.15"),
+        },
+    )
+    (_, reply) = run(
+        init(), call("check_package", name="split", python="3.14,3.15", targets=["win-arm64"], dependencies=True)
+    )
+    data = reply["result"]["structuredContent"]
+    assert data["ok"] is False
+    assert data["gaps"] == ["3.15 win-arm64"]
+    assert data["results"] == {"3.14 win-arm64": "wheel", "3.15 win-arm64": "source"}
+    assert data["versions"] == ["1.0", "2.0"]
+    assert data["dependencies_checked"] == 0

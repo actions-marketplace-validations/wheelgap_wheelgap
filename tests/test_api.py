@@ -1,7 +1,10 @@
 import json
 import re
+from dataclasses import asdict, fields, replace
+from inspect import signature
 
 import pytest
+from test_deps import LIN, WIN, index  # noqa: F401  # index: test_deps' fake JSON API, a fixture
 
 import wheelgap
 from wheelgap import Status
@@ -106,6 +109,14 @@ def test_check_packages_mixes_names_and_pins(fake_pypi):
     assert by_name["does-not-exist"].statuses[targets[0]] is Status.UNKNOWN
 
 
+def test_result_keeps_resolution_details_out_of_public_dataclass_interface():
+    assert "_resolutions" not in signature(wheelgap.Result).parameters
+    result = wheelgap.Result("x", "1.0")
+    assert "_resolutions" not in {f.name for f in fields(result)}
+    assert "_resolutions" not in asdict(result)
+    assert result.rejected == {} and result.reasons == {}
+
+
 @pytest.mark.parametrize("check_one", [False, True])
 def test_package_pin_respects_requires_python_per_target(fake_pypi, check_one):
     old, new = wheelgap.make_targets(python="3.9,3.13", platforms="linux-x86_64")
@@ -123,6 +134,8 @@ def test_package_pin_respects_requires_python_per_target(fake_pypi, check_one):
     assert result.to_dict(explain=True)["rejected"] == {
         old.label(True): [{"file": f, "reason": why} for f, why in rejected]
     }
+    # asdict cannot serialize dataclass Target keys; omit that public mapping for this check.
+    assert "_resolutions" not in asdict(replace(result, statuses={}))
     assert fake_pypi == ["https://pypi.org/pypi/pythonranged/2.0/json"]
 
 
@@ -190,6 +203,7 @@ def test_result_reports_the_version_pyodide_bundles(fixtures, version, differs):
     result = wheelgap.check_package("MarkupSafe", version, [linux, pyodide], files=files, pyodide_locks=[lock])
     assert result.statuses[pyodide] is Status.BUNDLED and result.gaps == [linux]  # a different version still passes
     assert result.bundled_version == "3.0.2" and result.bundled_version_differs is differs
+    assert result.bundled_versions == {"3.13": "3.0.2"}
     assert result.to_dict()["bundled"] == "3.0.2" and result.to_dict()["bundled_version_differs"] is differs
 
 
@@ -201,10 +215,100 @@ def test_result_without_a_bundled_target_has_no_bundled_version(fake_pypi, fixtu
     }
     assert by_name["fastlib"].bundled_version == "2.0.0" and not by_name["fastlib"].bundled_version_differs
     assert by_name["nowheels"].bundled_version is None
+    assert by_name["nowheels"].bundled_versions == {}
     assert (
         "bundled" not in by_name["nowheels"].to_dict()
+        and "bundled_versions" not in by_name["nowheels"].to_dict()
         and "bundled_version_differs" not in by_name["nowheels"].to_dict()
     )
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("same_version", [False, True])
+@pytest.mark.parametrize("method", ["offline", "index"])
+def test_pyodide_bundled_versions_are_per_python(fixtures, fake_pypi, reverse, same_version, method):
+    lock_313 = load_pyodide_lock(str(fixtures / "pyodide-lock.json"))
+    package = "markupsafe" if method == "offline" else "fastlib"
+    original_version = lock_313.packages[package]
+    next_version = original_version if same_version else "9.9.9"
+    lock_314 = replace(
+        lock_313,
+        source="fixture-pyodide-314",
+        python=(3, 14),
+        abi="2026_0",
+        packages={**lock_313.packages, package: next_version},
+    )
+    locks = [lock_313, lock_314]
+    if reverse:
+        locks.reverse()
+    targets = wheelgap.make_targets(python="3.13,3.14", platforms="pyodide")
+    if method == "offline":
+        result = wheelgap.check_package(
+            "MarkupSafe", "3.0.2", targets, files=["markupsafe-3.0.2.tar.gz"], pyodide_locks=locks
+        )
+    else:
+        (result,) = wheelgap.check_packages([("fastlib", "2.0.0")], targets, pyodide_locks=locks)
+
+    assert all(result.statuses[target] is Status.BUNDLED for target in targets)
+    expected = {"3.13": original_version, "3.14": next_version}
+    assert result.bundled_versions == expected
+    assert result.bundled_version == (original_version if same_version else None)
+    assert result.bundled_version_differs is not same_version
+    output = result.to_dict()
+    assert output["bundled_versions"] == expected
+    assert output["bundled_version_differs"] is not same_version
+    assert (output.get("bundled") == original_version) if same_version else ("bundled" not in output)
+    json.dumps(output)
+
+
+def test_pyodide_bundled_versions_excludes_locks_without_package(fixtures):
+    lock_313 = load_pyodide_lock(str(fixtures / "pyodide-lock.json"))
+    lock_314 = replace(
+        lock_313,
+        source="fixture-pyodide-314",
+        python=(3, 14),
+        abi="2026_0",
+        packages={k: v for k, v in lock_313.packages.items() if k != "markupsafe"},
+    )
+    targets = wheelgap.make_targets(python="3.13,3.14", platforms="pyodide")
+    result = wheelgap.check_package(
+        "MarkupSafe",
+        "3.0.2",
+        targets,
+        files=["markupsafe-3.0.2.tar.gz"],
+        pyodide_locks=[lock_314, lock_313],
+    )
+    assert result.statuses[targets[0]] is Status.BUNDLED
+    assert result.statuses[targets[1]] is Status.MISSING
+    assert result.bundled_versions == {"3.13": "3.0.2"}
+    assert result.bundled_version == "3.0.2"
+    assert result.to_dict()["bundled_versions"] == {"3.13": "3.0.2"}
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_check_lockfile_reports_bundled_versions_per_python(tmp_path, fake_pypi, fixtures, reverse):
+    lock_313 = load_pyodide_lock(str(fixtures / "pyodide-lock.json"))
+    lock_314 = replace(
+        lock_313,
+        source="fixture-pyodide-314",
+        python=(3, 14),
+        abi="2026_0",
+        packages={**lock_313.packages, "fastlib": "9.9.9"},
+    )
+    locks = [lock_313, lock_314]
+    if reverse:
+        locks.reverse()
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("fastlib==2.0.0\n", encoding="utf-8")
+    targets = wheelgap.make_targets(python="3.13,3.14", platforms="pyodide")
+    results = wheelgap.check_lockfile(requirements, targets, pyodide_locks=locks)
+    assert len(results) == 1
+    result = results[0]
+    assert all(result.statuses[target] is Status.BUNDLED for target in targets)
+    assert result.bundled_versions == {"3.13": "2.0.0", "3.14": "9.9.9"}
+    assert result.bundled_version is None
+    assert result.bundled_version_differs
+    assert result.to_dict()["bundled_versions"] == result.bundled_versions
 
 
 @pytest.mark.parametrize(
@@ -502,3 +606,37 @@ def test_check_lockfile_requirements_format_control_explain(fake_pypi, tmp_path)
 
     assert results["nowheels"].statuses[lin] is Status.MISSING
     assert "--only-binary forbids building from source" in results["nowheels"].reasons[lin]
+
+
+@pytest.mark.usefixtures("index")
+def test_check_packages_deps_checks_what_the_packages_install():
+    results = wheelgap.check_packages([("app", "1.0")], [WIN, LIN], deps=True)
+    rows = {r.name: r for r in results}
+    assert sorted(rows) == ["app", "crypt", "lib", "winonly"]
+    assert rows["crypt"].statuses == {WIN: Status.SOURCE, LIN: Status.WHEEL}
+    assert rows["crypt"].via == {WIN: ("app", "lib", "crypt")}  # as --explain: the path to each gap
+    assert rows["crypt"].to_dict(explain=True)["via"] == {WIN.label(True): ["app", "lib", "crypt"]}
+    assert rows["winonly"].statuses == {WIN: Status.WHEEL, LIN: Status.NOT_NEEDED}  # only Windows installs it
+    assert all(r.via == {} for r in wheelgap.check_packages([("app", "1.0")], [WIN, LIN]))
+    assert [r.name for r in wheelgap.check_packages(["app"], [WIN])] == ["app"]
+
+
+@pytest.mark.usefixtures("index")
+def test_check_package_deps_returns_the_whole_tree():
+    results = wheelgap.check_package("app", "1.0", [WIN], deps=True)
+    assert sorted(r.name for r in results) == ["app", "crypt", "lib", "winonly"]
+    assert isinstance(wheelgap.check_package("app", "1.0", [WIN]), wheelgap.Result)
+    with pytest.raises(ValueError, match="deps=True looks the dependencies up on PyPI"):
+        wheelgap.check_package("app", "1.0", [WIN], files=["app-1.0-py3-none-any.whl"], deps=True)
+
+
+@pytest.mark.usefixtures("index")
+def test_check_packages_deps_raises_the_source_error_the_cli_reports():
+    with pytest.raises(SourceError, match="can't resolve c for Python 3.14 on win-arm64"):
+        wheelgap.check_packages(["x", "y"], [WIN], deps=True)
+
+
+@pytest.mark.usefixtures("index")
+def test_check_packages_deps_refuses_a_url():
+    with pytest.raises(ValueError, match="can't check a URL: foo @ https://example.org/foo-1.0.tar.gz"):
+        wheelgap.check_packages(["foo @ https://example.org/foo-1.0.tar.gz"], deps=True)

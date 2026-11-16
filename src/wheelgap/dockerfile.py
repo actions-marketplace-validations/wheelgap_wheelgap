@@ -6,6 +6,7 @@ import json
 import math
 import re
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import NoReturn
@@ -91,8 +92,12 @@ class ImageTarget:
     platform: str
     glibc: str | None = None
     musl: str | None = None
-    # The global ARG defaults the final image's FROM used, as (name, value): a --build-arg can change them.
+    # The global ARG values the final image's FROM used, as (name, value): a default, or a --build-arg value for
+    # the names in given_args.
     build_args: tuple[tuple[str, str], ...] = field(default=(), compare=False)
+    given_args: frozenset[str] = field(default=frozenset(), compare=False)
+    # --build-arg names no global ARG declares: Docker doesn't use them in FROM.
+    undeclared_args: tuple[str, ...] = field(default=(), compare=False)
 
 
 _DIRECTIVE_RE = re.compile(r"^#\s*([A-Za-z]+)\s*=\s*(.+?)\s*$")
@@ -486,6 +491,17 @@ def _heredoc_rules(syntax: str | None) -> int | None:
     return min(minor, 16) if minor >= 4 or (minor == 3 and m.group(2)) else 0
 
 
+# The names BuildKit gives a value before reading the Dockerfile, from the platforms it builds on and for (and the
+# target stage). A global ARG's default replaces that value, and only `--build-arg` replaces the default: defaultArgs in
+# frontend/dockerfile/dockerfile2llb/platform.go, then buildMetaArgs in convert.go (AddOrReplace), at moby/buildkit
+# 38b0e2ab2e9bc5fd3f622759ac92ad4b649f3bf4. So a default is used as for any other ARG, and with none the value is
+# the build's own.
+_AUTOMATIC_ARGS = frozenset(
+    {
+        "BUILDPLATFORM", "BUILDOS", "BUILDOSVERSION", "BUILDARCH", "BUILDVARIANT",
+        "TARGETPLATFORM", "TARGETOS", "TARGETOSVERSION", "TARGETARCH", "TARGETVARIANT", "TARGETSTAGE",
+    }
+)  # fmt: skip
 # Docker reads instruction keywords in any case, so `arg` is an ARG too.
 _GLOBAL_ARG_RE = re.compile(r"^(?i:ARG)[\t\v\f\r ]+([A-Za-z_][A-Za-z0-9_]*)(?:=([^ \t\v\f\r]*))?$", re.ASCII)
 _VAR_REF_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))", re.ASCII)
@@ -500,19 +516,24 @@ class _GlobalArgs:
     defaults: dict[str, str]
     problems: dict[str, str]
     unreadable: list[str]
+    declared: set[str] = field(default_factory=set)
 
 
-def _global_arg_defaults(instructions: list[tuple[str, bool]]) -> _GlobalArgs:
+def _global_arg_defaults(
+    instructions: list[tuple[str, bool]], build_args: Mapping[str, str] | None = None
+) -> _GlobalArgs:
     """The `ARG NAME=default` values Docker expands in FROM, from the instructions before the first FROM.
 
-    A global ARG without a default can only come from `--build-arg`, which wheelgap doesn't read, so using it is an
-    error. An empty default (`ARG PY=`) sets the name to the empty string, which Docker accepts but which leaves the
-    image as `python:-slim`, so it's one too. A default using quotes, escapes or `$` (another ARG, a shell modifier)
+    A `--build-arg NAME=VALUE` in build_args replaces the default of a declared ARG, or gives a value to one with
+    none, and is held to the same rules as a default. A global ARG left without a value is an error. An empty
+    default (`ARG PY=`) sets the name to the empty string, which Docker accepts but which leaves the image as
+    `python:-slim`, so it's one too. A default using quotes, escapes or `$` (another ARG, a shell modifier)
     is one as well: Docker would expand it, and guessing it could pick the wrong image. An ARG that declares more than
     one variable (`ARG A=1 B=2`), that is split over a line continuation, or whose value has a non-ASCII character
     (Docker splits an ARG on any Unicode space, so `ARG A=1<U+00A0>B=2` declares two), is Docker's too, but wheelgap
     would read the whole thing as one value, so a FROM using any build argument is an error while one is there.
     """
+    build_args = build_args or {}
     args = _GlobalArgs({}, {}, [])
     for instruction, joined in instructions:
         if joined:
@@ -525,19 +546,33 @@ def _global_arg_defaults(instructions: list[tuple[str, bool]]) -> _GlobalArgs:
             args.unreadable.append(f"{instruction}: an ARG must declare one NAME=value, pass -p/-t instead")
             continue
         name, value = m.group(1), m.group(2)
-        if value is not None and not value.isascii():
+        args.declared.add(name)
+        # Docker splits an ARG on any Unicode space, so a non-ASCII declaration may declare more than one name
+        # (`ARG A=1<U+00A0>B=2`): it stays unreadable whatever --build-arg gives A.
+        if not instruction.isascii():
             args.unreadable.append(f"{instruction}: non-ASCII characters in an ARG aren't supported")
             continue
+        given = name in build_args
+        what = f"--build-arg {name}" if given else f"ARG {name}"
+        if given:
+            value = build_args[name]
+            if not value.isascii():
+                args.problems[name] = f"{what}={value}: non-ASCII characters in a value aren't supported"
+                continue
         # A later declaration of the same name replaces the earlier one, as in Docker.
         args.defaults.pop(name, None)
         args.problems.pop(name, None)
-        if value is None:
-            args.problems[name] = f"ARG {name} has no default: a --build-arg value isn't read, pass -p/-t instead"
+        if value is None and name in _AUTOMATIC_ARGS:
+            args.problems[name] = f"ARG {name} has no default: {name} is set by the build, pass -p/-t instead"
+        elif value is None:
+            args.problems[name] = f"ARG {name} has no default and no --build-arg {name}=VALUE, pass -p/-t instead"
         elif value == "":
-            args.problems[name] = f"ARG {name} has an empty default, pass -p/-t instead"
+            empty = f"{what} is empty" if given else f"ARG {name} has an empty default"
+            args.problems[name] = f"{empty}, pass -p/-t instead"
         elif any(c in value for c in "\"'\\$`"):
             args.problems[name] = (
-                f"ARG {name}={value}: defaults with quotes, escapes or $ aren't supported, pass -p/-t instead"
+                f"{what}={value}: {'values' if given else 'defaults'} with quotes, escapes or $ aren't supported, "
+                "pass -p/-t instead"
             )
         else:
             args.defaults[name] = value
@@ -576,7 +611,7 @@ def _from_instructions(text: str) -> list[tuple[int, str]]:
     return _parse_froms(text)[0]
 
 
-def _parse_froms(text: str) -> tuple[list[tuple[int, str]], _GlobalArgs]:
+def _parse_froms(text: str, build_args: Mapping[str, str] | None = None) -> tuple[list[tuple[int, str]], _GlobalArgs]:
     """(line number, arguments) of every FROM instruction in order, the line being where the instruction starts.
 
     Heredoc bodies (`RUN <<EOF` ... `EOF`) are skipped, so a line in one is never read as an instruction.
@@ -673,7 +708,7 @@ def _parse_froms(text: str) -> tuple[list[tuple[int, str]], _GlobalArgs]:
         heredocs = heredocs_in("".join(parts))
     if heredocs:
         raise DockerfileError(f"unterminated heredoc <<{heredocs[0][0]} (BuildKit rejects it)")
-    return found, _global_arg_defaults(args_before_from)
+    return found, _global_arg_defaults(args_before_from, build_args)
 
 
 def last_from(text: str) -> str:
@@ -758,16 +793,18 @@ def final_image(text: str) -> tuple[str, str | None]:
 
 def final_from(text: str) -> tuple[str, str | None, int]:
     """final_image, plus the line of the FROM instruction that names that image."""
-    image, platform, number, _ = _final_from(text)
+    image, platform, number, _, _ = _final_from(text)
     return image, platform, number
 
 
-def _final_from(text: str) -> tuple[str, str | None, int, dict[str, str]]:
+def _final_from(
+    text: str, build_args: Mapping[str, str] | None = None
+) -> tuple[str, str | None, int, dict[str, str], _GlobalArgs]:
     """final_from, plus the global ARG defaults that FROM used. Build arguments are expanded in every FROM, as
     Docker does, but one wheelgap can't expand is an error only in the FROM that names the final image: an
     earlier stage built `--platform=$BUILDPLATFORM` doesn't change the image the last stage runs on."""
     stages: dict[str, tuple[str, str | None, int, dict[str, str]]] = {}
-    lines, global_args = _parse_froms(text)
+    lines, global_args = _parse_froms(text, build_args)
     if not lines:
         raise DockerfileError("no FROM line found")
     errors: dict[int, DockerfileError] = {}
@@ -800,7 +837,7 @@ def _final_from(text: str) -> tuple[str, str | None, int, dict[str, str]]:
         )
     if number in errors:
         raise errors[number]
-    return image, platform, number, used
+    return image, platform, number, used, global_args
 
 
 def parse_image(image: str, platform: str | None = None) -> ImageTarget:
@@ -889,15 +926,20 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
     return ImageTarget(python, f"{family}-{arch}", glibc, musl)
 
 
-def read_dockerfile(path: Path) -> ImageTarget:
+def read_dockerfile(path: Path, build_args: Mapping[str, str] | None = None) -> ImageTarget:
+    """The image of the Dockerfile's final stage. build_args are `--build-arg NAME=VALUE` values, read as Docker
+    reads them: one replaces the default of the global ARG it names (or gives it a value), and one no global ARG
+    declares is left out of FROM (ImageTarget.undeclared_args)."""
     try:
         text = path.read_bytes().decode("utf-8-sig")
     except UnicodeDecodeError as e:
         byte = f"0x{e.object[e.start]:02x}"
         raise DockerfileError(f"{path}: not UTF-8 (byte {byte} at offset {e.start}), pass -p/-t instead") from None
     try:
-        image, platform, _, used = _final_from(text)
+        image, platform, _, used, global_args = _final_from(text, build_args)
         target = parse_image(image, platform)
     except DockerfileError as e:
         raise DockerfileError(f"{path}: {e}") from None
-    return replace(target, build_args=tuple(used.items())) if used else target
+    given = frozenset(name for name in used if name in (build_args or {}))
+    undeclared = tuple(name for name in build_args or {} if name not in global_args.declared)
+    return replace(target, build_args=tuple(used.items()), given_args=given, undeclared_args=undeclared)

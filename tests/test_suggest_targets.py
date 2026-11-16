@@ -44,6 +44,11 @@ def unreadable(found):
     return [(u.path, u.line, u.reason) for u in found.unreadable]
 
 
+def suggest_with(tmp_path, text):
+    workflow(tmp_path, text)
+    return suggest(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("label", "target"),
     [
@@ -180,9 +185,9 @@ jobs:
       group: big-runners
   custom:
     runs-on: build-box-1
-  container:
+  unknown_image:
     runs-on: ubuntu-latest
-    container: python:3.13-alpine
+    container: my-registry.example/python:3.13
   ambiguous:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -209,7 +214,12 @@ jobs:
         (path, 24, "job self: runs-on [self-hosted, linux, ARM64] isn't a single label"),
         (path, 26, "job group: runs-on with a group or labels isn't a single label"),
         (path, 29, "job custom: build-box-1 isn't a GitHub-hosted runner wheelgap knows"),
-        (path, 32, "job container: runs in a container, whose platform isn't read"),
+        (
+            path,
+            32,
+            "job unknown_image: container: my-registry.example/python:3.13: only the official python images and "
+            "Python-tagged Astral uv images are supported",
+        ),
         (
             path,
             39,
@@ -393,7 +403,7 @@ def test_dockerfile_it_cant_read(tmp_path):
     (tmp_path / "Dockerfile").write_text("ARG BASE\nFROM $BASE\n")
     found = suggest(tmp_path)
     assert found.targets == []
-    assert unreadable(found) == [("Dockerfile", None, "ARG BASE has no default: a --build-arg value isn't read")]
+    assert unreadable(found) == [("Dockerfile", None, "ARG BASE has no default and no --build-arg BASE=VALUE")]
 
 
 def test_glibc_is_left_out_when_the_sources_disagree(tmp_path, capsys):
@@ -2186,3 +2196,558 @@ def test_keys_and_anchors_twice_refuse_the_file(tmp_path, text, line):
     assert targets == []
     assert [r[0] for r in refused] == [line]
     assert refused[0][1].startswith(NOT_READ)
+
+
+# --- Jobs that run in a container: the image names the target and Python, not the runner ---
+
+CONTAINER_JOB = """\
+jobs:
+  test:
+    runs-on: ubuntu-24.04-arm
+    container: python:3.13-alpine
+"""
+
+
+def test_container_image_names_the_target_and_python_not_the_runner(tmp_path):
+    # Actions pulls the image without forcing a platform, so an ARM runner gets the image's aarch64 build. The image's
+    # libc is read from its tag; the runner's glibc doesn't apply inside it.
+    found = suggest_with(tmp_path, CONTAINER_JOB)
+    assert where(found.targets) == [("musl-aarch64", CI, 4)]
+    assert where(found.pythons) == [("3.13", CI, 4)]
+    assert found.targets[0].source == "container: python:3.13-alpine (read as linux/arm64, the runner's CPU, musl 1.2)"
+    assert (found.targets[0].glibc, found.targets[0].musl) == (None, "1.2")
+    assert found.pythons[0].source == "container: python:3.13-alpine"
+    assert found.unreadable == []
+    assert found.config() == {"python": ["3.13"], "targets": ["musl-aarch64"], "musl": "1.2"}
+
+
+@pytest.mark.parametrize(
+    ("runner", "platform", "target_suffix"),
+    [
+        ("ubuntu-latest", "linux/amd64", "x86_64"),
+        ("ubuntu-24.04-arm", "linux/arm64", "aarch64"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("container", "family", "python", "libc", "source_image"),
+    [
+        ("python:3.13-alpine", "musl", "3.13", "musl 1.2", "python:3.13-alpine"),
+        ("'python:3.13-alpine'", "musl", "3.13", "musl 1.2", "python:3.13-alpine"),
+        ("python:3.12-slim-bookworm", "linux", "3.12", "glibc 2.36", "python:3.12-slim-bookworm"),
+        ("python:3.13", "linux", "3.13", "glibc 2.41", "python:3.13"),
+        (
+            "ghcr.io/astral-sh/uv:python3.13-alpine",
+            "musl",
+            "3.13",
+            "musl 1.2",
+            "ghcr.io/astral-sh/uv:python3.13-alpine",
+        ),
+        ("python:3.16-rc-slim", "linux", "3.16", "", "python:3.16-rc-slim"),
+    ],
+)
+def test_container_literal_images(
+    tmp_path, runner, platform, target_suffix, container, family, python, libc, source_image
+):
+    # The image's libc comes from its tag, its architecture from the runner's CPU.
+    found = suggest_with(tmp_path, f"jobs:\n  test:\n    runs-on: {runner}\n    container: {container}\n")
+    note = f"read as {platform}, the runner's CPU"
+    notes = ", ".join(n for n in (note, libc) if n)
+    assert where(found.targets) == [(f"{family}-{target_suffix}", CI, 4)]
+    assert found.targets[0].source == f"container: {source_image} ({notes})"
+    assert where(found.pythons) == [(python, CI, 4)]
+    assert found.unreadable == []
+
+
+@pytest.mark.parametrize("runner", ["macos-14", "macos-latest", "windows-latest", "windows-11-arm"])
+def test_container_on_non_linux_runner_is_refused(tmp_path, runner):
+    # GitHub Actions only supports job containers on Linux runners.
+    found = suggest_with(tmp_path, f"jobs:\n  test:\n    runs-on: {runner}\n    container: python:3.13-alpine\n")
+    assert found.targets == []
+    assert found.pythons == []
+    assert unreadable(found) == [(CI, 3, f"job test: job containers only run on Linux runners, not {runner}")]
+
+
+@pytest.mark.parametrize(
+    ("runner", "line", "reason"),
+    [
+        (
+            "ubuntu-latest",
+            4,
+            "job test: container: Windows container images aren't supported on GitHub Actions Linux runners",
+        ),
+        (
+            "ubuntu-24.04-arm",
+            4,
+            "job test: container: Windows container images aren't supported on GitHub Actions Linux runners",
+        ),
+        ("build-box-1", 3, "job test: build-box-1 isn't a GitHub-hosted runner wheelgap knows"),
+        ("${{ inputs.os }}", 3, "job test: runs-on: ${{ inputs.os }} is an expression"),
+        ("[self-hosted, ARM64]", 3, "job test: runs-on [self-hosted, ARM64] isn't a single label"),
+        ("null", 3, "job test: null isn't a GitHub-hosted runner wheelgap knows"),
+    ],
+)
+def test_windows_container_image_is_refused_and_validates_runner_first(tmp_path, runner, line, reason):
+    found = suggest_with(
+        tmp_path, f"jobs:\n  test:\n    runs-on: {runner}\n    container: python:3.13-windowsservercore\n"
+    )
+    assert found.targets == []
+    assert found.pythons == []
+    assert unreadable(found) == [(CI, line, reason)]
+
+
+@pytest.mark.parametrize(
+    ("container", "line", "reason"),
+    [
+        # Expressions can't be read.
+        ("${{ matrix.image }}", 4, "job test: container: ${{ matrix.image }} is an expression"),
+        ("${{ inputs.image }}", 4, "job test: container: ${{ inputs.image }} is an expression"),
+        ("'${{ matrix.image }}'", 4, "job test: container: ${{ matrix.image }} is an expression"),
+        # An image that isn't a supported one, or that parse_image rejects.
+        (
+            "my-registry.example/python:3.13",
+            4,
+            "job test: container: my-registry.example/python:3.13: only the official python images and "
+            "Python-tagged Astral uv images are supported",
+        ),
+        ("python:3.x", 4, "job test: container: python:3.x: the tag must start with a Python version like 3.13"),
+        ("python:3.13-nonsense", 4, "job test: container: python:3.13-nonsense: unknown image variant 'nonsense'"),
+        ("python:3.13@${{ sha }}", 4, "job test: container: python:3.13@${{ sha }} is an expression"),
+        # A value that isn't a single scalar.
+        ("|", 4, "job test: container: a multi-line value isn't read"),
+        # Unknown or unsupported keys in a container mapping; options: may change the platform.
+        (
+            "\n      image: python:3.13\n      options: --platform linux/arm64",
+            6,
+            "job test: container: options isn't read",
+        ),
+        ("\n      image: python:3.13\n      options: --cpus 2", 6, "job test: container: options isn't read"),
+        ("\n      image: ${{ matrix.image }}", 5, "job test: container: ${{ matrix.image }} is an expression"),
+        ("\n      credentials:\n        username: me", 5, "job test: container: credentials isn't read"),
+        ("\n      image: python:3.13\n      volumes: [/tmp]", 6, "job test: container: volumes isn't read"),
+        ("\n      image: python:3.13\n      env:\n        A: b", 6, "job test: container: env isn't read"),
+        ("\n      image: python:3.13\n      ports: [8000]", 6, "job test: container: ports isn't read"),
+    ],
+)
+def test_container_shapes_it_cant_read(tmp_path, container, line, reason):
+    text = f"jobs:\n  test:\n    runs-on: ubuntu-latest\n    container: {container}\n"
+    targets, refused, found = read(tmp_path, text)
+    assert targets == []
+    assert found.pythons == []
+    assert refused == [(line, reason)]
+
+
+@pytest.mark.parametrize(
+    "services",
+    [
+        "\n      redis:\n        image: redis:7",  # valid Actions: services: is beside container: at the job level
+        " {redis: {image: 'redis:7'}}",
+        " {}",  # an empty mapping still names a key wheelgap doesn't read
+        "",  # a null value still names a key wheelgap doesn't read
+    ],
+)
+def test_job_level_services_beside_container_is_refused(tmp_path, services):
+    # GitHub places services: beside container:, not inside it. The sidecars aren't read, so no target is guessed.
+    text = (
+        f"jobs:\n  test:\n    runs-on: ubuntu-24.04-arm\n    container: python:3.13-alpine\n    services:{services}\n"
+    )
+    targets, refused, found = read(tmp_path, text)
+    assert targets == []
+    assert found.pythons == []
+    assert refused == [(5, "job test: services isn't read")]
+
+
+def test_container_mapping_still_refuses_services_inside_it(tmp_path):
+    # Not valid Actions, but keep the old key guarded: it must never be read as part of the container mapping.
+    text = (
+        "jobs:\n  test:\n    runs-on: ubuntu-latest\n    container:\n      image: python:3.13\n"
+        "      services:\n        redis:\n          image: redis:7\n"
+    )
+    targets, refused, found = read(tmp_path, text)
+    assert targets == []
+    assert found.pythons == []
+    assert refused == [(6, "job test: container: services isn't read")]
+
+
+def test_services_without_a_container_keeps_the_host_target(tmp_path):
+    # A job with services: but no container: runs its steps on the host, whose platform is known from runs-on.
+    text = (
+        "jobs:\n  test:\n    runs-on: ubuntu-latest\n    services:\n      redis:\n        image: redis:7\n"
+        "    steps:\n      - uses: actions/setup-python@v6\n        with:\n          python-version: '3.13'\n"
+    )
+    found = suggest_with(tmp_path, text)
+    assert where(found.targets) == [("linux-x86_64", CI, 3)]
+    assert where(found.pythons) == [("3.13", CI, 10)]
+    assert unreadable(found) == []
+
+
+@pytest.mark.parametrize(
+    ("runs_on", "line", "reason"),
+    [
+        ("${{ inputs.os }}", 3, "job test: runs-on: ${{ inputs.os }} is an expression"),
+        (
+            "${{ matrix.os }}",
+            3,
+            "job test: runs-on: matrix.os isn't a single label",
+        ),
+        ("self-hosted", 3, "job test: self-hosted isn't a GitHub-hosted runner wheelgap knows"),
+        ("[ubuntu-latest, self-hosted]", 3, "job test: runs-on [ubuntu-latest, self-hosted] isn't a single label"),
+        (
+            "3.10",
+            3,
+            "job test: runs-on: unquoted 3.10 is the number 3.1 in YAML (quote it)",
+        ),
+    ],
+)
+def test_container_with_an_unresolved_runner_guesses_no_target(tmp_path, runs_on, line, reason):
+    # Without a known runner CPU there's no platform to pass to parse_image: don't fall back to amd64 and guess.
+    text = f"jobs:\n  test:\n    runs-on: {runs_on}\n    container: python:3.13-alpine\n"
+    found = suggest_with(tmp_path, text)
+    assert found.targets == []
+    assert found.pythons == []
+    assert unreadable(found) == [(CI, line, reason)]
+
+
+def test_services_before_container_in_the_job_is_refused(tmp_path):
+    # Key order in the job mapping doesn't matter: services: is refused wherever it sits.
+    text = (
+        "jobs:\n  test:\n    runs-on: ubuntu-24.04-arm\n    services:\n      redis:\n        image: redis:7\n"
+        "    container: python:3.13-alpine\n"
+    )
+    found = suggest_with(tmp_path, text)
+    assert found.targets == []
+    assert found.pythons == []
+    assert unreadable(found) == [(CI, 4, "job test: services isn't read")]
+
+
+@pytest.mark.parametrize(
+    "container",
+    [
+        "\n      image: python:3.13-alpine",
+        "\n      image: 'python:3.13-alpine'",
+    ],
+)
+def test_container_mapping_with_an_image_is_read(tmp_path, container):
+    text = f"jobs:\n  test:\n    runs-on: ubuntu-latest\n    container:{container}\n"
+    found = suggest_with(tmp_path, text)
+    assert [f.value for f in found.targets] == ["musl-x86_64"]
+    assert [f.value for f in found.pythons] == ["3.13"]
+    assert found.unreadable == []
+
+
+def test_setup_python_inside_a_container_uses_the_images_libc(tmp_path):
+    # setup-python installs into the container, so its matching architecture resolves against the image's libc, and
+    # its Python is the job's: the image's own isn't suggested too.
+    workflow(
+        tmp_path,
+        """\
+jobs:
+  test:
+    runs-on: ubuntu-24.04-arm
+    container: python:3.13-slim
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          architecture: arm64
+""",
+    )
+    found = suggest(tmp_path)
+    assert where(found.targets) == [("linux-aarch64", CI, 4)]
+    assert where(found.pythons) == [("3.11", CI, 8)]
+    assert found.pythons[0].source == "python-version: 3.11"
+    assert found.unreadable == []
+
+
+def test_setup_python_inside_an_alpine_container_is_refused(tmp_path):
+    # setup-python has no musl builds, so the step fails in an Alpine image and the job never runs: nothing from it is
+    # suggested.
+    workflow(
+        tmp_path,
+        """\
+jobs:
+  test:
+    runs-on: ubuntu-24.04-arm
+    container: python:3.13-alpine
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          architecture: arm64
+""",
+    )
+    found = suggest(tmp_path)
+    assert found.targets == []
+    assert found.pythons == []
+    assert unreadable(found) == [
+        (CI, 4, "job test: setup-python has no musl builds, so it can't install a Python in python:3.13-alpine")
+    ]
+
+
+def test_setup_uv_inside_a_container_picks_the_python(tmp_path):
+    workflow(
+        tmp_path,
+        """\
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    container: python:3.12-slim
+    steps:
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14t"
+""",
+    )
+    found = suggest(tmp_path)
+    assert where(found.targets) == [("linux-x86_64", CI, 4)]
+    assert where(found.pythons) == [("3.14t", CI, 8)]  # setup-uv's Python is the job's, not the image's
+    assert found.unreadable == []
+
+
+def test_container_job_with_a_matrix_runs_on_is_not_read(tmp_path):
+    # The image would be pulled for a different CPU on each matrix runner, and a matrix label isn't one known
+    # architecture. Refuse rather than guess amd64 (#270).
+    workflow(
+        tmp_path,
+        """\
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    container: python:3.13-alpine
+""",
+    )
+    found = suggest(tmp_path)
+    assert found.targets == []
+    assert found.pythons == []
+    assert unreadable(found) == [(CI, 3, "job test: runs-on: matrix.os isn't a single label")]
+
+
+def test_container_job_with_a_matrix_but_a_fixed_runner_is_read(tmp_path):
+    # A matrix elsewhere in the job doesn't change the single, known runner CPU the image is pulled for.
+    workflow(
+        tmp_path,
+        """\
+jobs:
+  test:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        python: ['3.12', '3.13']
+    container: python:3.13-alpine
+""",
+    )
+    found = suggest(tmp_path)
+    assert where(found.targets) == [("musl-aarch64", CI, 7)]
+    assert where(found.pythons) == [("3.13", CI, 7)]
+    assert found.unreadable == []
+
+
+def test_unreadable_container_leaves_no_target_and_no_setup_python(tmp_path):
+    # A container that can't be read leaves no target, and the (otherwise readable) runner isn't half-suggested.
+    workflow(
+        tmp_path,
+        """\
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    container:
+      image: python:3.13-alpine
+      options: --platform linux/arm64
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+""",
+    )
+    found = suggest(tmp_path)
+    assert found.targets == []
+    # The image may be musl (here it is), where setup-python can't install a Python, so its version isn't suggested.
+    assert found.pythons == []
+    assert unreadable(found) == [(CI, 6, "job test: container: options isn't read")]
+
+
+def test_container_image_and_a_dockerfile_agree_on_musl(tmp_path, capsys):
+    workflow(tmp_path, "jobs:\n  test:\n    runs-on: ubuntu-latest\n    container: python:3.13-alpine\n")
+    (tmp_path / "Dockerfile").write_text("FROM python:3.13-alpine\n")
+    code, out, _ = run(capsys, "--suggest-targets", str(tmp_path))
+    assert code == 0
+    assert 'musl = "1.2"' in out
+    assert "container: python:3.13-alpine" in out
+    assert "FROM python:3.13-alpine" in out
+
+
+def test_container_image_json_shape(tmp_path, capsys):
+    workflow(tmp_path, CONTAINER_JOB)
+    code, out, _ = run(capsys, "--suggest-targets", str(tmp_path), "--json")
+    assert code == 0
+    data = json.loads(out)
+    assert data["targets"] == [
+        {
+            "target": "musl-aarch64",
+            "file": CI,
+            "line": 4,
+            "from": "container: python:3.13-alpine (read as linux/arm64, the runner's CPU, musl 1.2)",
+        }
+    ]
+    assert data["python"] == [{"python": "3.13", "file": CI, "line": 4, "from": "container: python:3.13-alpine"}]
+    assert data["unreadable"] == []
+    assert data["config"] == {"python": ["3.13"], "targets": ["musl-aarch64"], "musl": "1.2"}
+
+
+def test_container_job_without_runs_on_is_not_read(tmp_path):
+    # GitHub requires runs-on even for a container job; a reusable-workflow call has no image of its own.
+    targets, refused, found = read(tmp_path, "jobs:\n  test:\n    container: python:3.13-alpine\n")
+    assert targets == []
+    assert found.pythons == []
+    assert refused == [(2, "job test: no runs-on line, so GitHub wouldn't run the container job")]
+
+
+@pytest.mark.parametrize(
+    ("runner", "image", "arch", "platform"),
+    [
+        ("ubuntu-latest", "python:3.12", "x86", "linux/amd64"),
+        ("ubuntu-24.04-arm", "python:3.12-slim", "x64", "linux/arm64"),
+    ],
+)
+def test_setup_python_mismatched_architecture_inside_a_container_is_refused(tmp_path, runner, image, arch, platform):
+    workflow(
+        tmp_path,
+        f"""\
+jobs:
+  test:
+    runs-on: {runner}
+    container: {image}
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          architecture: {arch}
+""",
+    )
+    found = suggest(tmp_path)
+    assert found.targets == []
+    assert where(found.pythons) == [("3.11", CI, 8)]  # setup-python's Python is the job's, not the image's
+    assert unreadable(found) == [
+        (CI, 4, f"job test: setup-python's architecture: {arch} on container: {image} ({platform}) isn't read")
+    ]
+
+
+def test_setup_python_unresolved_architecture_and_setup_uv_python_arch_in_container_are_refused(tmp_path):
+    workflow(
+        tmp_path,
+        """\
+defs: &a
+  arch: x64
+jobs:
+  expr:
+    runs-on: ubuntu-latest
+    container: python:3.13-alpine
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          architecture: ${{ inputs.arch }}
+  alias:
+    runs-on: ubuntu-latest
+    container: python:3.13-alpine
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          architecture: *a
+  uv:
+    runs-on: ubuntu-24.04-arm
+    container: python:3.12-slim
+    steps:
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+          python-arch: arm64
+""",
+    )
+    found = suggest(tmp_path)
+    assert found.targets == []
+    # The Alpine jobs can't run setup-python at all; the slim job's Python is setup-uv's, not the image's.
+    assert [f.value for f in found.pythons] == ["3.14"]
+    assert unreadable(found) == [
+        (CI, 6, "job expr: setup-python has no musl builds, so it can't install a Python in python:3.13-alpine"),
+        (CI, 14, "job alias: setup-python has no musl builds, so it can't install a Python in python:3.13-alpine"),
+        (CI, 27, "job uv: setup-uv's python-arch: arm64 isn't read, so the job's target isn't read"),
+    ]
+
+
+def test_setup_python_matrix_architecture_inside_an_alpine_container_is_refused(tmp_path):
+    workflow(
+        tmp_path,
+        """\
+jobs:
+  test:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        arch: [arm64, x64]
+    container: python:3.13-alpine
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          architecture: ${{ matrix.arch }}
+""",
+    )
+    found = suggest(tmp_path)
+    assert found.targets == []
+    assert found.pythons == []
+    assert unreadable(found) == [
+        (CI, 7, "job test: setup-python has no musl builds, so it can't install a Python in python:3.13-alpine")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mapping", "line"),
+    [
+        ("\n      image: python:3.13-alpine", 5),
+        ("\n      image: 'python:3.13-alpine'", 5),
+        (' {image: "python:3.13-alpine"}', 4),
+        (' {image: "python:3.13-alpine", }', 4),
+    ],
+)
+def test_container_image_mapping_forms(tmp_path, mapping, line):
+    text = f"jobs:\n  test:\n    runs-on: ubuntu-latest\n    container:{mapping}\n"
+    found = suggest_with(tmp_path, text)
+    assert where(found.targets) == [("musl-x86_64", CI, line)]
+    assert where(found.pythons) == [("3.13", CI, line)]
+    assert found.unreadable == []
+
+
+def test_container_mapping_with_an_extra_key_is_refused_even_in_flow_form(tmp_path):
+    text = (
+        "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
+        '    container: {image: "python:3.13-alpine", options: "--cpus 2"}\n'
+    )
+    targets, refused, found = read(tmp_path, text)
+    assert targets == []
+    assert found.pythons == []
+    assert refused == [(4, "job test: container: options isn't read")]
+
+
+def test_a_container_on_ubuntu_slim_is_refused(tmp_path):
+    # ubuntu-slim runs in a container itself and can't run a job container.
+    found = suggest_with(tmp_path, "jobs:\n  test:\n    runs-on: ubuntu-slim\n    container: python:3.13-alpine\n")
+    assert found.targets == []
+    assert unreadable(found) == [
+        (CI, 3, "job test: ubuntu-slim runs in a container itself, so it can't run a job container")
+    ]
+
+
+def test_setup_python_in_a_container_that_cant_be_read_suggests_nothing(tmp_path):
+    # The image might be musl, where setup-python can't run, so its Python isn't suggested either.
+    found = suggest_with(
+        tmp_path,
+        "jobs:\n  test:\n    runs-on: ubuntu-latest\n    container: ${{ matrix.image }}\n    steps:\n"
+        "      - uses: actions/setup-python@v6\n        with:\n          python-version: '3.11'\n",
+    )
+    assert found.targets == []
+    assert found.pythons == []
+    assert [u.reason for u in found.unreadable] == ["job test: container: ${{ matrix.image }} is an expression"]

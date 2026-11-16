@@ -66,11 +66,16 @@ nav:
   - Guides:
       - Inputs: inputs.md
       - Targets: targets.md
+      - Windows on ARM: windows-arm.md
+      - Free-threaded Python: free-threading.md
       - Configuration: configuration.md
       - Output: output.md
       - CI: ci.md
       - Comparing two lockfiles: diff.md
       - Recipes: recipes.md
+  - Case studies:
+      - Overview: case-studies/index.md
+      - mitmproxy: case-studies/mitmproxy.md
   - Integrations:
       - Python API: python-api.md
       - MCP server: mcp.md

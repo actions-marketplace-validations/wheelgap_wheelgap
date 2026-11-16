@@ -18,9 +18,9 @@ wheelgap psycopg2 numpy==2.3.4    # package names, with or without a version
 | [`pdm.lock`](#pdmlock) | yes, if it lists files | no |
 | [`Pipfile.lock`](#pipfilelock) | no | no |
 | [`pixi.lock`](#pixilock) | no | no |
-| [requirements files](#requirements-files) | no | no |
-| [`pyproject.toml`](#pyprojecttoml) | no | no |
-| [package names](#package-names) | no | no |
+| [requirements files](#requirements-files) | no | with `--deps` (after 0.11.0) |
+| [`pyproject.toml`](#pyprojecttoml) | no | with `--deps` (after 0.11.0) |
+| [package names](#package-names) | no | with `--deps` |
 
 "Read without network" means the lockfile records every file published for each pinned version, so wheelgap
 needs no index lookup (except when its `requires-python` leaves out a Python you check; see
@@ -64,6 +64,15 @@ only a Windows-only dependency pulls in isn't reported on Linux.
 
 **Skipped:** packages whose source is `editable`, `virtual`, `git`, `path`, `directory` or `url`. Packages from
 another index keep their locked files and are never looked up on PyPI.
+
+**Build restrictions:** wheelgap reads `no-build`, `no-build-package`, `no-binary` and
+`no-binary-package` from the adjacent `pyproject.toml`'s `[tool.uv]` table or `uv.toml`. When both
+files are present, `uv.toml` takes precedence, as it does for `uv sync`. These settings affect
+index packages (not local, Git or editable packages that wheelgap skips). `no-build` forbids
+source builds; `no-binary` excludes wheels. `--explain` identifies the applicable settings.
+Invalid setting types are input errors. Only the files beside the lock are read: settings in a `uv.toml` in a
+parent directory, in your user-level uv config or in `UV_NO_BUILD`-style environment variables aren't. `wheelgap diff`
+with a git ref reads that ref's `pyproject.toml` and `uv.toml` beside the lock.
 
 **Python versions outside `requires-python`:** uv only keeps the wheels that can serve the lock's `requires-python`.
 If it leaves out a Python you check (say `==3.13.*`, checked with `-p 3.14t`), wheelgap also looks the lock's PyPI
@@ -235,6 +244,11 @@ are skipped.
 `name @ https://…`). Other pip options in the file, such as `--index-url` or `--hash`, are ignored: use wheelgap's
 own [`--index-url`](cli.md#index-url) to look packages up on another index.
 
+**`--deps`:** with [`--deps`](cli.md#deps) a requirements file is resolved instead — every requirement line is a
+root, and the whole tree it installs is checked per target. Constraint files and `--no-binary` / `--only-binary`
+apply to the resolved packages too. A fully pinned file that already lists what it installs (`pip-compile` output
+with `--hash` lines or `# via` comments) needs no resolving: wheelgap says so and checks it as written.
+
 ## pyproject.toml
 
 Libraries usually don't commit a lockfile. Pass the library's `pyproject.toml` to check the dependencies it declares
@@ -245,14 +259,17 @@ wheelgap pyproject.toml -t win-arm64 -t pyodide
 # Add [project.optional-dependencies] groups
 wheelgap pyproject.toml --extra test
 wheelgap pyproject.toml --all-extras
+# Resolve what the declared requirements and the selected extra install
+wheelgap pyproject.toml --extra test --deps -t win-arm64 --explain
 ```
 
 Each requirement is read like a line of a requirements file, so ranges and bare names use the newest matching release
 and markers are respected. A range picks the newest release whose `Requires-Python` allows each `-p` version, so with
 several it can pick a different release per Python ([how it works](how-it-works.md)). A bare name always checks the
 latest release, even for a `-p` version that can't install it, so it can show false gaps. Only direct
-dependencies are checked: their own dependencies aren't, and wheelgap always prints a note saying so. Use a lockfile
-for the full picture.
+dependencies are checked by default and wheelgap prints a note saying so. After 0.11.0, add [`--deps`](cli.md#deps) to resolve
+them and the selected extras using PyPI's metadata for each target. Projects that configure a custom installer
+index or source need a lockfile for this check.
 
 If `[project] requires-python` leaves out a `-p` Python (every clause counts, as pip applies them), that target is
 still checked and a note names it; an invalid `requires-python` is ignored with a note.
@@ -275,3 +292,11 @@ the newest matching release. An argument that is also the name of a file or dire
 directory, so pin the package to check it on PyPI instead (`wheelgap numpy==2.3.4`). The same goes for the subcommand
 names as the first argument: `wheelgap diff==2023.12.6` checks the PyPI package `diff`, and
 `wheelgap mcp==2.3.0` the package `mcp`.
+
+`--deps` also checks what the names install, which is where the gap usually is: `mcp` is pure Python,
+but on Windows on ARM `pip install mcp` compiles cryptography (`mcp → PyJWT → cryptography`). wheelgap resolves the
+tree for each target from PyPI's metadata, following markers and extras as pip evaluates them there, and takes the
+newest release that meets every constraint, supports that target's Python and isn't yanked. It isn't pip's resolver:
+when constraints only a backtracking resolver could untangle come up, it stops with an error instead of guessing, and a
+release whose dependencies it can't read is `unknown`. A lockfile from `uv lock` or `pip-compile` is exact, so prefer
+one when you have it. See [`--deps`](cli.md#deps).

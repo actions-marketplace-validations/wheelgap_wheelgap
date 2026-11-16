@@ -1,9 +1,9 @@
 """Seeded differential tests of --suggest-targets' workflow scan against PyYAML.
 
 Each generated workflow is read twice: by the scanner, and by PyYAML (`yaml.compose`, so plain and quoted scalars stay
-apart) followed by GitHub's semantics written out plainly below, with their own runner and architecture tables rather
-than the module's. The scanner may refuse what it can't read, but whatever it suggests must be what the YAML says: its
-targets and Pythons are a subset of the oracle's, and equal to them when it refused nothing.
+apart) followed by GitHub's semantics written out plainly below, with their own runner, architecture and container
+image tables rather than the module's. The scanner may refuse what it can't read, but whatever it suggests must be what
+the YAML says: its targets and Pythons are a subset of the oracle's, and equal to them when it refused nothing.
 
 Three generators: realistic workflows with varied YAML (`realistic`), random atoms of YAML syntax around and inside
 real values (`atoms`), and junk values next to a fixed 32-bit setup step that a misread would turn into win-amd64
@@ -20,6 +20,48 @@ from wheelgap.suggest_targets import Suggestions, read_workflow_text
 
 yaml = pytest.importorskip("yaml")
 
+# The container images the generators use, with the (family, Python) each names. The architecture comes from the
+# runner's CPU: Actions pulls the image without forcing a platform. An independent table, like RUNNERS and ARCH below;
+# tests/test_dockerfile.py pins the image parsing itself.
+CONTAINERS = {
+    "python:3.12": ("linux", "3.12"),
+    "python:3.13-alpine": ("musl", "3.13"),
+    "python:3.11-slim": ("linux", "3.11"),
+}
+# GitHub Actions only supports job containers on Linux runners. An unknown, unresolved, or non-Linux runner gives no
+# target (wheelgap refuses it).
+CONTAINER_ARCH = {
+    "ubuntu-latest": "x86_64",
+    "ubuntu-24.04-arm": "aarch64",
+    "ubuntu-22.04": "x86_64",
+    "ubuntu-22.04-arm": "aarch64",
+}
+
+
+def container_target(image, label):
+    """The target a literal container image runs on a runner label, or None when either can't be resolved."""
+    if image not in CONTAINERS:
+        return None
+    arch = CONTAINER_ARCH.get((label or "").lower())
+    if arch is None:
+        return None
+    family, python = CONTAINERS[image]
+    return f"{family}-{arch}", python
+
+
+def container_image(job):
+    """The literal image a job runs in, or None when the container is unreadable (an expression, a mapping with any
+    key besides image:, or a value that isn't a single scalar)."""
+    c = job.get("container")
+    if isinstance(c, dict):
+        if len(c) != 1 or not isinstance(c.get("image"), S):
+            return None
+        c = c["image"]
+    if not isinstance(c, S) or "${{" in c.text:
+        return None
+    return c.text
+
+
 # The labels the generators use, with the target each runs on (GitHub's runner list), and setup-python's
 # architectures where they're certain.
 RUNNERS = {
@@ -35,6 +77,8 @@ RUNNERS = {
 ARCH = {
     ("linux-x86_64", "x64"): "linux-x86_64",
     ("linux-aarch64", "arm64"): "linux-aarch64",
+    ("musl-x86_64", "x64"): "musl-x86_64",
+    ("musl-aarch64", "arm64"): "musl-aarch64",
     ("win-amd64", "x64"): "win-amd64",
     ("win-amd64", "x86"): "win32",
     ("win-arm64", "arm64"): "win-arm64",
@@ -154,13 +198,34 @@ def oracle(text):
                     inputs = step.get("with") or {}
                     inputs = {k.lower(): v for k, v in inputs.items()} if isinstance(inputs, dict) else {}
                     setups.append((action == "actions/setup-python", inputs))
+        container = container_image(job)
+        # setup-python has no musl builds: in an Alpine image the step fails and the job never runs, so nothing from
+        # it counts (no target, no Python).
+        blocked = container is not None and CONTAINERS.get(container, ("",))[0] == "musl" and any(p for p, _ in setups)
+        if blocked:
+            setups = [(is_python, inputs) for is_python, inputs in setups if not is_python]
+        # A step that picks the interpreter puts its Python first on PATH, so the image's own isn't the job's.
+        picks = any(is_python or "python-version" in i or "python-arch" in i for is_python, i in setups)
         for combo in combos:
-            label = value(job.get("runs-on"), combo) if "container" not in job else None
-            target = RUNNERS.get((label or "").lower())
+            label = value(job.get("runs-on"), combo)
+            if "container" in job:
+                # The image is pulled for the runner's CPU. Any `container:` key suppresses runner inference, even
+                # when the container itself can't be read (an expression, extra keys, or an unsupported shape).
+                resolved = None if blocked else container_target(container, label)
+                if resolved is not None:
+                    target = resolved[0]
+                    if not picks:
+                        pythons.add(resolved[1])
+                else:
+                    target = None
+            else:
+                target = RUNNERS.get((label or "").lower())
             # Each step that picks an interpreter: setup-python (its architecture, the runner's own when unset or
-            # ''), and setup-uv with a Python (the runner's own).
+            # ''), and setup-uv with a Python (the runner's own, or None if python-arch is set).
             archs = [
-                (value(i["architecture"], combo) if "architecture" in i else "") if is_python else ""
+                (value(i["architecture"], combo) if "architecture" in i else "")
+                if is_python
+                else (None if "python-arch" in i else "")
                 for is_python, i in setups
                 if is_python or "python-version" in i or "python-arch" in i
             ] or [""]
@@ -284,6 +349,12 @@ def realistic_job(rng):
             exclude.append({"os": rng.choice(matrix["os"]), "python": rng.choice(matrix["python"])})
     runs_on = "${{ matrix.os }}" if use_matrix and rng.random() < 0.8 else rng.choice(LABELS)
     lines = [f"    runs-on: {runs_on if '$' in runs_on else scalar(rng, runs_on)}{comment(rng)}"]
+    if rng.random() < 0.25:  # a job whose image names its target instead of the runner
+        image = rng.choice([*CONTAINERS, "${{ matrix.image }}", "c"])
+        if rng.random() < 0.4:
+            lines += ["    container:", f"      image: {scalar(rng, image)}"]
+        else:
+            lines.append(f"    container: {scalar(rng, image)}{comment(rng)}")
     if rng.random() < 0.4:
         lines.append("    env:")
         lines += [f"      V{n}: {scalar(rng, text)}{comment(rng)}" for n, text in enumerate(rng.sample(NOISE, 3))]
@@ -671,6 +742,22 @@ def test_scan_never_disagrees_with_pyyaml(generator, cases, least_valid, least_e
     assert exact >= least_exact
 
 
+@pytest.mark.parametrize(
+    "container",
+    [
+        "${{ inputs.image }}",  # an expression
+        "c",  # a valid scalar, but not an image the oracle knows
+        "[python:3.12]",  # a sequence, not a scalar
+    ],
+)
+def test_unreadable_container_suppresses_runner_inference_in_both_oracles(container):
+    # The helpers return None for these, but the job still has a container: key. Runner inference must stay suppressed
+    # in both oracles, or an unreadable container would be scanned as if it ran on the runner's own target.
+    text = f"jobs:\n  test:\n    runs-on: ubuntu-24.04-arm\n    container: {container}\n"
+    assert oracle(text) == (set(), set())
+    assert oracle5(text) == (set(), set())
+
+
 # --- round5: the review's generator for the whitelist's widenings (continuation lines, anchors and aliases, escaped
 # strings, nested flows, `key: {a: b}`, object matrices), with its own oracle and tables. ---
 
@@ -686,6 +773,8 @@ RUN5 = {
 ARCH5 = {
     ("linux-x86_64", "x64"): "linux-x86_64",
     ("linux-aarch64", "arm64"): "linux-aarch64",
+    ("musl-x86_64", "x64"): "musl-x86_64",
+    ("musl-aarch64", "arm64"): "musl-aarch64",
     ("win-amd64", "x64"): "win-amd64",
     ("win-amd64", "x86"): "win32",
     ("win-arm64", "arm64"): "win-arm64",
@@ -696,6 +785,20 @@ ARCH5 = {
 PYTHON5 = re.compile(r"3\.(\d+)(?:\.\d+)?(t?)")
 REF5 = re.compile(r"\$\{\{[ \t]*matrix\.([A-Za-z_][A-Za-z0-9_-]*)[ \t]*\}\}")
 NUM5 = re.compile(r"[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?")
+IMAGES5 = [*CONTAINERS]
+
+
+def container5(job):
+    """The literal image a job runs in, or None when the container is unreadable (an expression, a mapping with any
+    key besides image:, or a value that isn't a single scalar)."""
+    c = job.get("container")
+    if isinstance(c, dict):
+        if len(c) != 1 or not isinstance(c.get("image"), S5):
+            return None
+        c = c["image"]
+    if not isinstance(c, S5) or "${{" in c.text:
+        return None
+    return c.text
 
 
 class S5:
@@ -824,9 +927,30 @@ def oracle5(text):
                     w = s.get("with")
                     w = {k.lower(): v for k, v in w.items()} if isinstance(w, dict) else {}
                     setups.append((a, w))
+        container = container5(job)
+        # As in oracle(): setup-python can't run in an Alpine image, so such a job counts for nothing; otherwise a step
+        # that picks the interpreter makes its Python the job's, not the image's.
+        blocked = (
+            container is not None
+            and CONTAINERS.get(container, ("",))[0] == "musl"
+            and any(a.endswith("python") for a, _ in setups)
+        )
+        if blocked:
+            setups = [(a, w) for a, w in setups if not a.endswith("python")]
+        picks = any(a.endswith("python") or "python-version" in w or "python-arch" in w for a, w in setups)
         for combo in combos:
-            label = val5(job.get("runs-on"), combo) if "container" not in job else None
-            tgt = RUN5.get((label or "").lower())
+            label = val5(job.get("runs-on"), combo)
+            if "container" in job:
+                # As in oracle(): any `container:` key suppresses runner inference, even when its image can't be read.
+                resolved = None if blocked else container_target(container, label)
+                if resolved is not None:
+                    tgt = resolved[0]
+                    if not picks:
+                        P.add(resolved[1])
+                else:
+                    tgt = None
+            else:
+                tgt = RUN5.get((label or "").lower())
             archs = [
                 val5(w["architecture"], combo)
                 if a.endswith("python") and "architecture" in w
@@ -1171,8 +1295,10 @@ def model5(r):
         parts.append(("runs-on", "${{ matrix.os }}" if use_m and r.random() < 0.55 else r.choice(labels)))
         if use_m:
             parts.append(("strategy", {"fail-fast": "false", "matrix": m} if r.random() < 0.5 else {"matrix": m}))
-        if r.random() < 0.06:
-            parts.append(("container", r.choice(["python:3.12", {"image": "x"}])))
+        if r.random() < 0.2:
+            parts.append(
+                ("container", r.choice([*IMAGES5, {"image": r.choice(IMAGES5)}, {"image": "x"}, "c", "${{ x }}"]))
+            )
         if r.random() < 0.15:
             parts.append(("if", "github.event_name == 'push' && x"))
         if r.random() < 0.4:

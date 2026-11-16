@@ -13,7 +13,7 @@ Flags that take a list (`-p`, `-t`, `--extra`, `--group`, `--only-group`, `--ign
 can be repeated; `-p`, `-t`, `--ignore` and `--advisory` also take comma-separated values. Flags win over
 [`[tool.wheelgap]`](configuration.md).
 
-`wheelgap --help` lists the flags of the version you run. This page describes `main`; flags marked **after 0.10.0**
+`wheelgap --help` lists the flags of the version you run. This page describes `main`; flags marked **after 0.11.0**
 aren't in a release yet.
 
 ## Targets
@@ -64,6 +64,14 @@ unless `--dockerfile`, `[tool.wheelgap] targets` or uv's `required-environments`
 
 `--dockerfile PATH`: take the Python, the platform and the glibc or musl version from the image of the Dockerfile's
 final stage, such as `FROM python:3.13-alpine`. `-p`, `-t`, `--glibc` and `--musl` still win. See
+[From a Dockerfile](targets.md#from-a-dockerfile).
+
+### `--build-arg` {#build-arg}
+
+**After 0.11.0.** `--build-arg NAME=VALUE` (repeatable, with `--dockerfile`): the value `docker build --build-arg`
+gives a global ARG, so `FROM python:${PYTHON_VERSION}-slim` is read with the Python the build picks. It replaces the
+ARG's default, or gives a value to an ARG with none; values follow the same rules as defaults (no quotes, escapes or
+`$`). A name no ARG before the first `FROM` declares is ignored, as Docker ignores it there, with a note. See
 [From a Dockerfile](targets.md#from-a-dockerfile).
 
 ### `--pyodide-lock` {#pyodide-lock}
@@ -134,6 +142,56 @@ directory's `pixi.lock` the lockfile read. Naming one for any other input is an 
 
 ## Index access
 
+### `--dist` {#dist}
+
+**After 0.11.0.** Check the files you're about to upload — the `dist/` folder `python -m build` or `uv build` leaves —
+as the release they make: for each target, whether one of the wheels installs there or the build falls back to the
+sdist, with the same statuses and `--explain` reasons as a lockfile row. It takes no other inputs; the project's name
+and version come from the wheel and sdist filenames, and a folder that mixes projects or versions is refused.
+
+The baseline is the newest release on PyPI older than this one (so a 1.9.3 maintenance release is compared with 1.9.2,
+not with 2.0), looked up by the project's name (a final release ignores earlier pre-releases, so a 1.0 whose only
+predecessor is 1.0rc1 counts as a first release): a target it had a wheel for that these files don't, on a Python that
+wheel's Requires-Python allowed, is reported as dropped (`win-arm64: 46.0.3 had a wheel, this release has none`) and
+fails the run, on top of the usual gap exit. `--json` has them as `dropped`, a map of target label to the last release's
+version (`{}` when nothing was dropped or the project has no release to compare — a first release — and absent when the
+lookup failed). The comparison needs PyPI's JSON API, so `--dist` is an error with `--offline` or `--index-url` (and
+with `--online`, which would check PyPI's files instead of these). An `--ignore`d or `--advisory` target is left out, as
+for gaps. The comparison is skipped with a note when a pip or uv index variable (`PIP_INDEX_URL` and the like) is set,
+since PyPI's project of that name may not be yours. If the previous release couldn't be looked up, a note says the
+comparison didn't run; both notes show even with `-q`, so a gate that didn't compare never passes silently.
+### `--deps` {#deps}
+
+For package names on the command line or (after 0.11.0) requirements files and dependencies declared in
+`pyproject.toml`, also check what they install.
+For a project file, this includes any extras you select with `--extra` or `--all-extras`. wheelgap resolves the
+tree for each target from PyPI's metadata: for each requirement, the newest release that meets every constraint on it,
+supports the target's Python and isn't yanked (a yanked release only for an `==` pin), following markers and extras as
+pip evaluates them on that target. `--explain` shows the path to each gap (`via: mcp → PyJWT → cryptography`), and
+`--json --explain` has it as `via`. After 0.11.0, `--explain` with `--deps` also turns on [`--suggest`](#suggest),
+so each gap ends with the release to move to (`--no-suggest` turns it off). A release picked differently for two Pythons is a row for each.
+
+With a requirements file, each requirement line is a root — pinned or not, with its markers and extras — and `-r`
+includes are read too. A `-c` constraint file's constraints apply to the resolved tree, to dependencies as well as
+named packages, and one wheelgap can't apply marks the package `unknown`, as without `--deps`. `--no-binary` and
+`--only-binary` lines apply to the resolved packages as they do to the file's own. Editable, path and URL lines stay
+skipped. A file that already lists what it installs — every requirement pinned, with `pip-compile`'s `--hash` lines or
+`# via` comments — needs no resolving: wheelgap says so and checks it as written.
+
+It isn't pip's resolver. When a later constraint rules out a release it already picked, it starts again with that
+constraint known; if the constraints on a package can't all be met, it stops with an error rather than guess. A release
+whose dependencies it can't read (an sdist-only release with no `Requires-Dist` on PyPI, say) is `unknown`. Where pip
+would backtrack to an older release of a package to satisfy an upper bound (`"numpy<2" pandas`), it stops with that
+error too. A package with no release that installs on a target (no matching wheel or sdist) is shown at its newest
+matching release, as `missing`, rather than walking back to an old release of whatever depends on it. Dependencies are
+read from a wheel's own metadata file, since PyPI's JSON page can leave them out. A marker it can't evaluate for a
+target (`platform_release`) counts as true there. It looks
+up each package in the tree on the PyPI JSON API, so it doesn't work with `--offline`, `--index-url` or a lockfile
+input. It also refuses a project that configures another installer index or source in its own files, or
+when a pip or uv index variable (`PIP_INDEX_URL`, `UV_INDEX_URL` and the like) is set; it can't see a `pip.conf` or
+your user-level uv config, so with a private index there, use a lockfile. A lockfile from `uv lock` or
+`pip-compile` is exact, so prefer one when you have it.
+
 ### `--online` {#online}
 
 Re-check lockfile packages against PyPI instead of trusting the files the lockfile lists, for when a project has
@@ -196,6 +254,10 @@ package with a gap, such as a binary package to use instead. It sends the names 
 wheelgap.github.io, so it's opt-in, and only for names that pass [the PyPI-origin rule](how-it-works.md#pypi-origin);
 never with `--offline`, `--index-url` or a `WHEELGAP_INDEX_URL` mirror. `notes = true` in `[tool.wheelgap]` turns it
 on by default, and `--no-notes` turns it off for one run. See [Tracker notes](output.md#notes).
+It also shows the tracker's [build lab results](output.md#build-lab) for a `source` cell, from the
+same file: whether exactly that release built from its sdist and imported on GitHub's runners for that target. They're
+the lab's dated observations on GitHub's runners, which have compilers and many system libraries preinstalled, so a
+build that works there can still need setup on your machine. Nothing the lab built is downloaded.
 
 ### `--build-info` {#build-info}
 
@@ -205,15 +267,38 @@ opt-in, and only for packages that pass [the PyPI-origin rule](how-it-works.md#p
 `--index-url`, `WHEELGAP_INDEX_URL` or a pip or uv index setting in the environment. `build-info = true` in
 `[tool.wheelgap]` turns it on by default. See [Build requirements](output.md#build-info).
 
-### `--suggest` {#suggest}
+### `--suggest`, `--no-suggest` {#suggest}
 
 With `--explain`, also name the lowest newer release with a wheel for a pinned package's gap targets
 (`fastlib 2.0.0 -> 2.1.0 has wheels for musl-aarch64, win-amd64`) that keeps the wheels the package has on its other
 targets, or each target's nearest when no one release has them all. It looks each package with a gap up on pypi.org
 once, only for names that pass [the PyPI-origin rule](how-it-works.md#pypi-origin), and never changes a status, the
-summary or the exit code. A run with `--index-url` or `WHEELGAP_INDEX_URL` looks nothing up, `--offline` refuses the
-flag, and it has no Markdown form yet. With `--json`, adds `suggest` to each package with a gap. See
+summary or the exit code. A run with `--index-url` or `WHEELGAP_INDEX_URL` looks nothing up, and `--offline` refuses the
+flag. With `--markdown`, it renders suggestions as a Markdown list under the explanation. With `--json`, adds `suggest` to each package with a gap. See
 [Newer releases](output.md#suggest).
+
+**After 0.11.0.** With `--deps --explain` it's on by default, since `--deps` already looks every package in the tree
+up on PyPI: each gap ends with the way out, the nearest newer release with the wheel or the last older one that had
+it. That's only when `--deps` resolved every input; with a lockfile or an already-pinned requirements file among them,
+it stays opt-in, since those packages' names weren't sent to PyPI. `--no-suggest` turns it off.
+
+### `--write-constraints` {#write-constraints}
+
+**After 0.11.0.** `--write-constraints FILE` (with `--explain --suggest`, or `--deps --explain`, which turns `--suggest` on): also write what `--suggest` found to a
+pip/uv constraints file, one pin per package:
+
+```text
+cryptography==46.0.3  # wheels for win-arm64; 50.0.2 has none
+```
+
+A package gets a pin only when a single release has wheels for every gap target `--suggest` named a release for, and
+it keeps every wheel the checked release has: a newer one as `--suggest` names it, or the last older one that had a
+wheel. A package whose gaps need different releases, or whose only release with a wheel for a target drops one
+elsewhere, is left out with a comment saying why, and so is a version range that resolved to different releases on
+different Pythons. The file isn't checked against the rest of the dependency tree, so check that it still resolves:
+`pip install -c FILE -r requirements.txt` or `uv pip compile -c FILE requirements.in`. Gaps on `--advisory` targets count
+too, so a pin can move a package for a target that wouldn't fail the run. It's written even when the check fails; an
+empty `FILE` is an error, as for `--junit`.
 
 ### `-q`, `--quiet`, `--no-quiet` {#quiet}
 
@@ -233,6 +318,16 @@ a pull request comment. See [Output](output.md#markdown).
 
 `--junit PATH`: also write a JUnit XML report to `PATH`, alongside the usual output. See
 [Output](output.md#junit-xml).
+
+### `--badge` {#badge}
+
+**After 0.11.0.** `--badge PATH`: also write a [shields.io endpoint](https://shields.io/badges/endpoint-badge) file
+to `PATH`, alongside the usual output, with how many of the checked targets have wheels for everything:
+`{"schemaVersion": 1, "label": "wheels", "message": "7/8 targets", "color": "yellow"}`. A target counts when nothing on
+it is `source` or `missing` (a gap `--ignore` accepts there doesn't count against it; an `--advisory` target's gaps
+do). The colour is `brightgreen` when every target counts, `red` when none does and `yellow` in between. If any result
+is `unknown`, the message is `unknown` (`lightgrey`) instead of a count. The file is written even when the check fails,
+so CI can publish it; an empty `PATH` is an error, as for `--junit`. See [Recipes](recipes.md#readme-badge).
 
 ### `--github-annotations` {#github-annotations}
 
@@ -283,7 +378,7 @@ the platforms as JSON. Can't be combined with `--markdown`.
 `--suggest-targets [DIR]`: read the platforms and Pythons that `DIR` (default: the current directory)
 already names in its GitHub Actions workflows and Dockerfiles, print each with the file and line it came from, then a
 `[tool.wheelgap]` snippet to paste into `pyproject.toml`. It only suggests: nothing is changed or checked, and it exits
-0. With `--json`, it prints the same as an object. It can't be combined with `-p`, `-t`, `--dockerfile`,
+0. With `--json`, it prints the same as an object. It can't be combined with `-p`, `-t`, `--dockerfile`, `--build-arg`,
 `--list-targets`, `--markdown` or input files, and a `DIR` that isn't a folder exits 2. What it can't read for sure is
 listed with its file and line rather than guessed. See
 [Suggest targets from your CI and Dockerfiles](targets.md#suggest-targets).

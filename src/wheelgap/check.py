@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import lru_cache
@@ -565,6 +565,21 @@ def marker_holds(
 Parent = int | str | None
 
 
+def _uv_source_matches(package: dict, edge_source: dict[str, object]) -> bool:
+    """Match uv source tables, including git manifests without a resolved commit.
+
+    uv lock --script writes \x60git = "URL"\x60 in the manifest, while the matching
+    package's source has \x60git = "URL#commit"\x60.
+    """
+    locked = package.get("source")
+    if locked == edge_source:
+        return True
+    if not isinstance(locked, dict) or set(locked) != {"git"} or set(edge_source) != {"git"}:
+        return False
+    requested, resolved = edge_source["git"], locked["git"]
+    return isinstance(requested, str) and isinstance(resolved, str) and resolved.startswith(f"{requested}#")
+
+
 def _narrow_candidates(
     source: Source,
     candidates: list[int],
@@ -586,7 +601,7 @@ def _narrow_candidates(
         candidates = matched or candidates  # retain conservative fallback for incomplete lock metadata
     if edge_source is not None and source.uv_packages is not None:
         uv_packages = source.uv_packages
-        sourced = [i for i in candidates if uv_packages[i].get("source") == edge_source]
+        sourced = [i for i in candidates if _uv_source_matches(uv_packages[i], edge_source)]
         candidates = sourced or candidates
     return candidates
 
@@ -669,6 +684,32 @@ def _uv_reachable(source: Source, target: Target, paths: dict[int, list[str]] | 
     return parents
 
 
+def dropped_targets(local: list[str], last: list[tuple[str, str | None]], targets: Iterable[Target]) -> list[Target]:
+    """`--dist`: targets the last release had an installable wheel for but the checked files don't. `last` is the
+    previous release's files as (filename, Requires-Python): a wheel whose Requires-Python leaves the target's Python
+    out wasn't installable there, so not shipping one now isn't a drop."""
+    local_wheels = wheel_tags(local)
+    last_wheels: list[tuple[frozenset[Tag], str | None]] = []
+    for name, requires in last:
+        if name.endswith(".whl") and (tags := _parsed_tags(name)) is not None:
+            last_wheels.append((tags, requires))
+
+    def fits(requires: str | None, target: Target) -> bool:
+        if requires is None:
+            return True
+        try:  # a real interpreter is on a later patch than X.Y.0, as pip compares it
+            return SpecifierSet(requires).contains(f"{target.major}.{target.minor}.99")
+        except InvalidSpecifier:
+            return True
+
+    return [
+        t
+        for t in targets
+        if any(t.accepts(tags) and fits(requires, t) for tags, requires in last_wheels)
+        and not any(t.accepts(tags) for tags in local_wheels)
+    ]
+
+
 def reachable(source: Source, target: Target) -> dict[int, Parent]:
     """Packages installed on `target`, each mapped to the parent it was first reached from.
 
@@ -749,14 +790,17 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
     rows: list[Row] = []
     for source in sources:
         paths: dict[Target, dict[int, list[str]]] = {target: {} for target in targets}
-        installed = (
-            {
+        installed: dict[Target, dict[int, Parent]] | dict[Target, dict[int, list[str]]] | None
+        if source.deps_paths is not None:  # --deps: resolved per target already
+            paths = {t: source.deps_paths.get(t, {}) for t in targets}
+            installed = paths
+        elif source.edges is not None:
+            installed = {
                 t: _uv_reachable(source, t, paths[t]) if source.uv_selection is not None else reachable(source, t)
                 for t in targets
             }
-            if source.edges is not None
-            else None
-        )
+        else:
+            installed = None
         for i, pkg in enumerate(source.packages):
             if pkg.skip:
                 continue
@@ -786,7 +830,9 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                 )
                 if needed and installed is not None:
                     row.via[t] = (
-                        paths[t][i] if source.uv_selection is not None else dependency_path(source, installed[t], i)
+                        paths[t][i]
+                        if source.uv_selection is not None or source.deps_paths is not None
+                        else dependency_path(source, installed[t], i)  # type: ignore[arg-type]
                     )
             rows.extend(resolved_rows.values())
     return rows

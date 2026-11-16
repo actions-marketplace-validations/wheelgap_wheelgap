@@ -249,6 +249,13 @@ def fetch_json(
         return _request(req, timeout, attempts, lambda resp: json.loads(_read_capped(resp, max_bytes)))
 
 
+def fetch_text(url: str, max_bytes: int, timeout: float = 20.0, attempts: int = 4) -> str:
+    """GET a small text document, such as a wheel's PEP 658 metadata file (see _request for what is retried)."""
+    headers = {"User-Agent": f"wheelgap/{__version__}", "Accept-Encoding": "gzip"}
+    req = urllib.request.Request(url, headers=headers)
+    return _request(req, timeout, attempts, lambda resp: _read_capped(resp, max_bytes).decode("utf-8", "replace"))
+
+
 # A project's JSON API page lists every file of every release: grpcio's is about 10 MB, numpy's about 4 MB.
 RELEASES_MAX_BYTES = 32 * 1024 * 1024
 
@@ -796,6 +803,41 @@ def fill(
     if key and write_cache and cached is None and valid:
         cache.save_files(*key, _files(data["urls"]))
     return pkg
+
+
+def previous_release(name: str, version: str) -> tuple[str, list[tuple[str, str | None]]] | None:
+    """For --dist's dropped-target check: the newest release of the project older than `version`, with its
+    files that aren't yanked, each as (filename, its Requires-Python or None). Older, not newest: a 1.9.3
+    maintenance release is compared with 1.9.2, not with 2.0. Pre-releases count only when `version` is one, and a
+    release whose every file is yanked is passed over. None when there's no such release (a first release, or the
+    project isn't on the index at all)."""
+    try:
+        data = fetch_json(f"{index_url()}/{quote(name)}/json", max_bytes=RELEASES_MAX_BYTES)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    releases = data.get("releases") if isinstance(data, dict) else None
+    if not isinstance(releases, dict):
+        raise ValueError("the index gave no release list")
+    current = Version(version)
+    older: list[tuple[Version, str, list[tuple[str, str | None]]]] = []
+    for text, entries in releases.items():
+        try:
+            v = Version(text)
+            live = [
+                (e["filename"], e["requires_python"] if isinstance(e.get("requires_python"), str) else None)
+                for e in _files(entries)
+                if not e.get("yanked")
+            ]
+        except (InvalidVersion, ValueError):
+            continue
+        if v < current and live and (current.is_prerelease or not v.is_prerelease):
+            older.append((v, text, live))
+    if not older:
+        return None
+    _, text, live = max(older)
+    return text, live
 
 
 def _fill_json_data(pkg: Package, data: dict, python: str | None, base: str) -> Package:

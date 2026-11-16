@@ -25,7 +25,7 @@ All five are read-only. They look packages up on PyPI, or on the index in
 
 - `check_package`: one package, the latest release or a given version, on each
   target. `explain: true` adds why each target with a gap can't use its
-  wheels.
+  wheels, and (after 0.11.0) `dependencies: true` checks what it installs too.
 - `check_lockfile`: the same answer as `wheelgap PATH --json`, `[tool.wheelgap]`
   settings included: the packages with gaps, the ones it skipped (git, path and
   private-index packages, which aren't checked) and any notes. It also returns
@@ -33,9 +33,12 @@ All five are read-only. They look packages up on PyPI, or on the index in
 - `check_dockerfile`: the answer of
   `wheelgap PATH --dockerfile DOCKERFILE --json` (`PATH` defaults to the
   Dockerfile's folder), plus the `image` it read (`python`, `platform`,
-  `glibc`, `musl`), so an agent can ask before switching `python:3.13-slim` to
-  `-alpine` or adding `--platform=linux/arm64`. A Dockerfile wheelgap can't read
-  is a tool error.
+  `glibc`, `musl`, `build_args`), so an agent can ask before switching `python:3.13-slim` to
+  `-alpine` or adding `--platform=linux/arm64`. `build_args` maps global ARG names
+  used by the image's `FROM` to their values (or `{}` if none were used). If a
+  Docker build overrides them with `--build-arg`, pass the same values as the
+  `build_args` argument (**After 0.11.0**), as `--build-arg` does on the
+  command line. A Dockerfile wheelgap can't read is a tool error.
 - `diff_lockfiles`: takes an `old` and a `new` lockfile (plus `python` and
   `targets`) and answers as `wheelgap diff OLD NEW --json` does, with `ok`
   added: the packages that got worse on a target and the new ones with gaps. An
@@ -47,6 +50,11 @@ All five are read-only. They look packages up on PyPI, or on the index in
 On `pyodide` targets, `check_package` and `check_lockfile` take an optional
 `pyodide_lock` (a path or https URL of a `pyodide-lock.json`, as
 `--pyodide-lock` does), so packages Pyodide ships itself show as `bundled`.
+
+`check_lockfile` also takes an optional `environment` string for
+`pixi.lock` inputs, like the CLI's `--environment`. For example, pass
+`"environment": "test"` to check the `test` environment instead of `default`.
+An unknown environment is a tool error listing the lockfile's environment names.
 
 Pass `check_lockfile`, `check_dockerfile` and `diff_lockfiles` an absolute path
 or a `file://` URI, since the server's working directory may not be your
@@ -210,6 +218,31 @@ package's wheels that target can't use, closest misses first, each with the
 reason (such as `abi3 wheels can't be used on free-threaded Python (only
 abi3t ones can)`), and `rejected_omitted` counting any it left out. Without
 `explain`, the result has only the statuses, which keeps it small.
+
+When a package has gaps, `check_package` also returns `last_with_wheel`, as
+`wheelgap --explain --suggest --json` does: for each gap target that no newer
+release has a wheel for, the newest older release that has one (of the 50
+newest before the one checked), such as `{"3.13 win-arm64": "46.0.3"}`, so an
+agent can answer "pin cryptography to 46.0.3 or earlier". It reads the
+project's release list from PyPI, which is one more request, and is left out
+when there's no gap, when `WHEELGAP_INDEX_URL` points at another index (which
+may hold private names), or when that lookup fails.
+
+**After 0.11.0.** To check what a package installs as well as the package
+itself, as [`--deps`](cli.md#deps) does, pass `dependencies: true`:
+
+> Can I install mcp 2.3.0 on Windows on ARM?
+
+The tree is resolved for each target from PyPI's metadata, and the result adds
+`dependencies_checked` (how many other packages were checked) and
+`dependency_gaps`: each package in the tree with a gap, with its `results`,
+`gaps` and `via`, the path to it on each gap target, such as
+`{"3.13 win-arm64": ["mcp", "PyJWT", "cryptography"]}`. The other fields stay
+those of the package asked about, except `ok`, which is then true only if
+nothing in the tree has a gap. A tree that only a backtracking resolver could
+settle is an error, as it is on the command line.
+When several Pythons pick different releases of the package itself, its
+`results` and `gaps` cover all of them and `versions` lists them.
 
 ## Protocol versions
 

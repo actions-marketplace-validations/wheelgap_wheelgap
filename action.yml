@@ -234,9 +234,14 @@ runs:
         # instead of git's copy, so refuse one.
         old="$ref:./$lockfile"
         [ -e "$old" ] && fail "a file or folder is named like the git ref and lockfile, so git's copy wouldn't be read"
+        suggestions=0
+        if [ "$comment" = true ] && [ -n "$token" ] && [[ "${WHEELGAP_PR:-}" =~ ^[0-9]+$ ]]; then
+          suggestions=1
+        fi
         # wheelgap's stderr quotes the lockfiles (and git's messages), so it reaches the log only with anything the
         # runner would read as a workflow command defused.
-        pipx run --spec "$GITHUB_ACTION_PATH" wheelgap diff "$old" "$lockfile" "$@" --json > "$dir/diff.json" 2> "$dir/diff.err"
+        _WHEELGAP_ACTION_SUGGEST=$suggestions pipx run --spec "$GITHUB_ACTION_PATH" wheelgap diff \
+          "$old" "$lockfile" "$@" --json > "$dir/diff.json" 2> "$dir/diff.err"
         code=$?
         "$py" "$helper" log "$dir/diff.err" || echo "::error::wheelgap: couldn't show wheelgap's messages"
         # The helper's exit code is the result: 0 or 1 only when diff's exit code and report agree, else 2.

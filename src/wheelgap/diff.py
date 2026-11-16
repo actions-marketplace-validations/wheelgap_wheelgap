@@ -39,11 +39,11 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from packaging.utils import canonicalize_name
+from packaging.utils import InvalidName, canonicalize_name
 
-from . import __version__
+from . import __version__, origin, suggest
 from .api import Result, _check_lockfile, make_targets
-from .check import CELL, Status, applies, reachable
+from .check import CELL, Row, Status, applies, reachable
 from .logsafe import guarded_output
 from .sources import Source
 from .targets import DEFAULT_GLIBC, DEFAULT_MACOS, DEFAULT_MUSL, Target, next_python_note, resolve_distro
@@ -219,6 +219,49 @@ def json_report(report: Report, targets: list[Target]) -> str:
     )
 
 
+def add_comment_suggestions(report: Report, rows: list[Row], sources: list[Source], targets: list[Target]) -> None:
+    """Add the check's release suggestions for worsened wheels, using the actual head lockfile's provenance."""
+    if not report.worse or origin.other_index() is not None:
+        return
+    private = origin.private_names(sources)
+    worse: dict[str, dict] = {canonicalize_name(entry["name"]): entry for entry in report.worse}
+    multi_py = len({t.python for t in targets}) > 1
+    wanted: dict[str, list[tuple[str, list[Target], list[Target]]]] = {}
+    for row in rows:
+        pkg = row.package
+        entry = worse.get(pkg.key)
+        if entry is None or not pkg.version or pkg.no_binary:
+            continue
+        changed = entry["targets"]
+        gaps = [
+            t
+            for t, status in row.results.items()
+            if status in (Status.SOURCE, Status.MISSING)
+            and changed.get(t.label(multi_py), {}).get("new_status") == status.value
+        ]
+        if not gaps or not origin.known_pypi(pkg, sources[-1], private=private):
+            continue
+        try:
+            key = canonicalize_name(pkg.name, validate=True)
+        except InvalidName:
+            continue
+        keep = [t for t, status in row.results.items() if status is Status.WHEEL]
+        wanted.setdefault(key, []).append((pkg.version, gaps, keep))
+
+    found, _ = suggest.look_up_all({name: requests for name, requests in wanted.items()})
+    hints = {}
+    for name, answers in found.items():
+        entry = worse[name]
+        lines = []
+        for (version, gaps, _), answer in zip(wanted[name], answers, strict=True):
+            actionable = [t for t in gaps if t in answer.found or t in answer.last]
+            lines.extend(suggest.suggest_lines(entry["name"], version, actionable, answer, multi_py))
+        if lines:
+            hints[name] = list(dict.fromkeys(lines))
+    for name, lines in hints.items():
+        worse[name]["suggestions"] = lines
+
+
 def summary(n_worse: int, n_new: int) -> str:
     if not n_worse and not n_new:
         return "Nothing got worse."
@@ -263,8 +306,9 @@ def _git_blob(ref: str, path: str) -> subprocess.CompletedProcess[bytes]:
 def read_git_ref(ref: str, path: str, into: Path) -> str:
     """Write the file at REF:PATH to a file named like PATH in `into` (so its format is detected) and return it.
 
-    The pyproject.toml next to it at that ref comes along when there is one: an older poetry.lock takes its
-    direct dependencies from there, so leaving it behind would change the answer for that side.
+    The pyproject.toml and uv.toml next to it at that ref come along when there are some: an older poetry.lock
+    takes its direct dependencies from pyproject.toml, and a uv.lock its no-build and no-binary settings from either,
+    so leaving them behind would change the answer for that side.
     """
     done = _git_blob(ref, path)
     if done.returncode != 0:
@@ -275,11 +319,13 @@ def read_git_ref(ref: str, path: str, into: Path) -> str:
     posix = path.replace("\\", "/")
     out = side / posixpath.basename(posix)
     out.write_bytes(done.stdout)
-    if out.name != "pyproject.toml":
-        folder = posixpath.dirname(posix)
-        project = _git_blob(ref, f"{folder}/pyproject.toml" if folder else "pyproject.toml")
-        if project.returncode == 0:  # none at that ref is normal: nothing to bring along
-            (side / "pyproject.toml").write_bytes(project.stdout)
+    folder = posixpath.dirname(posix)
+    for config in ("pyproject.toml", "uv.toml"):
+        if out.name == config:
+            continue
+        found = _git_blob(ref, f"{folder}/{config}" if folder else config)
+        if found.returncode == 0:  # none at that ref is normal: nothing to bring along
+            (side / config).write_bytes(found.stdout)
     return str(out)
 
 
@@ -346,15 +392,22 @@ def _main(argv: list[str] | None, prog: str) -> int:
         if note := next_python_note(args.python):
             print(f"wheelgap: note: {note}", file=sys.stderr)
         sides = []
+        sources = []
+        rows: list[Row] = []
         with tempfile.TemporaryDirectory(prefix="wheelgap-diff-") as tmp:
             for path in (args.old, args.new):
                 ref = git_ref_input(path)
                 if ref is not None:
                     path = read_git_ref(*ref, Path(tmp))
-                results, source = _check_lockfile(path, targets, online=False, offline=False)
+                results, source, rows = _check_lockfile(path, targets, online=False, offline=False)
+                if ref is not None:
+                    # The git snapshot brings only sibling configs. An omitted parent or pdm.toml may name an index,
+                    # so only packages with explicit PyPI provenance can be used for a comment lookup.
+                    source.pypi_only = False
                 packages = merge(results, targets)
                 add_skipped(packages, source, targets)
                 sides.append(packages)
+                sources.append(source)
     except Exception as e:  # unknown targets, unreadable or malformed lockfiles, a REF:PATH git can't read
         print(f"wheelgap: error: {type(e).__name__}: {e}", file=sys.stderr)
         if args.json:  # as the main command does, so scripts needn't parse stderr
@@ -363,6 +416,11 @@ def _main(argv: list[str] | None, prog: str) -> int:
 
     report = compare(sides[0], sides[1], targets)
     if args.json:
+        if os.environ.get("_WHEELGAP_ACTION_SUGGEST") == "1":
+            try:
+                add_comment_suggestions(report, rows, sources, targets)
+            except Exception:
+                pass  # An optional lookup must not change the comparison's report or exit code.
         print(json_report(report, targets))
     else:
         for line in report.lines:

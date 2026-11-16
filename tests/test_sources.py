@@ -1765,3 +1765,75 @@ def test_requirements_binary_options_abbreviated(tmp_path, line, expected):
     req.write_text(f"{line}\nsix==1.16.0\n", encoding="utf-8")
     (six,) = parse_requirements(req).packages
     assert (six.no_binary, six.only_binary) == expected
+
+
+_UV_BUILD_POLICY_LOCK = """\
+version = 1
+[manifest]
+requirements = [{ name = "fastlib" }, { name = "puresdist" }]
+[[package]]
+name = "fastlib"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [{ url = "https://files.example/fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl" }]
+sdist = { url = "https://files.example/fastlib-2.0.0.tar.gz" }
+[[package]]
+name = "puresdist"
+version = "1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.example/puresdist-1.0.tar.gz" }
+"""
+
+
+@pytest.mark.parametrize(
+    "setting, expected",
+    [
+        ("no-build = true", {"fastlib": (False, True), "puresdist": (False, True)}),
+        ("no-binary = true", {"fastlib": (True, False), "puresdist": (True, False)}),
+        ('no-build-package = ["PureSDIST"]', {"fastlib": (False, False), "puresdist": (False, True)}),
+        ('no-binary-package = ["FASTLIB"]', {"fastlib": (True, False), "puresdist": (False, False)}),
+        (
+            'no-build-package = ["fastlib"]\nno-binary-package = ["fastlib"]',
+            {"fastlib": (True, True), "puresdist": (False, False)},
+        ),
+    ],
+)
+def test_uv_lock_build_policy_settings(tmp_path, setting, expected):
+    (tmp_path / "uv.lock").write_text(_UV_BUILD_POLICY_LOCK, encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[tool.uv]\n" + setting + "\n", encoding="utf-8")
+    (source,) = load_inputs([str(tmp_path)])
+    packages = by_name(source)
+    assert {name: (p.no_binary, p.only_binary) for name, p in packages.items()} == expected
+
+
+def test_uv_toml_build_policy_takes_precedence_over_pyproject(tmp_path):
+    (tmp_path / "uv.lock").write_text(_UV_BUILD_POLICY_LOCK, encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[tool.uv]\nno-binary = true\n", encoding="utf-8")
+    (tmp_path / "uv.toml").write_text('no-build-package = ["puresdist"]\n', encoding="utf-8")
+    (source,) = load_inputs([str(tmp_path)])
+    packages = by_name(source)
+    assert packages["fastlib"].no_binary is False
+    assert packages["puresdist"].only_binary is True
+
+
+@pytest.mark.parametrize(
+    "setting, key",
+    [
+        ("no-build = 1", "no-build"),
+        ('no-binary = "yes"', "no-binary"),
+        ('no-build-package = ["fastlib", 1]', "no-build-package"),
+        ("no-binary-package = true", "no-binary-package"),
+    ],
+)
+def test_uv_build_policy_rejects_wrong_types(tmp_path, setting, key):
+    (tmp_path / "uv.lock").write_text(_UV_BUILD_POLICY_LOCK, encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[tool.uv]\n" + setting + "\n", encoding="utf-8")
+    with pytest.raises(SourceError, match=key):
+        load_inputs([str(tmp_path)])
+
+
+def test_uv_build_policy_rejects_a_tool_key_that_isnt_a_table(tmp_path):
+    (tmp_path / "uv.lock").write_text('version = 1\n[[package]]\nname = "a"\nversion = "1.0"\n', encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text('tool = "uv"\n', encoding="utf-8")
+    with pytest.raises(SourceError, match=r"\[tool\] must be a table"):
+        load_inputs([str(tmp_path)])

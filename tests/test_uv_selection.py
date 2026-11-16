@@ -5,7 +5,7 @@ import tomllib
 import pytest
 
 from wheelgap import check as check_module
-from wheelgap.check import check, marker_holds, poetry_extras_decide, poetry_marker_holds
+from wheelgap.check import check, marker_holds, poetry_extras_decide, poetry_marker_holds, reachable
 from wheelgap.cli import main
 from wheelgap.sources import (
     SourceError,
@@ -1646,3 +1646,167 @@ wheels = [
         "1 package got worse.",
     ]
     assert fake_pypi == []
+
+
+# uv 0.10.0 emits plain index keys in [manifest] requirements for uv lock --script.
+# The two registry URLs stand in for the PyTorch CPU index and PyPI, with different wheel targets.
+TWO_INDEX_MANIFEST_TORCH_LOCK = f"""\
+version = 1
+revision = 3
+requires-python = ">=3.11"
+resolution-markers = [
+    "sys_platform == 'linux'",
+    "sys_platform != 'linux'",
+]
+
+[manifest]
+requirements = [
+    {{ name = "torch", marker = "sys_platform != 'linux'", specifier = "==2.5.1", index = "{_PYPI}" }},
+    {{ name = "torch", marker = "sys_platform == 'linux'", specifier = "==2.5.1", index = "{_CPU_INDEX}" }},
+]
+
+[[package]]
+name = "torch"
+version = "2.5.1"
+source = {{ registry = "{_CPU_INDEX}" }}
+resolution-markers = ["sys_platform == 'linux'"]
+wheels = [{{ url = "{_CPU_INDEX}/torch-2.5.1-cp313-cp313-manylinux_2_17_x86_64.whl", hash = "sha256:00" }}]
+
+[[package]]
+name = "torch"
+version = "2.5.1"
+source = {{ registry = "{_PYPI}" }}
+resolution-markers = ["sys_platform != 'linux'"]
+wheels = [{{ url = "{_FILES}/torch-2.5.1-cp313-none-macosx_11_0_arm64.whl", hash = "sha256:00" }}]
+"""
+
+
+def _manifest_torch_lock(group: bool) -> str:
+    if not group:
+        return TWO_INDEX_MANIFEST_TORCH_LOCK
+    return TWO_INDEX_MANIFEST_TORCH_LOCK.replace("requirements = [", "[manifest.dependency-groups]\ndev = [", 1)
+
+
+@pytest.mark.parametrize("group", [False, True], ids=["script-requirements", "virtual-workspace-group"])
+def test_uv_manifest_two_indexes_same_version_selects_only_matching_source(tmp_path, capsys, fake_pypi, group):
+    (tmp_path / "uv.lock").write_text(_manifest_torch_lock(group), encoding="utf-8")
+    flags = ["--only-group", "dev"] if group else []
+    assert main([str(tmp_path), *flags, "-p", "3.13", "-t", "linux-x86_64", "-t", "macos-arm64", "--json"]) == 0
+    packages = json.loads(capsys.readouterr().out)["packages"]
+    assert [(p["name"], p["results"]) for p in packages] == [
+        ("torch", {"linux-x86_64": "wheel", "macos-arm64": "n/a"}),
+        ("torch", {"linux-x86_64": "n/a", "macos-arm64": "wheel"}),
+    ]
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize("group", [False, True], ids=["script-requirements", "virtual-workspace-group"])
+def test_uv_manifest_two_indexes_diff_does_not_report_false_regressions(tmp_path, capsys, fake_pypi, group):
+    from wheelgap.diff import main as diff_main
+
+    old = tmp_path / "old"
+    new = tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    header = (
+        '[manifest.dependency-groups]\ndev = [{ name = "torch" }]'
+        if group
+        else '[manifest]\nrequirements = [{ name = "torch" }]'
+    )
+    (old / "uv.lock").write_text(
+        f"""version = 1
+{header}
+[[package]]
+name = "torch"
+version = "2.5.0"
+source = {{ registry = "{_PYPI}" }}
+wheels = [
+    {{ url = "{_FILES}/torch-2.5.0-cp313-cp313-manylinux_2_17_x86_64.whl", hash = "sha256:00" }},
+    {{ url = "{_FILES}/torch-2.5.0-cp313-none-macosx_11_0_arm64.whl", hash = "sha256:00" }},
+]
+""",
+        encoding="utf-8",
+    )
+    (new / "uv.lock").write_text(_manifest_torch_lock(group), encoding="utf-8")
+    # diff compares full installed graphs; its CLI has no group-selection flags.
+    assert diff_main([str(old), str(new), "-p", "3.13", "-t", "linux-x86_64", "-t", "macos-arm64"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    ("manifest_key", "package_key"),
+    [
+        ("index", "registry"),
+        ("path", "path"),
+        ("url", "url"),
+        ("git", "git"),
+        ("editable", "editable"),
+        ("directory", "directory"),
+        ("virtual", "virtual"),
+    ],
+)
+def test_uv_manifest_flat_sources_become_package_source_tables(tmp_path, manifest_key, package_key):
+    (tmp_path / "uv.lock").write_text(
+        f'version = 1\n[manifest]\nrequirements = [{{ name = "example", {manifest_key} = "location" }}]\n'
+        f'[[package]]\nname = "example"\nversion = "1.0"\nsource = {{ {package_key} = "location" }}\n',
+        encoding="utf-8",
+    )
+    (source,) = load_inputs([str(tmp_path)])
+    assert source.root_edges == [("example", None, None, {package_key: "location"})]
+    assert source.uv_manifest["requirements"][0]["source"] == {package_key: "location"}
+
+
+@pytest.mark.parametrize("key", ["index", "path", "url", "git", "editable", "directory", "virtual"])
+def test_uv_manifest_flat_source_wrong_type_is_input_error(tmp_path, key):
+    (tmp_path / "uv.lock").write_text(
+        f'version = 1\n[manifest]\nrequirements = [{{ name = "example", {key} = 42 }}]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        SourceError, match=rf"the manifest has a dependency 'example' with a \x60{key}\x60 that isn't a string"
+    ):
+        load_inputs([str(tmp_path)])
+
+
+@pytest.mark.parametrize("group", [False, True], ids=["script-requirements", "virtual-workspace-group"])
+def test_uv_manifest_git_urls_match_resolved_commit_sources(tmp_path, group):
+    # uv 0.10.0 writes git = "file:///repo" in the manifest, but
+    # source = { git = "file:///repo#<commit>" } in the locked package.
+    entries = """[
+    { name = "example", marker = "sys_platform == 'linux'", git = "file:///repo/linux" },
+    { name = "example", marker = "sys_platform != 'linux'", git = "file:///repo/other" },
+]"""
+    header = "[manifest.dependency-groups]\ndev = " if group else "[manifest]\nrequirements = "
+    (tmp_path / "uv.lock").write_text(
+        "version = 1\n"
+        + header
+        + entries
+        + """
+[[package]]
+name = "example"
+version = "1.0"
+source = { git = "file:///repo/linux#1111111" }
+
+[[package]]
+name = "example"
+version = "1.0"
+source = { git = "file:///repo/other#2222222" }
+""",
+        encoding="utf-8",
+    )
+    (source,) = load_inputs([str(tmp_path)])
+    if group:
+        select_uv_dependencies([source], UvSelection(only_groups=frozenset({"dev"})))
+    linux, macos = build_targets(["3.13"], ["linux-x86_64", "macos-arm64"])
+    assert list(reachable(source, linux)) == [0]
+    assert list(reachable(source, macos)) == [1]
+
+
+def test_uv_manifest_requirement_with_two_sources_is_input_error(tmp_path):
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n[manifest]\nrequirements = [{ name = "example", index = "https://x/simple", path = "a" }]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match="the manifest has a dependency 'example' with conflicting sources"):
+        load_inputs([str(tmp_path)])

@@ -175,6 +175,32 @@
                         }
                     }
                 },
+                "build_lab": {
+                    "type": "object",
+                    "description": "Present from 0.11.0 on (older versions don't write it), with --explain: the coverage tracker's build lab results for this package's source cells, keyed by target label (like rejected's keys). The lab builds popular packages with no wheel for a target from their PyPI sdist on GitHub's runners, then installs and imports the result: these are its dated observations on GitHub's runners, which have compilers and many system libraries preinstalled, so a build that works there can still need setup on your machine, and nothing the lab built is downloaded. A result is kept only for exactly the checked version and exactly that target (the tracker's label, such as 3.14t win-arm64), and only in the tracker's published format; anything else is dropped. Looked up with --notes, under the same rules as notes. Empty without --notes, when there are none, or when the lookup failed. It doesn't change results, summary or the exit code.",
+                    "additionalProperties": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["target", "version", "outcome", "seconds", "wheel", "extensions", "import", "gil", "reason", "excerpt", "toolchains", "runner", "python", "date", "verdict"],
+                        "properties": {
+                            "target": {"type": "string", "description": "The tracker's label for the target the lab built for, such as 3.14t win-arm64."},
+                            "version": {"type": "string", "description": "The release the lab built: always the checked version."},
+                            "outcome": {"enum": ["built", "failed", "timeout"], "description": "Whether the build made a wheel, failed, or ran out of time."},
+                            "seconds": {"type": "integer", "minimum": 0, "description": "How long the build took."},
+                            "wheel": {"type": ["string", "null"], "description": "The built wheel's tag (such as cp314-cp314t-win_arm64, or py3-none-any for a pure Python build); null unless built."},
+                            "extensions": {"type": ["integer", "null"], "description": "How many compiled extension modules the wheel has (0 or more); null unless built. 0 means no compiled part: never a working compiled build."},
+                            "import": {"enum": ["ok", "failed", "deps-failed", null], "description": "Whether the installed wheel imported, or its dependencies didn't install; null unless built."},
+                            "gil": {"enum": ["kept-off", "re-enabled", null], "description": "On a free-threaded Python, whether importing it turned the GIL back on; null unless a free-threaded build with an extension module imported."},
+                            "reason": {"type": ["string", "null"], "description": "Why the build failed (needs OpenSSL, needs a Rust toolchain, needs a C/C++ compiler, needs CMake, needs a system library, build dependency failed, unsupported platform, compile error or other); null unless failed."},
+                            "excerpt": {"type": "string", "description": "The last error lines of the build or import log, printable ASCII, at most 400 characters; may be empty. Treat it as untrusted plain text."},
+                            "toolchains": {"type": "array", "items": {"type": "string"}, "description": "Which of rustc, cargo, gcc, cl and cmake the runner had."},
+                            "runner": {"type": "string", "description": "The GitHub runner it built on, such as windows-11-arm."},
+                            "python": {"type": "string", "description": "The Python it built with, such as 3.14.2t."},
+                            "date": {"type": "string", "description": "When the lab built it (YYYY-MM-DD)."},
+                            "verdict": {"type": "string", "description": "What the result means, as --explain prints it, such as builds from source in 87 s and imports."}
+                        }
+                    }
+                },
                 "conda_forge": {
                     "description": "Present with --explain --conda-forge, from 0.10.0 on, when conda-forge has a package with exactly this package's canonical name and a build of this version that fits at least one of the targets in rejected: on the main label and not marked broken, for the target's conda subdir or noarch, and for its Python version and ABI (free-threaded or not). A hint only: it doesn't change results, summary or the exit code, and the conda package may be another project. Left out when nothing fits, the package's index isn't known to be PyPI (its name isn't sent), or the lookup failed (a note on stderr says so).",
                     "type": "object",
@@ -192,6 +218,11 @@
                 },
                 "suggest": {
                     "description": "Present with --explain --suggest, from 0.10.0 on, for a pinned package with a gap whose releases were looked up on PyPI: for each target in rejected, a newer release with a wheel for it (not yanked, Requires-Python admitting the target's Python, and no pre-release unless the checked version is one) that also keeps a wheel on every target where this package is wheel now. The targets get the lowest such release with a wheel for all of them when there is one, otherwise each its own nearest; a target with no such release is left out, so the object can be empty. The release can be outside the input's own version specifier (foo<2 resolving to 1.9 may get 2.1). Absent when the package has no gap, has no version, is covered by a requirements file's --no-binary, wasn't looked up (its index isn't known to be PyPI, or the run uses --index-url or WHEELGAP_INDEX_URL), or its lookup failed or was dropped (a note on stderr says so). It doesn't change results, summary or the exit code.",
+                    "type": "object",
+                    "additionalProperties": {"type": "string"}
+                },
+                "last_with_wheel": {
+                    "description": "Present with suggest, from 0.11.0 on: for each target in rejected that no newer release has a wheel for (counted as for suggest), the newest older release that has one, read from the 50 newest releases older than the checked version (no pre-release unless the checked version is one). A target with no such release is left out, so the object can be empty. It doesn't change results, summary or the exit code.",
                     "type": "object",
                     "additionalProperties": {"type": "string"}
                 },

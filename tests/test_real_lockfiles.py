@@ -18,7 +18,7 @@ import pytest
 
 import wheelgap
 from wheelgap.check import Status, check
-from wheelgap.sources import SourceError, file_kind
+from wheelgap.sources import SourceError, file_kind, load_file
 
 
 def _script():
@@ -257,7 +257,104 @@ def test_inspect_flags_a_drop_in_wheels_against_the_pinned_copy(tmp_path):
     )
     assert script.inspect(live).findings == []
     report = script.inspect(live, pinned=REAL / "pluggy/uv.lock")
-    assert report.of(MISREAD) == ["0.0 wheels per package, down from 11.6 in the pinned copy"]
+    assert "0.0 wheels per package, down from 11.6 in the pinned copy" in report.of(MISREAD)
+
+
+@pytest.mark.parametrize("file", sorted(EXPECTED))
+def test_inspect_against_its_own_pinned_copy_finds_nothing(file):
+    assert script.inspect(REAL / file, pinned=REAL / file).findings == []
+
+
+# Keys renamed to names the raw counts don't know (#264): each passes the counts, so only the pinned copy catches it.
+@pytest.mark.parametrize(
+    ("file", "old", "new", "findings"),
+    [
+        (
+            "pluggy/uv.lock",
+            "marker = ",
+            "when = ",
+            [
+                "0.0 markers per package, down from 0.2 in the pinned copy",
+                "0% of cells n/a, down from 13% in the pinned copy",
+            ],
+        ),
+        (
+            "pluggy/uv.lock",  # the project's root isn't found, so uv's graph has nowhere to start
+            'editable = "."',
+            'editable = "./"',
+            [
+                "21 packages, but wheelgap read no dependency graph",
+                "0.0 dependency edges per package, down from 1.2 in the pinned copy",
+                "0.0 markers per package, down from 0.2 in the pinned copy",
+                "0% of cells n/a, down from 13% in the pinned copy",
+            ],
+        ),
+        ("pluggy/uv.lock", "sdist = ", "source-dist = ", ["0.0 sdists per package, down from 1.0 in the pinned copy"]),
+        (
+            "pluggy/uv.lock",
+            "\nrequires-python = ",
+            "\npython-requires = ",
+            ["no requires-python read, but the pinned copy has '>=3.10'"],
+        ),
+        (
+            "cleo/poetry.lock",  # Poetry 1.x
+            "[package.dependencies]",
+            "[package.requires]",
+            [
+                "53 packages, but wheelgap read no dependency graph",
+                "0.0 dependency edges per package, down from 1.1 in the pinned copy",
+                "0.0 markers per package, down from 0.2 in the pinned copy",
+                "0% of cells n/a, down from 8% in the pinned copy",
+            ],
+        ),
+    ],
+)
+def test_inspect_flags_a_renamed_key_against_the_pinned_copy(tmp_path, file, old, new, findings):
+    live = tmp_path / Path(file).name
+    text = (REAL / file).read_text(encoding="utf-8")
+    assert old in text
+    live.write_text(text.replace(old, new), encoding="utf-8")
+    assert script.inspect(live, pinned=REAL / file).findings == [(MISREAD, f) for f in findings]
+
+
+def test_inspect_lets_poetry_drop_its_graph_with_a_warning():
+    # cleo's live lock moved from Poetry 1.x to lock-version 2.1, which records markers on packages, not edges.
+    report = script.inspect(REAL / "tomlkit/poetry.lock", pinned=REAL / "cleo/poetry.lock")
+    assert report.findings == [
+        (
+            WARNING,
+            "lock-version '2.1', with no dependency graph: refreshing the pinned copy would lose the corpus's "
+            "Poetry 1.x lock (pick another project for it)",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "text", "finding"),
+    [
+        (
+            "uv.lock",  # two packages and no root: no graph, so every package looks needed
+            UV_HEAD + UV_A + A_WHEEL + UV_A.replace('"a"', '"b"') + A_WHEEL,
+            "2 packages, but wheelgap read no dependency graph",
+        ),
+        (
+            "uv.lock",
+            UV_HEAD.replace('requires-python = ">=3.10"', "requires-python = 3.10") + UV_ROOT + UV_A + A_WHEEL,
+            "the file's requires-python is '3.1', but wheelgap read 'None'",
+        ),
+        (
+            "pylock.toml",
+            'requires-python = [">=3.10"]\n'
+            + PYLOCK_A
+            + '[[packages.wheels]]\nurl = "https://x/a-1.0-py3-none-any.whl"\n',
+            "the file's requires-python is \"['>=3.10']\", but wheelgap read 'None'",
+        ),
+    ],
+)
+def test_inspect_flags_a_missing_graph_or_requires_python(tmp_path, name, text, finding):
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    assert finding in script.inspect(path).of(MISREAD)
 
 
 @pytest.mark.parametrize("field", ["name", "version"])  # wheelgap refuses the name; the version gets printed
@@ -404,3 +501,24 @@ def test_main_pinned_reads_the_copies_offline(monkeypatch, capsys):
         "ok   python-poetry/cleo poetry.lock (pinned copy): lock-version '2.0'; 53 packages\n"
         "ok   py-pdf/pdfly pylock.toml (pinned copy): lock-version '1.0'; 104 packages\n"
     )
+
+
+def test_gated_matches_uv_edges_by_source_too(tmp_path):
+    # Two torch 2.5.0 entries from different indexes: each is gated by its own edge's marker, not by the other's.
+    cpu, pypi = '{ registry = "https://download.pytorch.org/whl/cpu" }', '{ registry = "https://pypi.org/simple" }'
+    path = tmp_path / "uv.lock"
+    path.write_text(
+        UV_HEAD + UV_ROOT + "dependencies = [\n"
+        f'    {{ name = "torch", version = "2.5.0", source = {cpu}, marker = "sys_platform == \'linux\'" }},\n'
+        '    { name = "lib" },\n]\n\n'
+        f'[[package]]\nname = "lib"\nversion = "1.0"\nsource = {pypi}\n'
+        f'dependencies = [{{ name = "torch", version = "2.5.0", source = {pypi} }}]\n\n'
+        f'[[package]]\nname = "torch"\nversion = "2.5.0"\nsource = {cpu}\n\n'
+        f'[[package]]\nname = "torch"\nversion = "2.5.0"\nsource = {pypi}\n',
+        encoding="utf-8",
+    )
+    source = load_file(path)
+    on_cpu, on_pypi = (i for i, p in enumerate(source.packages) if p.key == "torch")
+    assert source.uv_packages[on_cpu]["source"]["registry"].endswith("/cpu")
+    assert script._gated(source, on_cpu)  # only the marked edge from app names this entry
+    assert not script._gated(source, on_pypi)  # lib's edge has no marker, and lib has none on the way in

@@ -88,7 +88,7 @@ def cell(side: dict, prefix: str = "") -> str:
     return code(status)
 
 
-def rows(data: dict) -> list[str]:
+def rows(data: dict, *, suggestions: bool = False) -> list[str]:
     """One table row per package and target that got worse, then the new packages' gaps."""
     out = []
     for pkg in data["worse"]:
@@ -99,6 +99,11 @@ def rows(data: dict) -> list[str]:
                 f"<tr><td>{code(pkg.get('name'))}</td><td>{version}</td><td>{code(target)}</td>"
                 f"<td>{cell(side, 'old_')} → {cell(side, 'new_')}</td></tr>"
             )
+        lines = pkg.get("suggestions") if suggestions else None
+        if isinstance(lines, list):
+            hint = "; ".join(line for line in lines if isinstance(line, str))
+            if hint:
+                out.append(f'<tr><td></td><td colspan="3">{code(hint, MAX_MESSAGE)}</td></tr>')
     for pkg in data["new"]:
         version = f"(new) {versions(pkg.get('versions', []))}"
         for target, side in pkg["targets"].items():
@@ -161,6 +166,8 @@ def report(
     base_branch: bool = False,
     head: str = "",
     budget: int = MAX_COMMENT,
+    *,
+    suggestions: bool = False,
 ) -> str:
     """The Markdown report, at most `budget` characters."""
     at = f" at {code(head)}" if head else ""
@@ -195,6 +202,12 @@ def report(
         size += len(row) + 1
     if len(shown) < len(table):
         shown.append(more_row.format(len(table) - len(shown)))
+    elif suggestions:
+        with_hints = rows(data, suggestions=True)
+        # Keep every comparison row that fit before adding optional hints.
+        extra = sum(len(row) + 1 for row in with_hints) - sum(len(row) + 1 for row in table)
+        if size + extra <= budget:
+            shown = with_hints
     return "\n".join(header + head_rows + shown + ["</table>"] + footer)
 
 
@@ -306,8 +319,9 @@ def run(args: argparse.Namespace) -> int:
     with open(args.markdown, "w", encoding="utf-8") as f:
         f.write(text)
     if args.payload:
+        body = report(data, problem, args.lockfile, args.base, args.base_branch, head[:7], budget, suggestions=True)
         with open(args.payload, "w", encoding="utf-8") as f:
-            json.dump({"body": f"{marker(args.lockfile)}\n{text}"}, f)
+            json.dump({"body": f"{marker(args.lockfile)}\n{body}"}, f)
     # Counts only: names and versions in the log could be read as workflow commands.
     if data is None:
         print("wheelgap: couldn't compare the lockfiles; the job summary and the log above say why.")

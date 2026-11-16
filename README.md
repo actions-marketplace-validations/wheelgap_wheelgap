@@ -60,6 +60,13 @@ wheelgap pixi.lock --environment test -p 3.13 -t linux-x86_64,macos-arm64
 # No lockfile? Check packages directly (latest version, or pin one)
 wheelgap psycopg2 uvloop numpy==2.3.4 -t windows,win-arm64
 
+# ...and everything they install too, with the path to each gap
+wheelgap mcp==2.3.0 --deps -t win-arm64 --explain
+
+# Before a release: do the wheels you're about to upload cover every target
+# the last release had one for? (after 0.11.0)
+wheelgap --dist dist -p 3.13 -t win-arm64,linux-aarch64
+
 # Take the Python and platform from the final stage of a Dockerfile
 # (a global `ARG PYTHON_VERSION=3.13` before the first FROM works too)
 wheelgap --dockerfile Dockerfile
@@ -106,7 +113,7 @@ Version ranges select the newest matching release whose `Requires-Python` permit
 resolutions appear in separate rows, including in JSON, with `n/a` for targets using another resolution. See
 [version ranges](https://wheelgap.github.io/wheelgap/how-it-works/#version-ranges) for details.
 
-`--explain` can also show the coverage tracker's notes (`--notes`), what a source build needs (`--build-info`), conda-forge builds that fit (`--conda-forge`) and the nearest newer release with wheels for a gap (`--suggest`). These are opt-in, since they send package names elsewhere ([which names](https://wheelgap.github.io/wheelgap/how-it-works/#pypi-origin)).
+`--explain` can also show the coverage tracker's notes (`--notes`), what a source build needs (`--build-info`), conda-forge builds that fit (`--conda-forge`) and the nearest newer release with wheels for a gap (`--suggest`). These are opt-in, since they send package names elsewhere ([which names](https://wheelgap.github.io/wheelgap/how-it-works/#pypi-origin)). `--suggest` is on by default (after 0.11.0) when `--deps` resolved every input, since it already looked the whole tree up on PyPI; `--no-suggest` turns it off.
 
 The docs cover [inputs and dependency selection](https://wheelgap.github.io/wheelgap/inputs/), [`--explain`](https://wheelgap.github.io/wheelgap/output/#explain), [the `--json` schema](https://wheelgap.github.io/wheelgap/output/#json), [every flag](https://wheelgap.github.io/wheelgap/cli/) and the [recipes](https://wheelgap.github.io/wheelgap/recipes/) for multi-arch images, monorepos and free-threading readiness.
 
@@ -120,7 +127,7 @@ Python versions take a trailing `t` for free-threaded builds (`3.14t`). `--glibc
 
 ```yaml
 - uses: actions/checkout@v7
-- uses: wheelgap/wheelgap@v0.10.0
+- uses: wheelgap/wheelgap@v0.11.0
   with:
     args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
 ```
@@ -132,7 +139,7 @@ The job fails when a dependency would build from source on a target you ship, fo
 ```yaml
 repos:
   - repo: https://github.com/wheelgap/wheelgap
-    rev: v0.10.0
+    rev: v0.11.0
     hooks:
       - id: wheelgap
 ```
@@ -193,7 +200,7 @@ This checks both lockfiles and lists the packages that got worse on a target (a 
 ## How it works
 
 - **Lockfiles are read offline.** `uv.lock`, `pylock.toml`, `poetry.lock` and `pdm.lock` already record every file published for each pinned version. wheelgap parses the wheel filenames' tags with [`packaging`](https://packaging.pypa.io/) and checks them against the exact tag set each target accepts. That is the same logic pip and uv use to pick a wheel.
-- **`requirements.txt`, `Pipfile.lock`, `pixi.lock`, `pyproject.toml` and bare package names** are looked up on the PyPI JSON API (or your `--index-url`). wheelgap checks the requirements you give it and doesn't resolve dependencies.
+- **`requirements.txt`, `Pipfile.lock`, `pixi.lock`, `pyproject.toml` and bare package names** are looked up on the PyPI JSON API (or your `--index-url`). wheelgap checks the requirements you give it and doesn't resolve dependencies, except for package names and (after 0.11.0) requirements files and `pyproject.toml` inputs with `--deps`, which resolves what they install per target from PyPI's metadata.
 - **Environment markers are respected.** A `pywin32 ; sys_platform == 'win32'` dependency won't show up as a Linux gap. For `uv.lock` the dependency graph is walked per target, so transitive platform-specific packages are handled too.
 - **No guessing.** Where wheelgap can't be sure, it says `unknown`, which counts as a gap, rather than guess.
 

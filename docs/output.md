@@ -23,7 +23,7 @@ Add `set -o pipefail` when you pipe the output, so input errors still fail.
 ## Text
 
 ```text
-wheelgap 0.10.0 · uv.lock · 5 packages · Python 3.13
+wheelgap 0.11.0 · uv.lock · 5 packages · Python 3.13
 
 package    version  linux-aarch64  musl-aarch64
 fastlib    2.0.0    ● source       ● source
@@ -128,6 +128,38 @@ psycopg2 2.9.10: note from the wheelgap tracker for linux-x86_64 (alternative, c
   that can't be fetched, or a package the tracker doesn't list, adds nothing, and the exit status never depends on
   notes.
 
+### Build lab results {#build-lab}
+
+The tracker's weekly [build lab](https://wheelgap.github.io/tracker/) builds popular packages that
+have no wheel for a platform from their PyPI sdist on that platform, on GitHub's runners, then installs and imports the
+result, and on free-threaded Python checks whether importing it turned the GIL back on. With `--explain --notes`, a
+`source` cell gets one line after the package's notes when the lab built **exactly the checked version** for
+**exactly that target**:
+
+```text
+pkg 1.0 on win-arm64: build lab (2026-11-15, windows-11-arm, Python 3.14.2): builds from source in 87 s and imports
+```
+
+- The verdict is one of: `builds from source in 87 s and imports` (with `, GIL stays off` on free-threaded Python),
+  `builds in 87 s, but importing it turns the GIL back on`, `builds in 87 s as pure Python, with no compiled
+  extension module (if it has an optional one, that was skipped)`, `builds in 87 s, but with no compiled extension module`, `builds in 87 s, but doesn't import`,
+  `builds in 87 s, but its dependencies don't install`, `fails to build: needs a Rust toolchain` (or another
+  reason) and `didn't finish building in 40 min`. A wheel with no extension module is never called a working build.
+- These are the lab's dated observations on GitHub's runners, with the runner and Python they used, not a promise
+  about your machine. The runners have compilers and many system libraries preinstalled, so a build that works there
+  can still need setup on your machine: a package that needs a C library's headers, such as libpq's, may find them
+  already there. Nothing the lab built is downloaded: the results come in the same small file as the notes, so they
+  add no request, and follow the same rules (opt-in, names known to be PyPI's only, the cache, the timeouts).
+- A result for another release, or for another target (the free-threaded build says nothing about the regular one),
+  shows nothing. The tracker builds its latest release, which may not be yours.
+- With `--json --explain`, each package gets a `build_lab` object, keyed by target label like `rejected`, with the
+  lab's fields (`target`, `version`, `outcome`, `seconds`, `wheel`, `extensions`, `import`, `gil`, `reason`,
+  `excerpt`, `toolchains`, `runner`, `python`, `date`) and the `verdict` above; it's empty without `--notes` or when
+  there's no result. `--markdown` puts the lines with the notes.
+- The results come from a public repository too, so wheelgap reads them as strictly as the tracker's own checker and
+  drops any result that isn't exactly in its format, without hiding the notes (or the other way round). Treat
+  `excerpt` as untrusted plain text. The exit status never depends on them.
+
 ### Build requirements {#build-info}
 
 With `--build-info` (or `build-info = true` in `[tool.wheelgap]`), `--explain` also says what each `source` build
@@ -229,6 +261,10 @@ fastlib 2.0.0: no newer release has a wheel for linux-riscv64
 - **Which release.** Only a release that keeps a wheel on every target where the checked version has one counts, so a
   suggestion never trades one gap for another. Gap targets that no such release has a wheel for get a "no newer
   release" line, ending `without losing one elsewhere` when some newer release has a wheel for it but drops another.
+  When no newer release has a wheel for it at all, the line names the newest older release that did, if one of the 50
+  releases before the checked version has one (counted the same way): `cryptography 50.0.2: no newer release has a
+  wheel for win-arm64; the last one that did is 46.0.3`. Pinning it avoids the build on that target; check that
+  it still has wheels for your other targets.
   The other gap targets get the lowest counted release with a wheel for every one of them, when there is one;
   otherwise each its own nearest, one line per release. A wheel counts when it isn't yanked, the target accepts its
   tags, and its `Requires-Python` admits the target's Python. Pre-releases count only when the checked version is one,
@@ -246,11 +282,13 @@ fastlib 2.0.0: no newer release has a wheel for linux-riscv64
 
 With `--json --explain --suggest`, each package with a gap that was looked up gets a `suggest` object keyed by target
 label like `rejected`: `"suggest": {"musl-aarch64": "2.1.0", "win-amd64": "2.1.0"}`. A target with no counted release is
-left out (so the object can be empty). The key is left out for a package with no gap, a row with no version, a package a
-requirements file's `--no-binary` covers, a package that wasn't looked up (its index isn't known to be PyPI, or the run
-uses `--index-url` or `WHEELGAP_INDEX_URL`), and a failed or dropped lookup (a note on stderr says so). Like the other
-hints, it never changes a status, the summary or the exit code. Quiet text output can't show it (quiet can't be combined
-with `--explain`), and `--markdown --suggest` is an error for now.
+left out (so the object can be empty). Next to it, `last_with_wheel` names, for each gap target no newer release has a
+wheel for, the newest older release that has one: `"last_with_wheel": {"win-arm64": "46.0.3"}`. Both keys are left out
+for a package with no gap, a row with no version, a package a requirements file's `--no-binary` covers, a package that
+wasn't looked up (its index isn't known to be PyPI, or the run uses `--index-url` or `WHEELGAP_INDEX_URL`), and a failed
+or dropped lookup (a note on stderr says so). Like the other hints, it never changes a status, the summary or the exit
+code. Quiet text output can't show it (quiet can't be combined with `--explain`). With `--markdown --explain --suggest`,
+suggestions render as a list under the collapsed explanation details.
 
 ## --json {#json}
 
@@ -298,7 +336,7 @@ wheels go in a collapsed section.
 ```markdown
 ### wheelgap: 3 of 5 packages have gaps
 
-wheelgap 0.10.0 · `uv.lock` · 5 packages · Python 3.13
+wheelgap 0.11.0 · `uv.lock` · 5 packages · Python 3.13
 
 | package | version | linux-aarch64 | musl-aarch64 |
 | --- | --- | --- | --- |
